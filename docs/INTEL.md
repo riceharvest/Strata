@@ -111,6 +111,11 @@ build unless it is told to fetch the current one. An old copy can hold a device 
 images, then `gen compiler command failed with exit code 245` at the last link, #3219). `sycl/tools/build.sh` checks the
 version before the compile and stops with the fix. If you cannot update the image, `-e I8_ESIMD=OFF` builds without the fused int8
 kernels (stubs: the prompt's experts take the slower XMX path, the answers do not change); `-e ALLOW_BAD_OCLOC=1` builds anyway.
+**Podman instead of Docker** (e.g. Fedora Silverblue, rootless): `podman build -t strata-sycl-dev sycl/tools`, then the
+same `run` lines with `podman` and `--security-opt label=disable` (a data disk without SELinux labels is otherwise
+unreadable in the container). To serve or bench that way, set `STRATA_SYCL_RUNNER=podman` for `strata-sycl.sh`;
+`STRATA_SYCL_RUNNER=native` runs the engine directly when the server already runs inside a toolbox with oneAPI (the
+data root at `/work`), and `distrobox:<name>` enters that distrobox from the host.
 
 The build takes about 3 minutes and ends with `BUILD EXIT 0` and `errors: 0`. The binary is `build-sycl-aot/strata`
 (B-series) or `build-sycl/strata` (A-series); setup finds either one. Run the `docker build` again after pulling a
