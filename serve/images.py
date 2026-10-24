@@ -129,8 +129,8 @@ def sd_cli_args(cfg: dict, job: dict, out_pattern: str) -> list[str]:
 
 
 def image_env(cfg: dict, base: dict | None = None) -> dict:
-    """sd-cli's environment: the libraries its backend needs (ROCm's, setup's lib_dirs) first on the search path, the
-    GPU to use when the config names one, and the config's own "env"."""
+    """sd-cli's environment: the libraries its backend needs (setup's lib_dirs) first on the search path, the
+    GPU to use when the config names one (the Vulkan build), and the config's own "env"."""
     env = dict(os.environ if base is None else base)
     dirs = [str(d) for d in cfg.get("lib_dirs") or [] if Path(d).is_dir()]
     if dirs:
@@ -138,13 +138,10 @@ def image_env(cfg: dict, base: dict | None = None) -> dict:
         env[var] = os.pathsep.join(dirs + ([env[var]] if env.get(var) else []))
     gpu = cfg.get("gpu")
     if gpu is not None:
-        var = {"cuda": "CUDA_VISIBLE_DEVICES", "hip": "HIP_VISIBLE_DEVICES",
-               "vulkan": "GGML_VK_VISIBLE_DEVICES"}.get(cfg.get("backend"))
+        var = {"vulkan": "GGML_VK_VISIBLE_DEVICES"}.get(cfg.get("backend"))
         if var:
             # one card is "1"; a list ([1, 0], "1,0") is every one of them, in order - str() of a list is not a device list
             env[var] = ",".join(str(x).strip() for x in gpu if str(x).strip() != "") if isinstance(gpu, (list, tuple)) else str(gpu)
-            if var == "CUDA_VISIBLE_DEVICES":
-                env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
     for k, v in (cfg.get("env") or {}).items():
         env[str(k)] = str(v)
     return env

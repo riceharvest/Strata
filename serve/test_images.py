@@ -94,14 +94,13 @@ class Command(unittest.TestCase):
         self.assertNotIn("--model-args", images_api.sd_cli_args(cfg, job, "x"))
 
     def test_env(self):
-        env = images_api.image_env({"backend": "cuda", "gpu": 1, "env": {"X": 2}}, {"PATH": "p"})
-        self.assertEqual((env["CUDA_VISIBLE_DEVICES"], env["CUDA_DEVICE_ORDER"], env["X"]), ("1", "PCI_BUS_ID", "2"))
-        self.assertEqual(images_api.image_env({"backend": "cuda", "gpu": [1, 0]}, {})["CUDA_VISIBLE_DEVICES"], "1,0")     # a list is a device list
+        env = images_api.image_env({"backend": "vulkan", "gpu": 1, "env": {"X": 2}}, {"PATH": "p"})
+        self.assertEqual((env["GGML_VK_VISIBLE_DEVICES"], env["X"]), ("1", "2"))
+        self.assertEqual(images_api.image_env({"backend": "vulkan", "gpu": [1, 0]}, {})["GGML_VK_VISIBLE_DEVICES"], "1,0")     # a list is a device list
         with tempfile.TemporaryDirectory() as d:
-            env = images_api.image_env({"backend": "hip", "gpu": 0, "lib_dirs": [d, d + "-missing"]}, {})
-            self.assertEqual(env["HIP_VISIBLE_DEVICES"], "0")
+            env = images_api.image_env({"backend": "cpu", "gpu": 0, "lib_dirs": [d, d + "-missing"]}, {})
+            self.assertNotIn("GGML_VK_VISIBLE_DEVICES", env)
             self.assertEqual(env["PATH" if os.name == "nt" else "LD_LIBRARY_PATH"], d)
-        self.assertEqual(images_api.image_env({"backend": "vulkan", "gpu": 2}, {})["GGML_VK_VISIBLE_DEVICES"], "2")
 
     def test_config_checked(self):
         with self.assertRaises(ValueError):
