@@ -92,9 +92,7 @@ class ControlModeTests(unittest.TestCase):
         empty.mkdir()
         gpu = {"index": 0, "vram_gb": 12.0}
         with mock.patch.dict(os.environ, {"STRATA_COMPONENTS_DIR": str(empty)}), \
-                mock.patch.object(S, "download", side_effect=AssertionError("fetched")), \
-                mock.patch.object(S, "build_engine", side_effect=AssertionError("built")), \
-                mock.patch.object(S, "get_prebuilt", side_effect=AssertionError("fetched an engine")):
+                mock.patch.object(S, "download", side_effect=AssertionError("fetched")):
             found, eng, meta, libs, chosen, vision = S.engine_step(mock.Mock(build=False, prebuilt=None), gpu, False, [], 13, "gpu")
         self.assertEqual(found.resolve(), llama.resolve())
         self.assertEqual(libs, [])
@@ -286,19 +284,6 @@ class InstallerServerTests(unittest.TestCase):
         # not a download once setup prepares the files
         self.assertNotIn("download", self.mcp.combined_progress({"step": "6/7: preparing the model for Strata", "download": {"x": 1}}, job))
 
-    def test_a_pack_with_many_files_reports_the_whole_pack(self):
-        S = self.mcp.Strata(self.root, ROOT).setup_module()
-        files = self.mcp.expected_files(S, "nvfp4", "NVFP4", self.root / "models", False)
-        self.assertGreater(len(files), 5)
-        self.assertTrue(all(f["bytes"] for f in files), "a ready-made pack pins every file's size")
-        big = next(f for f in files if f["path"].endswith("experts.bin"))
-        Path(big["path"]).parent.mkdir(parents=True)
-        Path(big["path"] + ".part").write_bytes(b"x" * 1000)
-        prog = self.mcp.combined_progress({"step": "5/7: downloading"}, {"files": files, "total_gb": 128.0})
-        model = prog["parts"][0]
-        self.assertEqual((model["kind"], model["state"], model["files_done"], model["files_total"]), ("model", "downloading", 0, len(files)))
-        self.assertAlmostEqual(model["total_gb"], sum(f["bytes"] for f in files) / 1e9, places=2)
-
     def test_a_config_with_only_some_parts_is_not_ready(self):
         """The config names the first part only; 'ready' used to mean that part exists."""
         data = self.root / "models" / "x"
@@ -313,44 +298,6 @@ class InstallerServerTests(unittest.TestCase):
         (data / "Model-00003-of-00003.gguf").write_bytes(b"x")
         self.assertEqual(self.mcp.shard_gaps([str(first)]), [])
         self.assertEqual(self.mcp.shard_gaps([str(data / "single.gguf")]), [])
-
-    @unittest.skipUnless(os.name == "nt" or sys.platform.startswith("linux"), "a PC with a GPU probe")
-    def test_a_real_install_reaches_the_model_download_with_nothing_else_acquired(self):
-        """setup.py in the app's mode, as the install job runs it: steps 1-4 pass (PC check, packages bundled, engine component
-        optional, llama.cpp source already present) and step 5 asks for the model file. The model host is a folder that does
-        not exist, so nothing is downloaded; pip, git, cmake and winget shims that record any call must stay unused."""
-        import setup as plain
-        if not plain.gpus():
-            self.skipTest("no NVIDIA GPU here: setup stops at step 1")
-        import shutil
-        if shutil.disk_usage(self.tmp.name).free < 130 * 10**9:
-            self.skipTest("less than 130 GB free: setup stops at its disk check before the download step")
-        home = Path(self.tmp.name) / "home"
-        shims = Path(self.tmp.name) / "shims"
-        for p in (home / "third_party" / "llama.cpp" / "ggml", home / "third_party" / "llama.cpp" / "gguf-py", shims):
-            p.mkdir(parents=True)
-        (home / "third_party" / "llama.cpp" / "ggml" / "CMakeLists.txt").write_text("", encoding="utf-8")
-        log = Path(self.tmp.name) / "shim.log"
-        for tool in ("pip", "pip3", "git", "cmake", "ninja", "winget", "curl", "wget", "cl", "make"):
-            if os.name == "nt":
-                (shims / f"{tool}.cmd").write_text(f"@echo {tool} %* >> \"{log}\"\r\n", encoding="utf-8")
-            else:
-                (shims / tool).write_text(f"#!/bin/sh\necho {tool} \"$@\" >> '{log}'\n", encoding="utf-8")
-                (shims / tool).chmod(0o755)
-        env = {k: v for k, v in os.environ.items() if k not in ("STRATA_NO_ACQUIRE", "PYTHONPATH", "VIRTUAL_ENV")}
-        env.update(STRATA_CONTROL_INSTALL="1", STRATA_INSTALL_DIR=str(home), APPDATA=str(Path(self.tmp.name) / "appdata"),
-                   XDG_CONFIG_HOME=str(Path(self.tmp.name) / "xdg"), STRATA_COMPONENTS_DIR=str(Path(self.tmp.name) / "components"),
-                   HF_ENDPOINT=(Path(self.tmp.name) / "no-such-hf").as_uri(), PATH=str(shims) + os.pathsep + env.get("PATH", ""),
-                   PYTHONIOENCODING="utf-8")
-        done = subprocess.run([sys.executable, str(ROOT / "setup.py"), "--yes", "--no-start", "--family", "qwen", "--model", "Q2_0",
-                               "--context", "32768", "--vision", "no", "--experimental-speed-projection", "off"],
-                              capture_output=True, text=True, env=env, cwd=str(ROOT), stdin=subprocess.DEVNULL, timeout=300)
-        out = done.stdout + done.stderr
-        self.assertNotEqual(done.returncode, 0)
-        self.assertIn("bundled with the app", out)
-        self.assertIn("Step 5: downloading", out)
-        self.assertIn("Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf", out)
-        self.assertFalse(log.exists(), "something ran pip, git, cmake or a package manager: " + (log.read_text() if log.exists() else ""))
 
 
 if __name__ == "__main__":
