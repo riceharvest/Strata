@@ -157,14 +157,16 @@ python3 -m strata_control.dsv41_fit \
   --ctx 32768
 ```
 
-#### Zero-SSD Execution via Dynamic Router Pruning (`--prune-experts 160`)
-DeepSeek-V4.1 has 384 experts/layer, but activation profiles show a heavy power law: the top 160 experts account for **71.0% of all activations** (and top 192 account for **77.9%**). By setting `--prune-experts 160` (or `STRATA_DS4_PRUNE_EXPERTS=160`):
+#### Zero-SSD Execution via Layer-Adaptive Router Pruning (`--prune-experts 160`)
+DeepSeek-V4.1 has 384 experts/layer, but activation distributions vary significantly by layer: input projection (Layer 0) and central reasoning hubs (Layer 19) have flatter routing distributions than late output layers. Rather than applying a naive uniform cutoff that starves Layer 19 at 65% coverage, `--prune-experts 160` (or `STRATA_DS4_PRUNE_EXPERTS=160`) uses **layer-adaptive water-filling**:
+- Dynamically allocates 150–184 experts/layer based on `profile-2.00.bin` activation frequencies, equalizing activation coverage across the network (boosting Layer 19 from **65.1% $\to$ 70.9%**).
+- Preserves the exact same total budget of **6,400 active experts (~47.7 GB)**.
 - **3,789 active experts (~28.3 GB)** fit completely in the B70's 32 GB GDDR6 VRAM.
 - The remaining **2,611 active experts (~19.5 GB)** fit 100% in Host RAM.
-- **SSD spill drops to 0 GB!** Cold experts outside the top $N$ are masked out of routing decisions with a $-10^9$ router bias, eliminating NVMe read stalls completely from the critical token decode path.
+- **SSD spill drops to 0 GB!** Cold tail experts are masked with a $-10^9$ router bias, eliminating NVMe read stalls completely from the critical token decode path.
 
 ```bash
-# Run with zero SSD spill on an Intel Arc Pro B70 + 64 GB RAM
+# Run with zero SSD spill and layer-adaptive pruning on an Intel Arc Pro B70 + 64 GB RAM
 ./sycl/build/strata-dsv41 \
   --pack /path/to/DeepSeek-V4.1-Flash-1.75bpw/pack \
   --prune-experts 160 \
@@ -183,7 +185,7 @@ Or select **DeepSeek V4.1-Flash (`1.75bpw` / `2.00bpw` / `2.25bpw`)** interactiv
 
 | Environment Variable | B70 Default | Description |
 | :--- | :---: | :--- |
-| `STRATA_DS4_PRUNE_EXPERTS` | `0` (off, or `160`/`192`) | Masks bottom $384 - N$ experts per layer in router logits ($-10^9$ bias). `--prune-experts 160` fits all active experts in 32 GB VRAM + 64 GB RAM with **0 GB SSD spill**. |
+| `STRATA_DS4_PRUNE_EXPERTS` | `0` (off, or `160`/`192`) | Layer-adaptive router pruning with water-filling coverage equalization ($-10^9$ bias). `--prune-experts 160` equalizes all layers to $\ge 70.9\%$ activation coverage and fits all active experts in 32 GB VRAM + 64 GB RAM with **0 GB SSD spill**. |
 | `STRATA_VERIFY_DEVICE_PLAN` | `1` (auto) | Builds the MTP speculative verify expert routing plan on the GPU (`verify_plan_build`) and uses the `lean` direct-to-`parts_out` verify graph. |
 | `STRATA_VERIFY_NO_HOST` | `1` (auto) | Keeps MTP verify MoE dispatch purely on the GPU + asynchronous PCIe DMA stager without stalling on host CPU misses. |
 | `STRATA_STAGER_THREADS` | `12` (auto) | Number of host threads copying missed experts into the pinned staging ring (`12` saturates PCIe 5.0 x16 without scheduling contention). |

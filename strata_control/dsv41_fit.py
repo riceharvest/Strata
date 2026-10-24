@@ -191,7 +191,7 @@ def _plan_ista(model: str, cards: list[dict] | None, ram_gb: float | None, disk_
     lines, warns = out["lines"], out["warnings"]
     if prune_experts and prune_experts > 0 and prune_experts < EXPERTS_PER_LAYER:
         out["args"] += ["--prune-experts", str(prune_experts)]
-        lines.append(f"DeepSeek-V4.1-Flash, {v['title']} (Pruned: top {active_per_layer} of 384 experts/layer): {active_experts:,} active experts "
+        lines.append(f"DeepSeek-V4.1-Flash, {v['title']} (Layer-Adaptive Pruning: avg {active_per_layer} of 384 experts/layer): {active_experts:,} active experts "
                      f"({active_exp_gb:.1f} GB of experts, {ISTA_ENGRAM_BYTES / GB:.0f} GB n-gram table). Fits in memory without SSD offload.")
     else:
         lines.append(f"DeepSeek-V4.1-Flash, {v['title']}: a {download:.0f} GB download ({set_gb:.0f} GB of model, {ISTA_ENGRAM_BYTES / GB:.0f} GB "
@@ -242,7 +242,7 @@ def _plan_ista(model: str, cards: list[dict] | None, ram_gb: float | None, disk_
             lines.append(f"Intel B70 SSD latency optimizations active: --disk-skip-w skips blocking disk reads for tail experts (<2.5% weight), "
                          f"--engram-cache-mb {eg_mb} caches hot n-grams in RAM, and LFU/LRU replacement keeps frequently hit experts resident.")
         elif is_intel and prune_experts and prune_experts > 0 and prune_experts < EXPERTS_PER_LAYER:
-            lines.append(f"Intel B70 zero-SSD execution active: --prune-experts {active_per_layer} fits all active CPU experts in host RAM "
+            lines.append(f"Intel B70 zero-SSD execution active: --prune-experts {active_per_layer} uses layer-adaptive water-filling to equalize coverage (~71% across all layers) and fits all active CPU experts in host RAM "
                          f"({out['cpu_experts_gb']:.1f} GB), eliminating SSD latency on the decode path.")
         if n >= 2 and out["tp"] == 2:
             lines.append("Two cards share each layer's matrices (--tp 2): measured about twice as fast at reading prompts.")
