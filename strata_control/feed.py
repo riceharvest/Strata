@@ -172,10 +172,14 @@ def _time(value, what: str) -> dt.datetime:
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=dt.timezone.utc)
 
 
+#: The other makes' engine families a release feed lists beside the SYCL package. Their entries are left out, not an error,
+#: so such a feed still serves the package this PC can use; any other unknown backend is still a malformed entry.
+FOREIGN_BACKENDS = ("cuda", "hip", "metal", "vulkan")
+
+
 def _foreign(item) -> bool:
-    """An engine entry for a backend this build does not run (another make of GPU): left out of the list, not an error,
-    so a feed that also lists such packages still serves the ones this PC can use."""
-    return isinstance(item, dict) and isinstance(item.get("backend"), str) and item["backend"] not in BACKEND_MATRIX
+    """An engine entry for another make of GPU (FOREIGN_BACKENDS)."""
+    return isinstance(item, dict) and item.get("backend") in FOREIGN_BACKENDS
 
 
 def _engine_package(item: dict) -> EnginePackage:

@@ -143,7 +143,7 @@ class FeedChecks(unittest.TestCase):
             self.load(*signed(document(channel="beta"), self.key), channel="stable")
 
     def test_malformed_entries_are_errors_not_defaults(self):
-        for change in ({"sha256": "nothex"}, {"size": 0}, {"format": "rar"}, {"platform": "plan9"},
+        for change in ({"sha256": "nothex"}, {"size": 0}, {"format": "rar"}, {"platform": "plan9"}, {"backend": "tpu"},
                        {"version": "latest"}, {"archs": []}, {"manifest_sha256": None}, {"size": True}):
             with self.subTest(change=change):
                 with self.assertRaises(feedmod.FeedError):
@@ -158,8 +158,8 @@ class FeedChecks(unittest.TestCase):
         feed = self.load(*signed(document(engine={"packages": [cuda, entry()]}, dsv41={"packages": [cuda]}), self.key))
         self.assertEqual([p.backend for p in feed.engine], ["sycl"])
         self.assertEqual(feed.dsv41, ())
-        tpu = self.load(*signed(document(engine={"packages": [entry(backend="tpu"), entry()]}), self.key))
-        self.assertEqual([p.backend for p in tpu.engine], ["sycl"], "a backend this build does not know is left out too")
+        hip = entry(backend="hip", variant="rx9070", archs=("gfx1201",))
+        self.assertEqual([p.backend for p in self.load(*signed(document(engine={"packages": [hip, entry()]}), self.key)).engine], ["sycl"])
 
     def test_versions_are_strict_and_ordered(self):
         self.assertLess(feedmod.version_key("0.1.9"), feedmod.version_key("0.1.10"))
