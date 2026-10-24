@@ -21,7 +21,12 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
+#include <mutex>
+#include <tuple>
 #include <type_traits>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
 // ---------------------------------------------------------------- Hardware DP4A & B70 SWAR
@@ -721,14 +726,16 @@ inline void strata_launch_impl(cudaStream_t s, dim3 grid, dim3 block, size_t shm
     }
 }
 
+// The kernel's arguments are evaluated HERE, on the host, as a <<<>>> launch does, and the values go to the device: an argument
+// such as scr->cap or *vl (host memory) read inside the device lambda would page-fault on the GPU.
 #define STRATA_LAUNCH(stream, grid, block, shmem, kernel, ...) \
-    strata_launch_impl(stream, grid, block, shmem, [=](uint8_t* _slm) { \
+    strata_launch_impl(stream, grid, block, shmem, [_ds4_args = std::make_tuple(__VA_ARGS__)](uint8_t* _slm) { \
         (void)_slm; \
-        kernel(__VA_ARGS__); \
+        std::apply([](const auto&... _ds4_a) { kernel(_ds4_a...); }, _ds4_args); \
     })
 
 #define STRATA_LAUNCH_SLM(stream, grid, block, shmem, kernel, ...) \
-    strata_launch_impl(stream, grid, block, shmem, [=](uint8_t* _slm) { \
-        kernel(__VA_ARGS__, _slm); \
+    strata_launch_impl(stream, grid, block, shmem, [_ds4_args = std::make_tuple(__VA_ARGS__)](uint8_t* _slm) { \
+        std::apply([_slm](const auto&... _ds4_a) { kernel(_ds4_a..., _slm); }, _ds4_args); \
     })
 
