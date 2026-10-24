@@ -13,19 +13,14 @@ type, layout or default; the engine's CPU decoder only gains K = 5 and 4 (ids 22
 | --- | --- |
 | `tqenc.hpp`, `tqenc.cpp` | the encoder: tail-biting Viterbi on the 2^15-state shift trellis, fp16 scale refinement, importance weights; a C API |
 | `tqenc_test.cpp` | the tests (about 64,000 checks): streams and the circular wrap, Viterbi against a naive DP, planted solutions, bit-exact decode against `tq_states.hpp` and the scalar / AVX2 / AVX-512 kernels, special blocks, thread determinism, quality against the rate-distortion limit |
-| `tqenc_hip.cpp`, `tqenc_hip_test.cpp` | the same search on a GPU (HIP, gfx1201): bit-identical blocks, about 20 M weights/s on one R9700 |
 | `../tqenc.py` | Python wrapper (ctypes): `encode`, `decode`, the input-only block-128 Hadamard, signs, the `.tqx` container |
 | `pilot.py`, `pilot_summary.py` | the block-quality pilot on a source GGUF (local files or HTTP range requests) |
 | `gyro_reencode.py`, `gyro_vs_original.py`, `gyro_error_profile.py`, `hf_slice.py` | checks against agentionai's Gyro files and the original Qwen weights |
 
-Build and test (Linux x86-64, g++ with AVX2; the GPU part needs ROCm):
+Build and test (Linux x86-64, g++ with AVX2):
 
     sh tools/trellis/build.sh test && build-tqenc/tqenc_test          # --quick skips the quality table
     sh tools/trellis/build.sh lib  && python3 tools/trellis/test_tqenc_py.py
-    sh tools/trellis/build.sh hip  && HIP_VISIBLE_DEVICES=3 build-tqenc/tqenc_hip_test
-
-`build.sh hip` compiles `tqenc.cpp` with g++ on purpose: under hipcc, `ggml-common-tq.h` turns its codebook into a
-`__device__` variable and the host side reads zeros.
 
 ## Format facts the encoder relies on (checked against the decoder, not the comments)
 

@@ -74,7 +74,7 @@ def main():
                     "gate/up and down inputs per expert) and L<l>_cnt.u64 [n_exp]: an input-column weighted encode (error = sum h (w - dec)^2)")
     ap.add_argument("--prior", type=float, default=64.0, help="pseudo-count of the layer-mean prior for rarely used experts")
     ap.add_argument("--threads", type=int, default=4)
-    ap.add_argument("--cpu", action="store_true", help="the CPU encoder instead of the card")
+    ap.add_argument("--cpu", action="store_true", help="no effect: the trellis encoder runs on the CPU (the HIP encoder was removed)")
     a = ap.parse_args()
     t = TYPES[a.type]
     cfg = CFGS[a.cfg]

@@ -61,83 +61,11 @@ def lib() -> ctypes.CDLL:
     return _lib
 
 
-_hip = None
-
-
-class _gpu_lock:
-    """TQENC_GPU_LOCK=<card number>: take the box locks (shared /data/gpu.lock, exclusive ~/locks/gpu<N>.lock) around every GPU
-    call and release them in between, so a long job that is mostly host work does not keep the card from other users.
-    TQENC_GPU_WAIT=<seconds> (default: wait for ever): give up after that long; `ok` is then False and encode() uses the CPU."""
-
-    def __init__(self):
-        self.fds = []
-        self.ok = True
-
-    def __enter__(self):
-        card = os.environ.get("TQENC_GPU_LOCK")
-        if card is None:
-            return self
-        import fcntl
-        import time
-        wait = float(os.environ.get("TQENC_GPU_WAIT", "1e9"))
-        t0 = time.time()
-        while os.path.exists(os.path.expanduser("~/locks/EXCL_WAIT")):   # a writer is waiting for the box
-            if time.time() - t0 > wait:
-                self.ok = False
-                return self
-            time.sleep(2)
-        for path, mode in (("/data/gpu.lock", fcntl.LOCK_SH), (os.path.expanduser("~/locks/gpu%s.lock" % card), fcntl.LOCK_EX)):
-            fd = os.open(path, os.O_RDWR | os.O_CREAT)
-            while True:
-                try:
-                    fcntl.flock(fd, mode | fcntl.LOCK_NB)
-                    break
-                except BlockingIOError:
-                    if time.time() - t0 > wait:
-                        os.close(fd)
-                        self.ok = False
-                        for f in reversed(self.fds):
-                            os.close(f)
-                        self.fds = []
-                        return self
-                    time.sleep(0.2)
-            self.fds.append(fd)
-        return self
-
-    def __exit__(self, *a):
-        for fd in reversed(self.fds):
-            os.close(fd)
-        return False
-
-
-def hip_lib() -> ctypes.CDLL:
-    """libtqenc_hip.so (sh tools/trellis/build.sh hip; run under the box GPU locks, HIP_VISIBLE_DEVICES picks the card)."""
-    global _hip
-    if _hip is None:
-        cands = [os.environ.get("TQENC_HIP_LIB", ""),
-                 str(pathlib.Path(__file__).resolve().parent.parent / "build-tqenc" / "libtqenc_hip.so")]
-        last = None
-        for c in cands:
-            if not c:
-                continue
-            try:
-                _hip = ctypes.CDLL(c)
-                break
-            except OSError as e:
-                last = e
-        if _hip is None:
-            raise RuntimeError("libtqenc_hip.so not found: %s" % last)
-        _hip.tqh_encode.restype = ctypes.c_double
-        _hip.tqh_encode.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int64, ctypes.c_void_p,
-                                    ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_void_p,
-                                    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int]
-    return _hip
-
-
 def encode(w: np.ndarray, t: int, h: np.ndarray | None = None, iters: int = 1, ncand: int = 1, exact: int = 0,
            scale_tries: int = 1, threads: int = 0, gpu: bool = False):
     """w: float32 array whose last axis is a multiple of 128.  Returns (packed uint8 [nblocks, block_bytes],
-    per-block error float64 [nblocks], total error, stats dict).  Error = sum h (w - decoded)^2 (h = 1 if None)."""
+    per-block error float64 [nblocks], total error, stats dict).  Error = sum h (w - decoded)^2 (h = 1 if None).
+    gpu: accepted for the callers' sake and ignored: the HIP encoder is gone, the CPU encoder writes the same blocks."""
     w = np.ascontiguousarray(w, dtype=np.float32)
     if w.shape[-1] % BLOCK:
         raise ValueError("last axis %d is not a multiple of 128" % w.shape[-1])
@@ -151,15 +79,6 @@ def encode(w: np.ndarray, t: int, h: np.ndarray | None = None, iters: int = 1, n
         if h.shape != w.shape:
             raise ValueError("importance weights must have the shape of w")
         hp = h.ctypes.data
-    if gpu:
-        if exact or t == TQ2_T:
-            raise ValueError("the GPU encoder has no exact search and no TQ2_T")
-        with _gpu_lock() as gl:
-            if gl.ok:
-                tot = hip_lib().tqh_encode(t, w.ctypes.data, hp, nb, out.ctypes.data, iters, ncand, scale_tries, 0,
-                                           err.ctypes.data, stats.ctypes.data, None, 0)
-                return out, err, tot, {"nonfinite_blocks": int(stats[0]), "zero_blocks": int(stats[1])}
-        threads = int(os.environ.get("TQENC_CPU_THREADS", threads or 24))   # the card stayed busy: the CPU encoder, same blocks
     tot = lib().tqe_encode(t, w.ctypes.data, hp, nb, out.ctypes.data, iters, ncand, exact, scale_tries, threads,
                            err.ctypes.data, stats.ctypes.data)
     return out, err, tot, {"nonfinite_blocks": int(stats[0]), "zero_blocks": int(stats[1])}
