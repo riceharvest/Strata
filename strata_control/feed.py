@@ -7,7 +7,8 @@ file's exact bytes, so there is no canonicalisation to get wrong). It lists, for
   ``platforms{<tauri target>: {url, signature}}``), plus ``sha256`` and ``size`` per platform. The Tauri updater plugin
   reads a copy of this member at ``app/latest.json`` and checks the minisign signature itself;
 * ``control``: the runtime component (Control: bundled Python, ``strata_control``, the CLI and server), one archive per platform;
-* ``engine``: the engine packages, one entry per platform / backend / variant, each with ``version``, ``archs``,
+* ``engine``: the engine packages, one entry per platform / backend / variant (entries for a backend this build does not
+  run are left out), each with ``version``, ``archs``,
   ``min_driver``, ``min_runtime``, ``size``, ``sha256`` of the archive, ``manifest_sha256`` of the package's
   ``engine-component.json`` (which holds every file's hash) and a URL.
 
@@ -171,6 +172,12 @@ def _time(value, what: str) -> dt.datetime:
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=dt.timezone.utc)
 
 
+def _foreign(item) -> bool:
+    """An engine entry for a backend this build does not run (another make of GPU): left out of the list, not an error,
+    so a feed that also lists such packages still serves the ones this PC can use."""
+    return isinstance(item, dict) and isinstance(item.get("backend"), str) and item["backend"] not in BACKEND_MATRIX
+
+
 def _engine_package(item: dict) -> EnginePackage:
     if not isinstance(item, dict):
         raise FeedError("an engine entry in the feed is not an object")
@@ -274,7 +281,7 @@ def parse(payload: bytes, *, source: str, key_id: str) -> Feed:
     if raw_engine is not None:
         if not isinstance(raw_engine, dict) or not isinstance(raw_engine.get("packages"), list):
             raise FeedError("the feed's engine member lists no packages")
-        engine = [_engine_package(item) for item in raw_engine["packages"]]
+        engine = [_engine_package(item) for item in raw_engine["packages"] if not _foreign(item)]
         seen = set()
         for pkg in engine:
             ident = (pkg.version, pkg.platform, pkg.backend, pkg.variant)
@@ -286,7 +293,7 @@ def parse(payload: bytes, *, source: str, key_id: str) -> Feed:
     if raw_dsv41 is not None:
         if not isinstance(raw_dsv41, dict) or not isinstance(raw_dsv41.get("packages"), list):
             raise FeedError("the feed's dsv41 member lists no packages")
-        dsv41 = [_engine_package(item) for item in raw_dsv41["packages"]]
+        dsv41 = [_engine_package(item) for item in raw_dsv41["packages"] if not _foreign(item)]
         seen = set()
         for pkg in dsv41:
             ident = (pkg.version, pkg.platform, pkg.backend, pkg.variant)
@@ -362,16 +369,9 @@ def fetch(source: str, trusted: dict[str, bytes], **guards) -> Feed:
 
 # ---------------------------------------------------------------------------------------------- hardware and selection
 
-def gfx_covers(archs, present: list[str]) -> bool:
-    """HIP: the build holds machine code for at least one of the installed AMD GPUs (``gfx1201``). Unknown GPUs: not a refusal."""
-    if not present:
-        return True
-    return any(a in present for a in archs)
-
-
 def engine_fit_reasons(pkg: EnginePackage, hardware: dict) -> list[str]:
     """Why `pkg` cannot run on the machine `hardware` describes; empty when it fits. `hardware` is what
-    `updater.detect_hardware()` returns: platform, backend, nvidia driver, cuda archs, gfx names, runtime version."""
+    `updater.detect_hardware()` returns: platform, backend, runtime version."""
     from strata_control import engine_component as ec
     reasons = []
     if pkg.platform != hardware["platform"]:
@@ -384,21 +384,12 @@ def engine_fit_reasons(pkg: EnginePackage, hardware: dict) -> list[str]:
     runtime = hardware.get("runtime")
     if pkg.min_runtime and runtime and ec._version_key(runtime) < ec._version_key(pkg.min_runtime):
         reasons.append(f"{pkg.label} needs control {pkg.min_runtime} or newer, this is {runtime}")
-    cuda_archs = tuple(a for a in pkg.archs if a.startswith(("sm_", "compute_")))
-    if pkg.backend == "cuda" and cuda_archs and hardware.get("cuda_archs") and not ec.arch_covers(cuda_archs, hardware["cuda_archs"]):
-        reasons.append(f"{pkg.label} has code for {', '.join(cuda_archs)}, this PC's GPU is {', '.join(hardware['cuda_archs'])}")
-    if pkg.backend == "hip" and not gfx_covers(pkg.archs, hardware.get("gfx") or []):
-        reasons.append(f"{pkg.label} has code for {', '.join(pkg.archs)}, this PC's GPU is {', '.join(hardware['gfx'])}")
-    need, have = pkg.min_driver.get("nvidia"), hardware.get("nvidia_driver")
-    if pkg.backend == "cuda" and need and have and ec._version_key(have) < ec._version_key(need):
-        reasons.append(f"{pkg.label} needs NVIDIA driver {need} or newer, this PC has {have}")
     return reasons
 
 
 def select_engine(packages, hardware: dict) -> tuple[EnginePackage | None, list[str]]:
-    """The best package for this PC and, when none fits, every reason. Best = newest version; with equal versions the build
-    that needs the newer driver (CUDA 13 beside CUDA 12), as `engine_component.resolve` chooses between installed ones."""
-    from strata_control import engine_component as ec
+    """The best package for this PC and, when none fits, every reason. Best = newest version, as
+    `engine_component.resolve` chooses between installed ones."""
     fitting, reasons = [], []
     for pkg in packages:
         why = engine_fit_reasons(pkg, hardware)
@@ -408,43 +399,4 @@ def select_engine(packages, hardware: dict) -> tuple[EnginePackage | None, list[
             fitting.append(pkg)
     if not fitting:
         return None, reasons
-    fitting = _settle_hip_variants(fitting, hardware, reasons)
-    if not fitting:
-        return None, reasons
-    best = max(fitting, key=lambda p: (version_key(p.version), ec._version_key(p.min_driver.get("nvidia", "0")),
-                                       ec.hip_preference(p.archs) if p.backend == "hip" else 1))
-    return best, reasons
-
-
-def _hip_variants(fitting) -> set[str]:
-    return {p.variant for p in fitting if p.backend == "hip"}
-
-
-def _settle_hip_variants(fitting: list, hardware: dict, reasons: list[str]) -> list:
-    """Several HIP builds "fit" only when this PC's gfx is unknown (an empty list fits everything). Version must never decide
-    between them: the newest build of the wrong card family would be refused at its test start. Order of evidence: the variant asked
-    for, the GPU's name, the variant already installed (an update never switches card family), then give up with a plain reason."""
-    if hardware.get("backend") != "hip" or hardware.get("gfx"):
-        return fitting
-    hip = [p for p in fitting if p.backend == "hip"]
-    if len({p.variant for p in hip}) < 2:
-        return fitting
-    from strata_control import engine_component as ec
-    chosen, why = [], ""
-    wanted = str(hardware.get("variant_wanted") or "").lower()
-    if wanted:
-        chosen = [p for p in hip if p.variant.lower() == wanted]
-        why = f"the {wanted} build was asked for"
-    if not chosen:
-        guesses = {g for g in (ec.gfx_from_name(n) for n in hardware.get("gpu_names") or []) if g}
-        chosen = [p for p in hip if any(a in guesses for a in p.archs)]
-        why = f"the GPU name ({', '.join(hardware.get('gpu_names') or [])}) is a {', '.join(sorted(guesses))}" if chosen else ""
-    if not chosen and hardware.get("installed_variant"):
-        chosen = [p for p in hip if p.variant == hardware["installed_variant"]]
-        why = f"the installed {hardware['installed_variant']} build is kept, this PC's AMD card could not be identified"
-    if not chosen:
-        reasons.append("Strata cannot tell which AMD build this PC needs (" + ", ".join(sorted(_hip_variants(hip))) +
-                       "); the card was not recognised, so nothing was chosen. Name the build with STRATA_ENGINE_BACKEND=hip-<build>")
-        return [p for p in fitting if p.backend != "hip"]
-    reasons.append(f"several AMD builds fit; chose {chosen[0].variant}: {why}")
-    return [p for p in fitting if p.backend != "hip" or p in chosen]
+    return max(fitting, key=lambda p: version_key(p.version)), reasons

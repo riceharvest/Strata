@@ -680,13 +680,7 @@ class Runner:
         if not note:
             note = str(report.get("notice") or "").strip()
         if "backend" in report and report["backend"] is None:                    # not even a graphics card Strata knows: say that, not "the feed has nothing"
-            names = []
-            try:
-                from strata_control import engine_component as ec
-                names = [a.get("name", "") for a in ec.windows_display_adapters()] if os.name == "nt" else []
-            except Exception:                                # noqa: BLE001 - the names are a nicety
-                pass
-            return no_gpu_words(names)
+            return no_gpu_words([])
         if not note or note.startswith("No engine for this PC was found"):
             note = "There is no engine for this computer's graphics card in the update source."
         return note
@@ -1200,13 +1194,9 @@ class Runner:
     # ---- 3. config and profile
     def drafting_inputs(self, cfg: dict) -> dict:
         """What strata_control/drafting.py needs to decide for this launch: the choice, the card class, the model and the data folder."""
-        from strata_control import drafting, engine_component
-        try:
-            archs = list(engine_component.cuda_archs_present()) + list(engine_component.hip_archs_present())
-        except Exception:                                    # noqa: BLE001 - an unknown card is the "other" class
-            archs = []
+        from strata_control import drafting
         mode = self.s.drafting if self.s.drafting is not None else cfg.get("drafting")
-        return {"mode": mode, "klass": drafting.card_class(archs), "model_name": cfg.get("model_name"), "family": self.s.family,
+        return {"mode": mode, "klass": drafting.card_class([]), "model_name": cfg.get("model_name"), "family": self.s.family,
                 "data_dir": drafting.data_dir_of(cfg.get("args") or []) or (Path(self.s.data_dir) if self.s.data_dir else None)}
 
     def ensure_drafter(self, base_path: Path) -> None:

@@ -40,14 +40,10 @@ class UpdaterCase(unittest.TestCase):
             os.environ.pop(name, None)
         env = mock.patch.dict(os.environ, {
             "STRATA_PROFILE_DIR": str(self.root / "profiles"), "STRATA_RUNTIME_DIR": str(self.root / "runtime"),
-            "STRATA_COMPONENTS_DIR": str(self.components), "STRATA_ENGINE_BACKEND": "cuda",
+            "STRATA_COMPONENTS_DIR": str(self.components), "STRATA_ENGINE_BACKEND": "sycl",
             "FAKE_ENGINE_MARK": str(self.root / "ran.txt")})
         env.start()
         self.addCleanup(env.stop)
-        for target, value in ((ec, "cuda_archs_present"), (ec, "nvidia_driver_version")):
-            patch = mock.patch.object(target, value, return_value=["sm_86"] if value == "cuda_archs_present" else "610.47")
-            patch.start()
-            self.addCleanup(patch.stop)
         ec.register_signature_verifier(None)               # a verifier an earlier test file left behind (it holds the shipped keys only) must not decide here
         self.addCleanup(ec.register_signature_verifier, None)
         # the tests sign with throwaway keys that they hand over explicitly: the release key shipped in update_keys.json is not in play here
@@ -64,8 +60,7 @@ class UpdaterCase(unittest.TestCase):
         patch = mock.patch.dict(os.environ, {"STRATA_UPDATE_TRUSTED_KEYS": str(self.test_keys)})
         patch.start()
         self.addCleanup(patch.stop)
-        self.hardware = {"platform": PLATFORM, "backend": "cuda", "runtime": None, "nvidia_driver": "610.47",
-                         "cuda_archs": ["sm_86"], "gfx": []}
+        self.hardware = {"platform": PLATFORM, "backend": "sycl", "runtime": None}
         self.models = self.root / "models"
         self.models.mkdir()
         (self.models / "model.gguf").write_bytes(b"GGUF" + os.urandom(2048))
@@ -98,7 +93,7 @@ class UpdaterCase(unittest.TestCase):
         (tokenizer / "merges.txt").write_text("a b")
         (tokenizer / "token_type.json").write_text(json.dumps([0] * 257 + [3, 3, 3]))
         self.config = self.root / "run.json"
-        self.config.write_text(json.dumps({"exe": "/some/old/engine", "backend": "cuda", "tokenizer": str(tokenizer), "args": [],
+        self.config.write_text(json.dumps({"exe": "/some/old/engine", "backend": "sycl", "tokenizer": str(tokenizer), "args": [],
                                            "cwd": str(self.root), "model_name": "fake", "host": "127.0.0.1", "port": 0}))
 
     # ------------------------------------------------------------------ helpers
@@ -145,7 +140,7 @@ class UpdaterCase(unittest.TestCase):
         return sorted(p.name for p in folder.iterdir() if p.is_dir()) if folder.exists() else []
 
     def resolved(self):
-        return ec.resolve(self.components, backend="cuda").version
+        return ec.resolve(self.components, backend="sycl").version
 
     def assert_user_data_untouched(self):
         self.assertEqual(self.preset.read_bytes(), self.preset_bytes, "a saved preset must not change")
@@ -163,7 +158,7 @@ class EngineUpdate(UpdaterCase):
         self.assertEqual(report["engine"]["status"], "available")
         self.assertEqual((report["engine"]["installed"]["version"], report["engine"]["offered"]["version"]), ("0.1.45", "0.1.46"))
         self.assertEqual([r[1] for r in self.server.requests], ["/strata-feed.json", "/strata-feed.json.sig"])
-        self.assertEqual(self.engine_folders(), [f"0.1.45-{PLATFORM}-cuda-cuda13"])
+        self.assertEqual(self.engine_folders(), [f"0.1.45-{PLATFORM}-sycl"])
 
     def test_update_downloads_verifies_test_starts_then_switches(self):
         old = self.install_current()
@@ -174,7 +169,7 @@ class EngineUpdate(UpdaterCase):
         self.assertEqual((out["exit_code"], result["status"], result["changed"]), (0, "updated", True), out)
         self.assertEqual(result["test_start"]["mode"], "full")
         self.assertEqual(self.resolved(), "0.1.46")
-        self.assertEqual(sorted(self.engine_folders()), [f"0.1.45-{PLATFORM}-cuda-cuda13", f"0.1.46-{PLATFORM}-cuda-cuda13"],
+        self.assertEqual(sorted(self.engine_folders()), [f"0.1.45-{PLATFORM}-sycl", f"0.1.46-{PLATFORM}-sycl"],
                          "the previous version stays for a manual rollback")
         # the test start ran the staged copy, not a file in the live folder
         ran = (self.root / "ran.txt").read_text().splitlines()[0]
@@ -209,7 +204,7 @@ class EngineUpdate(UpdaterCase):
         self.publish(("0.1.47", fx.GOOD_ENGINE))
         out = updater.run_update(self.ctx(), control=False)
         self.assertEqual(out["results"][0]["status"], "updated")
-        self.assertEqual(self.engine_folders(), [f"0.1.46-{PLATFORM}-cuda-cuda13", f"0.1.47-{PLATFORM}-cuda-cuda13"])
+        self.assertEqual(self.engine_folders(), [f"0.1.46-{PLATFORM}-sycl", f"0.1.47-{PLATFORM}-sycl"])
         self.assertEqual(self.resolved(), "0.1.47")
 
     def test_a_failing_test_start_keeps_the_old_engine(self):
@@ -223,7 +218,7 @@ class EngineUpdate(UpdaterCase):
         self.assertNotIn("server_exited", result["error"], "the engine's own words stay out of the sentence")
         self.assertIn("strata update --force", result["error"])
         self.assertEqual(self.resolved(), "0.1.45")
-        self.assertEqual(self.engine_folders(), [f"0.1.45-{PLATFORM}-cuda-cuda13"], "the failed engine was never put in the live folder")
+        self.assertEqual(self.engine_folders(), [f"0.1.45-{PLATFORM}-sycl"], "the failed engine was never put in the live folder")
         self.assertEqual(sorted(p.name for p in (self.components / ".s").iterdir()), [])
         self.assertEqual(preset_marks.pending(self.state_base), [])
         self.assert_user_data_untouched()
@@ -357,7 +352,7 @@ class EngineUpdate(UpdaterCase):
         out = updater.rollback_engine(self.ctx())
         self.assertEqual((out["status"], out["from"], out["to"]), ("rolled-back", "0.1.46", "0.1.45"))
         self.assertEqual(self.resolved(), "0.1.45")
-        self.assertEqual(ec.status(self.components, backend="cuda")["pinned"], f"0.1.45-{PLATFORM}-cuda-cuda13")
+        self.assertEqual(ec.status(self.components, backend="sycl")["pinned"], f"0.1.45-{PLATFORM}-sycl")
         self.assertEqual(preset_marks.pending(self.state_base), [], "back on the engine the presets were measured on: nothing owed")
         again = updater.run_update(self.ctx(), control=False)
         self.assertEqual(again["results"][0]["status"], "skipped")
@@ -384,7 +379,7 @@ class EngineUpdate(UpdaterCase):
 
     def test_a_broken_installed_engine_is_replaced_by_a_good_one(self):
         folder = self.install_current("0.1.46")
-        library = next(p for p in folder.iterdir() if p.name.startswith(("cudart", "libcudart")))
+        library = next(p for p in folder.iterdir() if p.name.startswith(("sycl", "libsycl")))
         body = bytearray(library.read_bytes())
         body[5] ^= 0xFF
         library.write_bytes(bytes(body))
@@ -394,11 +389,11 @@ class EngineUpdate(UpdaterCase):
         self.assertEqual(out["results"][0]["status"], "updated", out)
         self.assertEqual(self.resolved(), "0.1.46")
 
-    def test_the_package_for_another_gpu_is_not_offered(self):
-        self.publish(("0.1.46", fx.GOOD_ENGINE, {"archs": ("sm_90",)}))
-        out = updater.run_update(self.ctx(hardware={**self.hardware, "cuda_archs": ["sm_61"]}), control=False)
+    def test_the_package_for_another_backend_is_not_offered(self):
+        self.publish(("0.1.46", fx.GOOD_ENGINE))
+        out = updater.run_update(self.ctx(hardware={**self.hardware, "backend": "cpu"}), control=False)
         self.assertEqual(out["results"][0]["status"], "none-for-this-pc")
-        self.assertIn("sm_61", " ".join(out["results"][0]["reasons"]))
+        self.assertIn("this PC needs cpu", " ".join(out["results"][0]["reasons"]))
         self.assertEqual(self.archive_requests(), [])
 
     def test_a_process_that_forbids_acquiring_cannot_update(self):
@@ -445,7 +440,7 @@ class StartPathSignature(UpdaterCase):
         (target / ec.MANIFEST).write_text(json.dumps(manifest))
         ec.register_signature_verifier(None)
         with self.assertRaises(ec.EngineMissing) as caught:
-            ec.resolve(self.components, backend="cuda")
+            ec.resolve(self.components, backend="sycl")
         self.assertIn("signature", str(caught.exception))
 
     def test_without_trusted_keys_a_signed_package_is_unverified_and_required_signing_refuses_it(self):
@@ -769,23 +764,6 @@ class Cli(UpdaterCase):
             self.assertIn("STRATA_NO_ACQUIRE", err)
         self.assertEqual(self.resolved(), "0.1.45")
         self.assertEqual(self.archive_requests(), [])
-
-
-class AnotherCardFamilyNote(unittest.TestCase):
-    """A feed whose only HIP engine is built for another AMD card family says so in one plain line."""
-
-    def test_the_note_names_both_families_and_the_build_to_ask_for(self):
-        import tempfile
-        from types import SimpleNamespace
-        pkg = SimpleNamespace(label="0.1.45.1 linux-x86_64-hip-rx7900", platform="linux-x86_64", backend="hip", min_runtime=None,
-                              archs=("gfx1100", "gfx1101", "gfx1102"), min_driver={})
-        hardware = {"platform": "linux-x86_64", "backend": "hip", "runtime": None, "gfx": ["gfx1201"], "cuda_archs": [], "nvidia_driver": None}
-        with tempfile.TemporaryDirectory() as d:
-            ctx = SimpleNamespace(components=Path(d), hardware=hardware)
-            report, offered = updater._choose_engine(SimpleNamespace(engine=[pkg]), ctx, SimpleNamespace(section=lambda name: {}))
-        self.assertIsNone(offered)
-        self.assertEqual(report["status"], "none-for-this-pc")
-        self.assertEqual(report["note"], "This build of Strata is for AMD RX 7000 cards. This computer has an AMD RX 9000 card (gfx1201). Ask for the RX 9000 build.")
 
 
 if __name__ == "__main__":

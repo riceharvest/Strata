@@ -46,7 +46,7 @@ def trusted_of(key: dict) -> dict:
 
 
 def build_package(parent: Path, version: str, *, engine_source: str = GOOD_ENGINE, key: dict | None = None,
-                  backend: str = "cuda", variant: str = "cuda13", build_id: str | None = None, archs=("sm_86", "compute_89"),
+                  backend: str = "sycl", variant: str = "", build_id: str | None = None, archs=("intel-arc",),
                   min_driver=None, padding: int = 0) -> Path:
     """A schema-2 package made by the real packager (a stub engine behind a manifest-declared entrypoint). `padding` bytes of
     an incompressible 'library' make the archive big enough for a transfer to be cut part-way."""
@@ -56,17 +56,17 @@ def build_package(parent: Path, version: str, *, engine_source: str = GOOD_ENGIN
     if WINDOWS:
         entry = "strata.cmd"
         (src / entry).write_bytes(f'@echo off\r\n"{sys.executable}" "%~dp0engine_main.py" %*\r\n'.encode())
-        library = "cudart64_13.dll"
+        library = "sycl8.dll"
     else:
         entry = "strata"
         (src / entry).write_text(f'#!/bin/sh\nexec "{sys.executable}" "$(dirname "$0")/engine_main.py" "$@"\n')
         (src / entry).chmod(0o755)
-        library = "libcudart.so.13"
+        library = "libsycl.so.8"
     (src / library).write_bytes(os.urandom(padding) if padding else b"a runtime library the stub never loads " * 50)
     out = parent / "built"
     out.mkdir(exist_ok=True)
     folder = package_engine.build(src, backend, version, components.host_platform(), out, entry=entry, archs=tuple(archs),
-                                  min_driver=min_driver or {"nvidia": "580.65"}, build_id=build_id or f"stub-{version}",
+                                  min_driver=min_driver or {}, build_id=build_id or f"stub-{version}",
                                   variant=variant, include=["engine_main.py"])
     if key is not None:
         feed_tool.sign_package(folder, key)

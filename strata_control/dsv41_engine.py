@@ -21,7 +21,7 @@ def exe_name() -> str:
 
 
 def version_key(folder_name: str) -> tuple:
-    """The version at the front of a package folder's name ("0.1.49-windows-x86_64-cuda-cuda13" -> (0, 1, 49)), for choosing the newest."""
+    """The version at the front of a package folder's name ("0.1.49-linux-x86_64-sycl" -> (0, 1, 49)), for choosing the newest."""
     head = str(folder_name).split("-")[0]
     return tuple(int(x) for x in head.split(".") if x.isdigit())
 

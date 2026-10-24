@@ -38,8 +38,8 @@ def manifest(**over) -> dict:
         "id": "strata-engine",
         "version": "0.1.44.1",
         "kind": "engine",
-        "backend": "metal",
-        "platforms": ["macos-arm64"],
+        "backend": "sycl",
+        "platforms": ["linux-x86_64"],
         "artifacts": [{"name": "engine.tar.gz", "url": "https://example.invalid/e.tar.gz",
                        "sha256": "a" * 64, "bytes": 1024, "format": "tar.gz"}],
         "license": "proprietary",
@@ -91,7 +91,7 @@ class TestManifestParsing(StoreCase):
     def test_a_valid_manifest_parses(self):
         c = C.parse_manifest(manifest())
         self.assertEqual(c.id, "strata-engine")
-        self.assertEqual(c.backend, "metal")
+        self.assertEqual(c.backend, "sycl")
         self.assertEqual(len(c.artifacts), 1)
 
     def test_a_manifest_without_a_digest_is_refused(self):
@@ -145,34 +145,31 @@ class TestManifestParsing(StoreCase):
 
 class TestCompatibility(StoreCase):
     def test_a_component_for_this_platform_is_compatible(self):
-        self.assertEqual(C.check_compatible(C.parse_manifest(manifest()), target="macos-arm64"), [])
+        self.assertEqual(C.check_compatible(C.parse_manifest(manifest()), target="linux-x86_64"), [])
 
     def test_another_platform_is_refused_with_both_named(self):
-        reasons = C.check_compatible(C.parse_manifest(manifest()), target="linux-x86_64")
+        reasons = C.check_compatible(C.parse_manifest(manifest()), target="windows-x86_64")
         self.assertTrue(reasons)
-        self.assertIn("macos-arm64", reasons[0])
         self.assertIn("linux-x86_64", reasons[0])
+        self.assertIn("windows-x86_64", reasons[0])
 
     def test_a_backend_that_is_not_committed_to_on_a_platform_is_refused(self):
-        """Windows SYCL and Intel Macs are explicitly not supported, not merely untested."""
+        """Windows SYCL is explicitly not supported, not merely untested."""
         ok, why = C.backend_supported("sycl", "windows-x86_64")
         self.assertFalse(ok)
         self.assertIn("not a supported combination", why)
-        ok, why = C.backend_supported("metal", "macos-x86_64")
-        self.assertFalse(ok, "Intel Macs are excluded from local Metal support")
-        self.assertTrue(C.backend_supported("metal", "macos-arm64")[0])
-        self.assertTrue(C.backend_supported("cuda", "linux-x86_64")[0])
         self.assertTrue(C.backend_supported("sycl", "linux-x86_64")[0])
 
     def test_an_unknown_backend_is_refused(self):
-        ok, why = C.backend_supported("vulkan", "linux-x86_64")
-        self.assertFalse(ok)
-        self.assertIn("unknown backend family", why)
+        for backend in ("vulkan", "cuda", "hip", "metal"):
+            ok, why = C.backend_supported(backend, "linux-x86_64")
+            self.assertFalse(ok)
+            self.assertIn("unknown backend family", why)
 
     def test_a_component_for_another_backend_is_refused(self):
-        c = C.parse_manifest(manifest(backend="metal", platforms=["macos-arm64"]))
-        reasons = C.check_compatible(c, target="macos-arm64", backend="cuda")
-        self.assertTrue(any("built for the metal backend" in r for r in reasons), reasons)
+        c = C.parse_manifest(manifest(backend="sycl", platforms=["linux-x86_64"]))
+        reasons = C.check_compatible(c, target="linux-x86_64", backend="cpu")
+        self.assertTrue(any("built for the sycl backend" in r for r in reasons), reasons)
 
 
 class TestSafeExtraction(StoreCase):
@@ -260,7 +257,7 @@ class TestSafeExtraction(StoreCase):
 class TestInstall(StoreCase):
     def test_a_verified_component_installs_into_the_cache(self):
         component, payloads = self.payload(tar_bytes([("bin/strata", b"engine")]))
-        path = self.store.install(component, payloads=payloads, target="macos-arm64")
+        path = self.store.install(component, payloads=payloads, target="linux-x86_64")
         self.assertTrue((path / ".complete").exists())
         self.assertEqual((path / "bin/strata").read_bytes(), b"engine")
         self.assertEqual(path.name, component.cache_key)
@@ -270,7 +267,7 @@ class TestInstall(StoreCase):
         component, _ = self.payload(data)
         wrong = b"different bytes entirely"
         with self.assertRaises(C.ComponentError) as ctx:
-            self.store.install(component, payloads={"engine.tar.gz": wrong}, target="macos-arm64")
+            self.store.install(component, payloads={"engine.tar.gz": wrong}, target="linux-x86_64")
         self.assertIn("does not match its manifest", str(ctx.exception))
         cache = self.store.root / "cache"
         present = [p.name for p in cache.iterdir()] if cache.exists() else []
@@ -281,21 +278,21 @@ class TestInstall(StoreCase):
         component, _ = self.payload(data)
         object.__setattr__(component.artifacts[0], "bytes", len(data) + 5)
         with self.assertRaises(C.ComponentError) as ctx:
-            self.store.install(component, payloads={"engine.tar.gz": data}, target="macos-arm64")
+            self.store.install(component, payloads={"engine.tar.gz": data}, target="linux-x86_64")
         self.assertIn("bytes", str(ctx.exception))
 
     def test_an_incompatible_component_is_refused_before_anything_is_written(self):
         component, payloads = self.payload(tar_bytes([("a", b"x")]))
         with self.assertRaises(C.ComponentError) as ctx:
-            self.store.install(component, payloads=payloads, target="linux-x86_64")
+            self.store.install(component, payloads=payloads, target="windows-x86_64")
         self.assertEqual(ctx.exception.code, 2)
         self.assertFalse(any((self.store.root / "cache").iterdir()))
 
     def test_a_second_install_of_the_same_bytes_reuses_the_cache(self):
         component, payloads = self.payload(tar_bytes([("a", b"x")]))
-        first = self.store.install(component, payloads=payloads, target="macos-arm64")
+        first = self.store.install(component, payloads=payloads, target="linux-x86_64")
         stamp = (first / ".complete").stat().st_mtime_ns
-        second = self.store.install(component, target="macos-arm64")
+        second = self.store.install(component, target="linux-x86_64")
         self.assertEqual(first, second)
         self.assertEqual((second / ".complete").stat().st_mtime_ns, stamp,
                          "the cached payload was reused rather than rebuilt")
@@ -304,7 +301,7 @@ class TestInstall(StoreCase):
         data = tar_bytes([("fine.txt", b"ok"), ("../escape", b"x")])
         component, payloads = self.payload(data)
         with self.assertRaises(C.UnsafeArchive):
-            self.store.install(component, payloads=payloads, target="macos-arm64")
+            self.store.install(component, payloads=payloads, target="linux-x86_64")
         self.assertFalse(any((self.store.root / "cache").iterdir()))
         self.assertFalse((self.tmp / "escape").exists(), "nothing escaped the destination")
 
@@ -320,34 +317,34 @@ class TestActivation(StoreCase):
 
     def test_activation_puts_the_payload_at_the_active_path(self):
         component, payloads = self.build("1.0", b"one")
-        self.store.install(component, payloads=payloads, target="macos-arm64")
-        result = self.store.activate(component, target="macos-arm64")
+        self.store.install(component, payloads=payloads, target="linux-x86_64")
+        result = self.store.activate(component, target="linux-x86_64")
         self.assertEqual((Path(result["active"]) / "marker").read_bytes(), b"one")
 
     def test_the_cache_survives_activation(self):
         """A compatible application update must not have to download the engine again."""
         component, payloads = self.build("1.0", b"one")
-        cached = self.store.install(component, payloads=payloads, target="macos-arm64")
-        self.store.activate(component, target="macos-arm64")
+        cached = self.store.install(component, payloads=payloads, target="linux-x86_64")
+        self.store.activate(component, target="linux-x86_64")
         self.assertTrue((cached / "marker").exists(), "the cached payload was consumed")
 
     def test_activating_a_newer_version_retains_the_previous_one(self):
         first, p1 = self.build("1.0", b"one")
-        self.store.install(first, payloads=p1, target="macos-arm64")
-        self.store.activate(first, target="macos-arm64")
+        self.store.install(first, payloads=p1, target="linux-x86_64")
+        self.store.activate(first, target="linux-x86_64")
         second, p2 = self.build("2.0", b"two")
-        self.store.install(second, payloads=p2, target="macos-arm64")
-        result = self.store.activate(second, target="macos-arm64")
+        self.store.install(second, payloads=p2, target="linux-x86_64")
+        result = self.store.activate(second, target="linux-x86_64")
         self.assertTrue(result["moved_aside"], "the displaced version is kept, not deleted")
         self.assertEqual((Path(result["active"]) / "marker").read_bytes(), b"two")
 
     def test_rollback_restores_the_previous_version_exactly(self):
         first, p1 = self.build("1.0", b"one")
-        self.store.install(first, payloads=p1, target="macos-arm64")
-        self.store.activate(first, target="macos-arm64")
+        self.store.install(first, payloads=p1, target="linux-x86_64")
+        self.store.activate(first, target="linux-x86_64")
         second, p2 = self.build("2.0", b"two")
-        self.store.install(second, payloads=p2, target="macos-arm64")
-        self.store.activate(second, target="macos-arm64")
+        self.store.install(second, payloads=p2, target="linux-x86_64")
+        self.store.activate(second, target="linux-x86_64")
 
         result = self.store.rollback("strata-engine")
         self.assertEqual(result["restored"], "1.0")
@@ -357,8 +354,8 @@ class TestActivation(StoreCase):
     def test_rollback_without_a_previous_version_is_refused(self):
         """'Rollback succeeded' and 'the component is gone' must not be the same outcome."""
         component, payloads = self.build("1.0", b"one")
-        self.store.install(component, payloads=payloads, target="macos-arm64")
-        self.store.activate(component, target="macos-arm64")
+        self.store.install(component, payloads=payloads, target="linux-x86_64")
+        self.store.activate(component, target="linux-x86_64")
         with self.assertRaises(C.ComponentError) as ctx:
             self.store.rollback("strata-engine")
         self.assertEqual(ctx.exception.code, 2)
@@ -368,14 +365,14 @@ class TestActivation(StoreCase):
     def test_activating_something_not_installed_is_refused(self):
         component, _ = self.build("1.0", b"one")
         with self.assertRaises(C.ComponentError) as ctx:
-            self.store.activate(component, target="macos-arm64")
+            self.store.activate(component, target="linux-x86_64")
         self.assertIn("not installed", str(ctx.exception))
 
     def test_activating_an_incompatible_component_is_refused(self):
         component, payloads = self.build("1.0", b"one")
-        self.store.install(component, payloads=payloads, target="macos-arm64")
+        self.store.install(component, payloads=payloads, target="linux-x86_64")
         with self.assertRaises(C.ComponentError) as ctx:
-            self.store.activate(component, target="linux-x86_64")
+            self.store.activate(component, target="windows-x86_64")
         self.assertEqual(ctx.exception.code, 2)
 
 
@@ -390,10 +387,10 @@ class TestStoreState(StoreCase):
 
     def test_installed_versions_are_listed_and_the_active_one_marked(self):
         one, p1 = self.build("1.0")
-        self.store.install(one, payloads=p1, target="macos-arm64")
+        self.store.install(one, payloads=p1, target="linux-x86_64")
         two, p2 = self.build("2.0")
-        self.store.install(two, payloads=p2, target="macos-arm64")
-        self.store.activate(one, target="macos-arm64")
+        self.store.install(two, payloads=p2, target="linux-x86_64")
+        self.store.activate(one, target="linux-x86_64")
         listed = self.store.installed("strata-engine")
         self.assertEqual([c.version for c in listed], ["1.0", "2.0"])
         self.assertEqual([c.version for c in listed if c.active], ["1.0"])
@@ -404,11 +401,11 @@ class TestStoreState(StoreCase):
 
     def test_pruning_keeps_what_is_active_and_what_rollback_needs(self):
         one, p1 = self.build("1.0")
-        self.store.install(one, payloads=p1, target="macos-arm64")
-        self.store.activate(one, target="macos-arm64")
+        self.store.install(one, payloads=p1, target="linux-x86_64")
+        self.store.activate(one, target="linux-x86_64")
         two, p2 = self.build("2.0")
-        kept = self.store.install(two, payloads=p2, target="macos-arm64")
-        self.store.activate(two, target="macos-arm64")
+        kept = self.store.install(two, payloads=p2, target="linux-x86_64")
+        self.store.activate(two, target="linux-x86_64")
 
         removed = self.store.prune_cache()
         self.assertNotIn(one.cache_key, removed, "the rollback target must survive a prune")
@@ -491,7 +488,7 @@ class TestInterruptedTransfer(StoreCase):
         data = tar_bytes([("a", b"x")])
         component, _ = self.payload(data)
         with self.assertRaises(C.ComponentError):
-            self.store.install(component, payloads={"engine.tar.gz": b"wrong"}, target="macos-arm64")
+            self.store.install(component, payloads={"engine.tar.gz": b"wrong"}, target="linux-x86_64")
         self.assertIsNone(self.store.cached(component))
 
 

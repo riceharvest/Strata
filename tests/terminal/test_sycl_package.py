@@ -29,11 +29,7 @@ def entry(platform, backend, variant, archs, version="0.1.47"):
             "installed_bytes": 2000, "notes": ""}
 
 
-FEED = [feedmod._engine_package(e) for e in (
-    entry(LINUX, "cuda", "cuda13", ("sm_75", "sm_86", "sm_89", "sm_120", "compute_120")),
-    entry(LINUX, "hip", "rx9070", ("gfx1200", "gfx1201")),
-    entry(WIN, "cuda", "cuda13", ("sm_86",)),
-    entry(LINUX, "sycl", "", ("intel-arc",)))]
+FEED = [feedmod._engine_package(entry(LINUX, "sycl", "", ("intel-arc",)))]
 
 
 def fake_drm(root: Path, *vendors: str) -> str:
@@ -55,8 +51,7 @@ class ArcChoice(unittest.TestCase):
             with mock.patch.object(ec.shutil, "which", return_value=None), \
                     mock.patch.object(ec, "host_platform", return_value=platform), \
                     mock.patch.object(updater, "host_platform", return_value=platform), \
-                    mock.patch.object(ec, "_drm_vendor_backend", lambda: real(drm)), \
-                    mock.patch.object(ec, "windows_display_adapters", return_value=[]),                     mock.patch.object(ec, "_windows_vendor_backend", lambda: real(drm)):      # the test PC may be Windows: either probe answers
+                    mock.patch.object(ec, "_drm_vendor_backend", lambda: real(drm)):
                 return updater.detect_hardware(environ or {})
 
     def pick(self, hardware):
@@ -69,11 +64,15 @@ class ArcChoice(unittest.TestCase):
         best, _ = self.pick(hw)
         self.assertEqual((best.backend, best.platform, best.archs), ("sycl", LINUX, ("intel-arc",)))
 
-    def test_nvidia_and_amd_pcs_never_get_it_even_with_an_intel_igpu_beside_the_card(self):
-        for vendors, want in ((("0x10de",), "cuda"), (("0x8086", "0x10de"), "cuda"), (("0x8086", "0x1002"), "hip")):
+    def test_a_pc_without_an_intel_card_gets_nothing(self):
+        for vendors in (("0x10de",), ("0x1002",), ()):
             hw = self.detect(*vendors)
-            best, _ = self.pick(hw)
-            self.assertEqual(best.backend, want, vendors)
+            self.assertIsNone(hw["backend"], vendors)
+            self.assertIsNone(self.pick(hw)[0], vendors)
+
+    def test_a_feed_entry_for_another_make_of_card_is_left_out_not_an_error(self):
+        self.assertTrue(feedmod._foreign(entry(LINUX, "cuda", "cuda13", ("sm_86",))))
+        self.assertFalse(feedmod._foreign(entry(LINUX, "sycl", "", ("intel-arc",))))
 
     def test_windows_has_no_intel_package_and_says_why(self):
         hw = self.detect("0x8086", platform=WIN)
@@ -83,10 +82,9 @@ class ArcChoice(unittest.TestCase):
         self.assertEqual(ec.backend_supported("sycl", WIN)[0], False)
         self.assertEqual(ec.backend_supported("sycl", LINUX)[0], True)
 
-    def test_the_package_is_not_offered_to_a_mac_or_to_a_forced_other_backend(self):
-        self.assertIsNone(self.pick({"platform": "macos-arm64", "backend": "metal", "runtime": "0.2.2"})[0])
-        best, _ = self.pick(self.detect("0x8086", environ={ec.ENV_BACKEND: "cuda"}))
-        self.assertEqual(best.backend, "cuda")
+    def test_the_package_is_not_offered_to_a_forced_other_backend(self):
+        best, _ = self.pick(self.detect("0x8086", environ={ec.ENV_BACKEND: "cpu"}))
+        self.assertIsNone(best)
 
     def test_an_older_sycl_package_does_not_beat_the_new_one_and_a_newer_one_wins(self):
         packages = [feedmod._engine_package(entry(LINUX, "sycl", "", ("intel-arc",), v)) for v in ("0.1.45", "0.1.47", "0.1.46")]
@@ -94,7 +92,7 @@ class ArcChoice(unittest.TestCase):
         self.assertEqual(best.version, "0.1.47")
 
     def test_no_package_at_all_gives_the_plain_no_engine_reason(self):
-        best, why = feedmod.select_engine([p for p in FEED if p.backend != "sycl"], self.detect("0x8086"))
+        best, why = feedmod.select_engine([feedmod._engine_package(entry(LINUX, "cpu", "", ()))], self.detect("0x8086"))
         self.assertIsNone(best)
         self.assertTrue(any("needs sycl" in r for r in why), why)
 

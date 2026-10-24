@@ -16,8 +16,8 @@ Layout (``components_dir()``)::
 Manifest (``engine-component.json``, schema 2; schema 1 packages still load). packaging/README.md has the full table::
 
     {"schema_version": 2, "id": "strata-engine", "name": "strata-engine", "version": "0.1.45",
-     "platform": "linux-x86_64", "backend": "cuda", "archs": ["sm_86", "compute_89"],
-     "min_driver": {"nvidia": "580.65"}, "build_id": "be885026f9-cuda13.0", "min_runtime": "0.1.45",
+     "platform": "linux-x86_64", "backend": "sycl", "archs": ["intel-arc"],
+     "min_driver": {}, "build_id": "be885026f9-sycl", "min_runtime": "0.1.45",
      "entrypoint": "strata", "files": [{"path": "strata", "sha256": "...", "bytes": 1}, ...],
      "signature": null}                      # S6 fills it; verify_signature() is the hook
 
@@ -30,8 +30,8 @@ Checks, in order, and each one names what failed:
   an unsigned or unverifiable package);
 * every listed file exists with the listed size, and every file's SHA-256 matches (`verify(full=True)`, which is what
   a start does; the quick listing/status path hashes only the entrypoint);
-* the runtime that is asking is new enough for `min_runtime`, and the GPU driver (when it can be read) for
-  `min_driver`. A package that fails an integrity check is `EngineIntegrityError`: nothing is started.
+* the runtime that is asking is new enough for `min_runtime`. A package that fails an integrity check is
+  `EngineIntegrityError`: nothing is started.
 
 Nothing here imports anything outside the standard library and `strata_control`.
 """
@@ -127,23 +127,15 @@ class EngineComponent:
     min_runtime: str | None = None
     archs: tuple[str, ...] = ()
     notes: str = ""
-    min_driver: dict = field(default_factory=dict)       # {"nvidia": "580.65"}: the oldest driver the build runs on
+    min_driver: dict = field(default_factory=dict)       # {vendor: version}: the oldest driver the build runs on (read, not checked)
     build_id: str = ""                                    # which engine build this is (source commit + toolkit)
-    variant: str = ""                                     # optional tag when one backend has several builds (cuda13, cuda12)
+    variant: str = ""                                     # optional tag when one backend has several builds
     signature: dict | None = None                         # S6: {"alg", "key_id", "value"} over signing_payload()
     raw: dict = field(default_factory=dict, repr=False)   # the manifest as read, for the signature check
 
     @property
     def exe(self) -> Path:
         return self.root / self.entrypoint
-
-    @property
-    def cuda_archs(self) -> tuple[str, ...]:
-        return tuple(item for item in self.archs if item.startswith(("sm_", "compute_")))
-
-    @property
-    def hip_archs(self) -> tuple[str, ...]:
-        return tuple(item for item in self.archs if item.startswith("gfx"))
 
     def to_dict(self) -> dict:
         return {"id": self.id, "version": self.version, "platform": self.platform, "backend": self.backend,
@@ -154,8 +146,7 @@ class EngineComponent:
 
 def package_lib_dirs(folder) -> list[str]:
     """The folders an engine package needs on the library path (``PATH`` on Windows, ``LD_LIBRARY_PATH`` elsewhere): its own folder, then
-    the ones its BUILD.json names in ``lib_dirs`` (relative; the Windows HIP package keeps the ROCm DLLs in ``rocm/bin``, which
-    rocblas.dll's kernel data and ``../.kpack`` are laid out around). Only folders that exist inside the package."""
+    the ones its BUILD.json names in ``lib_dirs`` (relative). Only folders that exist inside the package."""
     folder = Path(folder)
     dirs = [str(folder)]
     try:
@@ -304,7 +295,7 @@ def read_manifest(folder: Path) -> EngineComponent:
         raise ComponentProblem(f"the entrypoint {entry} is not in the file list")
     if len({item[0] for item in parsed}) != len(parsed):
         raise ComponentProblem(f"{MANIFEST} lists a file twice")
-    archs = data.get("archs", data.get("cuda_archs")) or []        # schema 1 called the list cuda_archs
+    archs = data.get("archs") or []
     if not isinstance(archs, list) or not all(isinstance(a, str) and a for a in archs):
         raise ComponentProblem("archs must be a list of strings")
     if schema >= 2 and data["backend"] != "cpu" and not archs:
@@ -402,7 +393,7 @@ def _hash_settled(path: Path, digest: str) -> str | None:
 def verify(component: EngineComponent, *, full: bool = False) -> None:
     """Raise IntegrityProblem unless the files are what the manifest says. `full` hashes every file; without it only
     the entrypoint is hashed (sizes are always checked)."""
-    # extended-length paths: under a long user name an AMD engine's files pass 259 characters, which Windows (long paths off)
+    # extended-length paths: under a long user name an engine's files can pass 259 characters, which Windows (long paths off)
     # reports as "missing" for an ordinary path
     folder = longpath.long_path(component.root)
     root = folder.resolve()
@@ -437,99 +428,29 @@ def runtime_version() -> str | None:
 # ----------------------------------------------------------------------------------------------- the GPU
 
 def detect_backend(environ=None) -> tuple[str | None, str]:
-    """(backend, how) for this machine: the engine family its GPU needs. Bounded, read-only probes of tools that are
-    already installed; ``STRATA_ENGINE_BACKEND`` overrides (the tests and the support desk use it)."""
+    """(backend, how) for this machine: sycl when an Intel GPU is there. Bounded, read-only probes;
+    ``STRATA_ENGINE_BACKEND`` overrides (the tests and the support desk use it)."""
     environ = os.environ if environ is None else environ
     forced = environ.get(ENV_BACKEND, "").strip().lower()
     if forced:
         if forced not in BACKEND_MATRIX:
             raise ComponentProblem(f"{ENV_BACKEND}={forced!r} is not one of {', '.join(sorted(BACKEND_MATRIX))}")
         return forced, "environment"
-    if host_platform().startswith("macos"):
-        return "metal", "platform"
-    # Windows: the display adapters are the machine's own statement about which cards it has, so they decide first. A leftover
-    # nvidia-smi from a card that was taken out, or a toolkit installed for another card, must never outvote them: that is how an
-    # AMD PC was given a CUDA engine (#3688). A tool is only asked about a make that has an adapter here.
-    adapters = windows_display_adapters() if host_platform().startswith("windows") else []
-    present = adapter_makes(adapters)
-    if present:
-        return _first_make(present), "display adapters"
-    probes = (("cuda", ("nvidia-smi", "--query-gpu=name", "--format=csv,noheader")),
-              ("hip", ("rocminfo",) if os.name != "nt" else ("hipInfo",)),
-              ("sycl", ("sycl-ls",)))
-    vendors_here = {a.get("vendor") for a in adapters}
-    vendor_of = {"cuda": "10de", "hip": "1002", "sycl": "8086"}
-    for backend, command in probes:
-        if vendors_here and vendor_of[backend] not in vendors_here:
-            continue                                  # the adapters list no card of this make: a tool that answers is a leftover
-        tool = shutil.which(command[0])
-        if not tool:
-            continue
+    tool = shutil.which("sycl-ls")
+    if tool:
         try:
-            done = subprocess.run([tool, *command[1:]], capture_output=True, timeout=8, text=True,
-                                  creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            done = subprocess.run([tool], capture_output=True, timeout=8, text=True)
         except (OSError, subprocess.SubprocessError):
-            continue
-        if done.returncode == 0 and done.stdout.strip():
-            if backend == "hip" and "gfx" not in done.stdout:
-                continue
-            if backend == "sycl" and "level_zero" not in done.stdout.lower() and "gpu" not in done.stdout.lower():
-                continue
-            return backend, command[0]
-    found = _drm_vendor_backend() if os.name != "nt" else _windows_vendor_backend()
+            done = None
+        if done is not None and done.returncode == 0 and ("level_zero" in done.stdout.lower() or "gpu" in done.stdout.lower()):
+            return "sycl", "sycl-ls"
+    found = _drm_vendor_backend() if os.name != "nt" else None
     if found:
-        return found, "sysfs pci vendor" if os.name != "nt" else "display adapters"
+        return found, "sysfs pci vendor"
     return None, "no GPU tool answered"
 
 
-def _first_make(makes) -> str:
-    """The make Strata uses when a PC has cards of several: NVIDIA, then AMD, then Intel (the order of every probe)."""
-    return next(m for m in ("cuda", "hip", "sycl") if m in makes)
-
-
-def adapter_makes(adapters: list[dict] | None) -> set[str]:
-    """The engine families the Windows display adapters call for: cuda (an NVIDIA adapter), hip (an AMD card, not an integrated
-    Radeon), sycl (an Intel adapter). Empty when the list is empty. Read-only, nothing is run."""
-    makes = set()
-    for adapter in adapters or []:
-        vendor = adapter.get("vendor")
-        if vendor == "10de":
-            makes.add("cuda")
-        elif vendor == "8086":
-            makes.add("sycl")
-    if windows_amd_cards(adapters or []):
-        makes.add("hip")
-    return makes
-
-
-def gpu_makes_present() -> set[str]:
-    """The engine families this PC has a graphics card for, from the display adapters (Windows) or the PCI vendors (Linux); empty
-    when that cannot be read. Used to keep an update on the make the installation was built for (#3688)."""
-    if os.name == "nt":
-        return adapter_makes(windows_display_adapters())
-    return _drm_vendor_makes()
-
-
-def _drm_vendor_makes(root: str = "/sys/class/drm") -> set[str]:
-    vendors = set()
-    try:
-        for card in sorted(Path(root).glob("card[0-9]*")):
-            if "-" not in card.name:
-                try:
-                    vendors.add((card / "device" / "vendor").read_text().strip().lower())
-                except OSError:
-                    continue
-    except OSError:
-        return set()
-    return {backend for vendor, backend in (("0x10de", "cuda"), ("0x1002", "hip"), ("0x8086", "sycl")) if vendor in vendors}
-
-
-def _drm_vendor_backend(root: str = "/sys/class/drm") -> str | None:
-    """Linux without the vendor tools on PATH (a HIP box that runs ROCm from Python wheels has no rocminfo): the PCI
-    vendor of the display adapters decides. NVIDIA 0x10de -> cuda, AMD 0x1002 -> hip, Intel 0x8086 -> sycl, in that
-    order. Read-only sysfs, nothing is run."""
-    if not os.path.isdir(root):
-        return None
+def _drm_vendors(root: str) -> set[str]:
     vendors = set()
     try:
         for card in sorted(Path(root).glob("card[0-9]*")):
@@ -540,239 +461,16 @@ def _drm_vendor_backend(root: str = "/sys/class/drm") -> str | None:
             except OSError:
                 continue
     except OSError:
+        return set()
+    return vendors
+
+
+def _drm_vendor_backend(root: str = "/sys/class/drm") -> str | None:
+    """Linux without sycl-ls on PATH (the engine runs in a container): an Intel display adapter (PCI vendor 0x8086)
+    means sycl. Read-only sysfs, nothing is run."""
+    if not os.path.isdir(root):
         return None
-    for vendor, backend in (("0x10de", "cuda"), ("0x1002", "hip"), ("0x8086", "sycl")):
-        if vendor in vendors:
-            return backend
-    return None
-
-
-#: Windows AMD cards by PCI device id (VEN_1002), the same table as setup.py's _WIN_AMD_DID (tests/terminal/test_engine_component.py
-#: keeps the two equal): the architecture Strata runs the card as. Integrated Radeons are not in it (the one APU that is supported,
-#: Strix Halo, 0x1586, is in WIN_AMD_UMA_IDS), so an integrated Radeon beside a card never counts as "the GPU".
-WIN_AMD_DEVICE_ARCH = {0x744C: "gfx1100", 0x7448: "gfx1100", 0x745E: "gfx1100", 0x747E: "gfx1101", 0x7480: "gfx1102",
-                       0x7590: "gfx1200", 0x7550: "gfx1201", 0x7551: "gfx1201",
-                       0x73BF: "gfx1030", 0x73AF: "gfx1030", 0x73A5: "gfx1030", 0x73DF: "gfx1031"}
-WIN_AMD_UMA_IDS = {0x1586: "gfx1151"}                                   # Strix Halo: unified memory, supported
-WIN_AMD_IGPU_IDS = {0x150E, 0x1114, 0x1902, 0x15BF, 0x15C8, 0x164F, 0x1900, 0x1901, 0x1681, 0x1638, 0x1636, 0x15D8, 0x15E7}
-_WIN_DISPLAY_CLASS = r"SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}"
-
-
-def gfx_from_name(name: str) -> str:
-    """The AMD architecture a card's marketing name implies ("" when the name says nothing): the fallback when the PCI device id is
-    not in the table. Only names Strata knows a gfx for; an integrated Radeon with no supported build still maps (it then simply
-    fits no package)."""
-    text = re.sub(r"\s+", " ", str(name or "")).upper()
-    if "AMD" not in text and "RADEON" not in text and "RYZEN" not in text:
-        return ""
-    if re.search(r"\b(?:8060S|8050S)\b", text) or "RYZEN AI MAX" in text:
-        return "gfx1151"
-    if re.search(r"\bR9700\b|\bR97\d\d\b|\bAI PRO R97", text) or re.search(r"\bRX 9070\b", text):
-        return "gfx1201"
-    if re.search(r"\bRX 906\d\b|\bR96\d\d\b|\bAI PRO R96", text):
-        return "gfx1200"
-    found = re.search(r"\b(?:RX |W)(7[5-9]\d\d)\b", text)
-    if found:
-        series = int(found.group(1)) // 100
-        return {79: "gfx1100", 78: "gfx1101", 77: "gfx1101", 76: "gfx1102", 75: "gfx1102"}[series]
-    if re.search(r"\b(?:780M|760M|740M)\b", text):
-        return "gfx1103"
-    if re.search(r"\b(?:880M|890M)\b", text):
-        return "gfx1150"
-    if re.search(r"\b860M\b", text):
-        return "gfx1152"
-    found = re.search(r"\bRX (6\d{3})\b", text)
-    if found:
-        number = int(found.group(1))
-        if number >= 6800:
-            return "gfx1030"
-        if number in (6700, 6750) or "6700 XT" in text:
-            return "gfx1031"
-        if 6600 <= number < 6700:
-            return "gfx1032"
-        if number in (6500, 6400):
-            return "gfx1034"
-    return ""
-
-
-def _windows_adapters_cim() -> list[dict]:
-    """Second source when the registry key lists nothing: PowerShell's Win32_VideoController (PNPDeviceID has VEN_/DEV_). It can fail for
-    a limited account, so every failure is an empty answer."""
-    if os.name != "nt":
-        return []
-    shell = shutil.which("powershell") or shutil.which("pwsh")
-    if not shell:
-        return []
-    try:
-        done = subprocess.run([shell, "-NoProfile", "-NonInteractive", "-Command",
-                               "Get-CimInstance Win32_VideoController | ForEach-Object { $_.PNPDeviceID + '|' + $_.Name + '|' + $_.AdapterRAM }"],
-                              capture_output=True, text=True, timeout=15, stdin=subprocess.DEVNULL,
-                              creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-    except (OSError, subprocess.SubprocessError):
-        return []
-    found = []
-    for line in done.stdout.splitlines():
-        match = re.search(r"VEN_([0-9A-F]{4})&DEV_([0-9A-F]{4})", line, re.I)
-        if not match:
-            continue
-        parts = line.split("|")
-        ram = int(parts[2]) if len(parts) > 2 and parts[2].strip().isdigit() else 0
-        found.append({"vendor": match.group(1).lower(), "device": int(match.group(2), 16),
-                      "name": parts[1].strip() if len(parts) > 1 else "",
-                      "vram_gb": (ram / 2 ** 30) if ram > 0 else 0.0})
-    return found
-
-
-def windows_display_adapters() -> list[dict]:
-    """The display adapters Windows has a driver for: the display-class registry key (readable without admin and without running
-    anything), then Win32_VideoController when the key lists nothing: {"vendor": "10de"|"1002"|"8086"|..., "device": int, "name",
-    "vram_gb"}. Empty off Windows or when neither can be read."""
-    return _windows_display_adapters_registry() or _windows_adapters_cim()
-
-
-def _windows_display_adapters_registry() -> list[dict]:
-    found: list[dict] = []
-    try:
-        import winreg
-        cls = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, _WIN_DISPLAY_CLASS)
-    except (ImportError, OSError):
-        return found
-    index = 0
-    while True:
-        try:
-            sub = winreg.EnumKey(cls, index)
-        except OSError:
-            break
-        index += 1
-        if not sub.isdigit():
-            continue
-        try:
-            key = winreg.OpenKey(cls, sub)
-        except OSError:
-            continue
-        values = {}
-        for name in ("DriverDesc", "MatchingDeviceId", "HardwareInformation.qwMemorySize"):
-            try:
-                values[name] = winreg.QueryValueEx(key, name)[0]
-            except OSError:
-                pass
-        match = re.search(r"VEN_([0-9A-F]{4})&DEV_([0-9A-F]{4})", str(values.get("MatchingDeviceId") or ""), re.I)
-        if not match:
-            continue
-        memory = values.get("HardwareInformation.qwMemorySize")
-        if isinstance(memory, bytes):
-            memory = int.from_bytes(memory[:8], "little")
-        found.append({"vendor": match.group(1).lower(), "device": int(match.group(2), 16),
-                      "name": str(values.get("DriverDesc") or ""),
-                      "vram_gb": (int(memory) / 2 ** 30) if isinstance(memory, int) and memory > 0 else 0.0})
-    return found
-
-
-def windows_amd_cards(adapters: list[dict] | None = None) -> list[dict]:
-    """The AMD graphics cards (not an integrated Radeon) among the Windows display adapters, each with the architecture Strata
-    runs it as ("" when the id is not in the table but the adapter has 3 GB or more of its own memory, so it is no APU)."""
-    cards = []
-    for adapter in (windows_display_adapters() if adapters is None else adapters):
-        if adapter.get("vendor") != "1002":
-            continue
-        device = adapter.get("device")
-        arch = WIN_AMD_DEVICE_ARCH.get(device) or WIN_AMD_UMA_IDS.get(device) or ""
-        if not arch and device not in WIN_AMD_IGPU_IDS:
-            guess = gfx_from_name(adapter.get("name", ""))              # a card whose id is not in the table: its name says
-            if guess in ("gfx1103", "gfx1150", "gfx1152"):               # (those are integrated Radeons)
-                continue
-            arch = guess
-        if not arch and (device in WIN_AMD_IGPU_IDS or float(adapter.get("vram_gb") or 0) < 3.0):
-            continue                                                    # an integrated Radeon (512 MB of carve-out)
-        cards.append({"arch": arch, "name": adapter.get("name", ""), "device": device})
-    return cards
-
-
-def _windows_vendor_backend(adapters: list[dict] | None = None) -> str | None:
-    """Windows without nvidia-smi / hipInfo on PATH: the display adapters decide, NVIDIA first, then an AMD card (an AMD
-    integrated GPU alone is not one), as on Linux. Read-only registry, nothing is run."""
-    adapters = windows_display_adapters() if adapters is None else adapters
-    if any(a.get("vendor") == "10de" for a in adapters):
-        return "cuda"
-    if windows_amd_cards(adapters):
-        return "hip"
-    return None
-
-
-def cuda_archs_present(environ=None) -> list[str]:
-    """``sm_XX`` for each NVIDIA card nvidia-smi reports; empty when it cannot say."""
-    found = []
-    for line in _smi_query("compute_cap"):
-        match = re.fullmatch(r"(\d+)\.(\d+)", line.strip())
-        if match:
-            found.append(f"sm_{match.group(1)}{match.group(2)}")
-    return found
-
-
-def hip_archs_present(kfd_root: str | None = None) -> list[str]:
-    """``gfxNNNN`` for each AMD GPU the Linux kernel driver lists (``gfx_target_version`` is MMmmss: gfx1201 = 120001,
-    gfx1103 = 110003, gfx90a = 90010); Windows: from the display adapters' PCI ids (integrated Radeons left out); empty when
-    it cannot say (no amdgpu/kfd, no permission, an id not in the table)."""
-    if kfd_root is None:
-        if os.name == "nt":
-            return sorted({c["arch"] for c in windows_amd_cards() if c["arch"]})
-        kfd_root = "/sys/class/kfd/kfd/topology/nodes"
-    found = []
-    try:
-        nodes = sorted(Path(kfd_root).iterdir())
-    except OSError:
-        return []
-    for node in nodes:
-        try:
-            for line in (node / "properties").read_text(encoding="utf-8").splitlines():
-                key, _, value = line.partition(" ")
-                if key == "gfx_target_version" and value.strip().isdigit() and int(value) > 0:
-                    number = int(value)
-                    found.append(f"gfx{number // 10000}{number // 100 % 100:x}{number % 100:x}")
-        except OSError:
-            continue
-    return found
-
-
-def _smi_query(field_name: str) -> list[str]:
-    tool = shutil.which("nvidia-smi")
-    if not tool:
-        return []
-    try:
-        done = subprocess.run([tool, f"--query-gpu={field_name}", "--format=csv,noheader"], capture_output=True,
-                              timeout=8, text=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-    except (OSError, subprocess.SubprocessError):
-        return []
-    return [line.strip() for line in done.stdout.splitlines() if line.strip()] if done.returncode == 0 else []
-
-
-def nvidia_driver_version() -> str | None:
-    """The NVIDIA driver version nvidia-smi reports (the oldest one when several cards disagree); None when unreadable."""
-    versions = _smi_query("driver_version")
-    if not versions:                      # Linux without nvidia-smi (Fedora: it is in xorg-x11-drv-nvidia-cuda): the kernel module says
-        try:
-            found = re.search(r"Kernel Module\s+(\d+(?:\.\d+)+)", Path("/proc/driver/nvidia/version").read_text())
-            versions = [found.group(1)] if found else []
-        except OSError:
-            versions = []
-    return min(versions, key=_version_key) if versions else None
-
-
-def arch_covers(archs, present: list[str]) -> bool:
-    """Whether a build with `archs` (``sm_86`` = machine code for that card, ``compute_89`` = PTX that any card of
-    that generation or newer can JIT) can run on at least one of the `present` cards (``sm_XX``)."""
-    cards = {int(item[3:]) for item in present if item.startswith("sm_") and item[3:].isdigit()}
-    if not cards:
-        return True              # cannot tell: not a refusal
-    for arch in archs:
-        kind, _, number = arch.partition("_")
-        if not number.isdigit():
-            continue
-        if kind == "sm" and int(number) in cards:
-            return True
-        if kind == "compute" and any(card >= int(number) for card in cards):
-            return True
-    return False
+    return "sycl" if "0x8086" in _drm_vendors(root) else None
 
 
 # ----------------------------------------------------------------------------------------------- resolve
@@ -793,67 +491,10 @@ def scan(root: Path | None = None) -> tuple[list[EngineComponent], list[dict]]:
     return found, problems
 
 
-def driver_notice(have: str | None, need: str) -> str:
-    """The plain sentence for an NVIDIA driver that is too old for every engine on this PC."""
-    major = str(need).split(".")[0]
-    how = ("download it from nvidia.com/drivers" if os.name == "nt" else
-           "on Ubuntu open Software & Updates > Additional Drivers, or run: sudo ubuntu-drivers install")
-    return (f"Your NVIDIA graphics driver ({have}) is too old for Strata. Install driver {major} or newer ({how}), "
-            "restart the computer and open Strata again.")
-
-
-#: The AMD card families a person knows by the box they bought, for the one plain line when a build is for another family.
-HIP_FAMILIES = (("RX 9000", ("gfx1200", "gfx1201")), ("RX 7000", ("gfx1100", "gfx1101", "gfx1102")), ("RX 6000", ("gfx1030", "gfx1031")),
-                ("Ryzen AI Max", ("gfx1151",)))
-
-
-def hip_family(arch: str) -> str:
-    return next((name for name, archs in HIP_FAMILIES if arch in archs), arch)
-
-
-#: AMD architectures no ready-made engine package of this release covers. Empty since 0.2.2: the RX 6000 series (gfx1030 / gfx1031) has
-#: its own package (Linux `rx6000`, Windows `rdna2`; built, not tested on a real RX 6000 card). The mechanism stays for the next card family
-#: that has none: a family in this table gets the plain "no ready-made engine" line instead of "Ask for the X build".
-NO_PACKAGE_HIP: dict[str, str] = {}
-NO_PACKAGE_SENTENCE = ("This release has no ready-made Strata engine for the AMD {0} series. Strata can only run on it with an engine built for "
-                       "that card (docs/AMD_HIP.md, \"RDNA2\").")
-
-
 def no_package_note(archs) -> str | None:
-    """One plain sentence when some of these architectures (gfx1030 ...) have no ready-made package in this release, else None."""
-    families = sorted({NO_PACKAGE_HIP[a] for a in archs if a in NO_PACKAGE_HIP})
-    return NO_PACKAGE_SENTENCE.format(" and ".join(families)) if families else None
-
-
-def hip_preference(archs) -> int:
-    """Tie-break between two AMD engine packages of one version that both cover a PC (a computer with an RX 7900 beside an RX 6800): the
-    RX 6000 package (gfx103x code only) never wins over another family's, so adding it changed nothing for a PC that was served before."""
-    archs = [str(a) for a in archs or ()]
-    return 0 if archs and all(a.startswith("gfx103") for a in archs) else 1
-
-
-def arch_notice(built: tuple[str, ...], here: list[str]) -> str:
-    """The plain sentence for an AMD engine that has code for other cards than this computer's (a tester build for another card)."""
-    if here and all(a in NO_PACKAGE_HIP for a in here):      # asking for "the RX 6000 build" would send the person to one that does not exist
-        have = sorted({hip_family(a) for a in here})
-        return (f"This computer has an AMD {' and '.join(have)} card ({', '.join(sorted(set(here)))}). {no_package_note(here)}")
-    built_for = sorted({hip_family(a) for a in built})
-    have = sorted({hip_family(a) for a in here})
-    make = lambda names: " and ".join(names)  # noqa: E731
-    return (f"This build of Strata is for AMD {make(built_for)} cards. This computer has an AMD {make(have)} card ({', '.join(sorted(set(here)))}). "
-            f"Ask for the {make(have)} build.")
-
-
-RELEASES_URL = "https://github.com/Niko1221/Strata/releases"
-MAKE_NAMES = {"cuda": "NVIDIA", "hip": "AMD", "sycl": "Intel"}
-
-
-def wrong_make_notice(built: str, archs: tuple[str, ...], here: str) -> str:
-    """The plain sentence for a build made for another make of graphics card than this computer has (an AMD build on an NVIDIA PC)."""
-    families = sorted({hip_family(a) for a in archs if any(a in group for _, group in HIP_FAMILIES)})
-    built_for = f"AMD {' and '.join(families)}" if built == "hip" and families else MAKE_NAMES.get(built, built)
-    make = MAKE_NAMES.get(here, here)
-    return f"This Strata is for {built_for} cards. Your PC has an {make} card: download the {make} version from {RELEASES_URL}"
+    """One plain sentence when some of these architectures have no ready-made package in this release. Every card this
+    fork runs on (the Intel Arc) has one, so: None."""
+    return None
 
 
 def resolve(root: Path | None = None, *, backend: str | None = None, target: str | None = None,
@@ -873,10 +514,6 @@ def resolve(root: Path | None = None, *, backend: str | None = None, target: str
         # no GPU tool answered: only a CPU engine can be started
         wanted = "cpu"
     usable, reasons, broken = [], [], []
-    compatible, driver_blocked, arch_blocked = 0, [], []
-    archs_here = cuda_archs_present() if wanted == "cuda" else []
-    driver_here = nvidia_driver_version() if wanted == "cuda" else None
-    hip_here = hip_archs_present() if wanted == "hip" else []
     have_runtime = runtime if runtime is not None else runtime_version()
     for item in found:
         label = f"{item.version} {item.platform}-{item.backend}"
@@ -890,23 +527,8 @@ def resolve(root: Path | None = None, *, backend: str | None = None, target: str
         if item.backend != wanted:
             reasons.append(f"{label} is a {item.backend} engine, this PC needs {wanted} ({how})")
             continue
-        compatible += 1
         if item.min_runtime and have_runtime and _version_key(have_runtime) < _version_key(item.min_runtime):
             reasons.append(f"{label} needs control {item.min_runtime} or newer, this is {have_runtime}")
-            continue
-        if item.cuda_archs and archs_here and not arch_covers(item.cuda_archs, archs_here):
-            reasons.append(f"{label} has code for {', '.join(item.cuda_archs)}, this PC's GPU is "
-                           f"{', '.join(archs_here)}")
-            continue
-        if item.hip_archs and hip_here and not set(item.hip_archs) & set(hip_here):
-            reasons.append(f"{label} has code for {', '.join(item.hip_archs)}, this PC's GPU is "
-                           f"{', '.join(hip_here)}")
-            arch_blocked.append(item)
-            continue
-        need = item.min_driver.get("nvidia")
-        if need and driver_here and _version_key(driver_here) < _version_key(need):
-            reasons.append(f"{label} needs NVIDIA driver {need} or newer, this PC has {driver_here}")
-            driver_blocked.append(need)
             continue
         try:
             verify_signature(item)
@@ -920,28 +542,13 @@ def resolve(root: Path | None = None, *, backend: str | None = None, target: str
         everything = reasons + [p["folder"] + ": " + p["problem"] for p in problems]
         if broken and len(broken) == len(reasons):       # every package that fits this PC failed its integrity check
             raise EngineIntegrityError("; ".join(broken), base, problems=problems)
-        plain = None
-        if arch_blocked and len(arch_blocked) == compatible and not broken:      # every engine that fits this PC is built for other cards
-            plain = arch_notice(tuple(sorted({a for item in arch_blocked for a in item.hip_archs})), hip_here)
-        if plain is None and not compatible and not broken and wanted in MAKE_NAMES:       # every engine here is for another make of card
-            here_target = [item for item in found if item.platform == target]
-            other = [item for item in here_target if item.backend in MAKE_NAMES and item.backend != wanted]
-            if other and len(other) == len(here_target):
-                top = max(other, key=lambda item: _version_key(item.version))
-                plain = wrong_make_notice(top.backend, top.archs, wanted)
-        missing = EngineMissing("; ".join(everything) or "nothing matched", base, problems=problems, notice=plain)
-        if driver_blocked and len(driver_blocked) == compatible and not broken:
-            # the only thing in the way is the NVIDIA driver: one plain line that names the version to install
-            missing.driver_notice = driver_notice(driver_here, min(driver_blocked, key=_version_key))
-        raise missing
+        raise EngineMissing("; ".join(everything) or "nothing matched", base, problems=problems)
     pin = pinned_folder(base)
     if pin:                                   # a manual rollback: the pinned package wins while it is usable
         for item in usable:
             if item.root.name == pin:
                 return item
-    # newest version first; with equal versions the build for the newer driver (the CUDA 13 build beside the CUDA 12 one)
-    return max(usable, key=lambda item: (_version_key(item.version), _version_key(item.min_driver.get("nvidia", "0")),
-                                         hip_preference(item.hip_archs)))
+    return max(usable, key=lambda item: _version_key(item.version))      # newest version first
 
 
 #: A run config can name its engine as "component:strata-engine" instead of a path: the server then asks the
@@ -984,5 +591,5 @@ def status(root: Path | None = None, *, backend: str | None = None, full: bool =
         report["engine"] = chosen.to_dict()
         report["usable"] = True
     except EngineMissing as exc:
-        report["notice"] = getattr(exc, "driver_notice", None) or getattr(exc, "plain_notice", None) or str(exc)
+        report["notice"] = getattr(exc, "plain_notice", None) or str(exc)
     return report

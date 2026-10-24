@@ -143,17 +143,16 @@ class Manifest(unittest.TestCase):
         with self.assertRaises(ec.ComponentProblem):
             ec.read_manifest(folder)
 
-    def test_a_schema_1_package_from_s3_still_loads(self):
+    def test_a_schema_1_package_still_loads(self):
         folder = self.package()
         path = folder / ec.MANIFEST
         data = json.loads(path.read_text())
         for key in ("name", "build_id", "min_driver", "signature", "archs"):
             data.pop(key)
         data["schema_version"] = 1
-        data["cuda_archs"] = ["sm_86"]
         path.write_text(json.dumps(data))
         component = ec.read_manifest(folder)
-        self.assertEqual((component.archs, component.build_id), (("sm_86",), ""))
+        self.assertEqual((component.archs, component.build_id), ((), ""))
 
     def test_duplicate_file_entries_are_refused(self):
         folder = self.package()
@@ -189,17 +188,8 @@ class CollectLibs(unittest.TestCase):
         self.assertFalse(collect_libs.is_driver("libsycl.so.8"))
 
 
-class Arch(unittest.TestCase):
-    def test_machine_code_and_ptx(self):
-        self.assertTrue(ec.arch_covers(["sm_86"], ["sm_86"]))
-        self.assertFalse(ec.arch_covers(["sm_86"], ["sm_120"]))
-        self.assertTrue(ec.arch_covers(["sm_75", "compute_89"], ["sm_120"]), "PTX of an older generation runs on a newer card")
-        self.assertFalse(ec.arch_covers(["sm_75", "compute_89"], ["sm_86"]), "PTX never runs on an older card")
-        self.assertTrue(ec.arch_covers(["sm_86"], []), "cannot tell: not a refusal")
-
-
 class Start(unittest.TestCase):
-    """What a start checks: every file's hash (not only the entrypoint), the driver, the signature policy."""
+    """What a start checks: every file's hash (not only the entrypoint), the backend, the signature policy."""
 
     def setUp(self):
         self.dir = tempfile.TemporaryDirectory()
@@ -207,17 +197,15 @@ class Start(unittest.TestCase):
         self.root = Path(self.dir.name)
         self.out = self.root / "engine"
         self.out.mkdir()
-        self.folder = package_engine.build(make_source(self.root / "src"), "cuda", "0.1.45", HERE, self.out,
-                                           archs=("sm_86",), min_driver={"nvidia": "580.65"}, build_id="b1")
+        self.folder = package_engine.build(make_source(self.root / "src"), "sycl", "0.1.45", HERE, self.out,
+                                           archs=("intel-arc",), build_id="b1")
         self.addCleanup(ec.register_signature_verifier, None)
         patch = mock.patch.object(signing, "BUILTIN_KEYS", self.root / "no-shipped-keys.json")   # a build with no shipped key; the real file: test_release_keys
         patch.start()
         self.addCleanup(patch.stop)
 
-    def start(self, **kw):
-        with mock.patch.object(ec, "cuda_archs_present", return_value=kw.pop("cards", ["sm_86"])), \
-                mock.patch.object(ec, "nvidia_driver_version", return_value=kw.pop("driver", "590.00")):
-            return ec.expand("component:strata-engine", {"backend": "cuda"}, root=self.root, **kw)
+    def start(self, backend="sycl", **kw):
+        return ec.expand("component:strata-engine", {"backend": backend}, root=self.root, **kw)
 
     def test_a_good_package_starts(self):
         self.assertEqual(Path(self.start()).resolve(), (self.folder / EXE).resolve())
@@ -227,8 +215,7 @@ class Start(unittest.TestCase):
         body = bytearray(lib.read_bytes())
         body[7] ^= 0xFF                                           # same size, same entrypoint: only the full hash sees it
         lib.write_bytes(bytes(body))
-        with mock.patch.object(ec, "cuda_archs_present", return_value=["sm_86"]),                 mock.patch.object(ec, "nvidia_driver_version", return_value=None):
-            self.assertEqual(ec.resolve(self.root, backend="cuda", runtime="1").version, "0.1.45", "the quick check passes")
+        self.assertEqual(ec.resolve(self.root, backend="sycl", runtime="1").version, "0.1.45", "the quick check passes")
         with self.assertRaises(ec.EngineIntegrityError) as caught:
             self.start()
         self.assertIn(LIB, str(caught.exception))
@@ -245,33 +232,17 @@ class Start(unittest.TestCase):
         with self.assertRaises(ec.EngineIntegrityError):
             self.start()
 
-    def test_two_builds_of_one_version_prefer_the_newer_driver_when_both_fit(self):
-        other = make_source(self.root / "src3")
-        old = package_engine.build(other, "cuda", "0.1.45", HERE, self.out, archs=("sm_60", "sm_86"),
-                                   min_driver={"nvidia": "575.51"}, build_id="b-12", variant="cuda12")
-        self.assertEqual(old.name, f"0.1.45-{HERE}-cuda-cuda12")
-        self.assertEqual(ec.read_manifest(old).variant, "cuda12")
-        self.assertEqual(Path(self.start(driver="610.0")).parent.resolve(), self.folder.resolve())    # 580.65 build wins
-        self.assertEqual(Path(self.start(driver="576.0")).parent.resolve(), old.resolve())            # only the CUDA 12 one fits
-
     def test_a_good_package_does_not_hide_a_tampered_one(self):
-        newer = package_engine.build(make_source(self.root / "src2"), "cuda", "0.1.46", HERE, self.out,
-                                     archs=("sm_86",), build_id="b2")
+        newer = package_engine.build(make_source(self.root / "src2"), "sycl", "0.1.46", HERE, self.out,
+                                     archs=("intel-arc",), build_id="b2")
         (newer / LIB).write_bytes(b"y" * (newer / LIB).stat().st_size)
         self.assertEqual(ec.read_manifest(Path(self.start()).parent).version, "0.1.45")
 
     def test_other_pc_reasons_are_not_integrity_errors(self):
         with self.assertRaises(ec.EngineMissing) as caught:
-            self.start(cards=["sm_120"])
+            self.start(backend="cpu")
         self.assertNotIsInstance(caught.exception, ec.EngineIntegrityError)
-        self.assertIn("sm_86", str(caught.exception))
-
-    def test_an_old_driver_is_refused_with_both_versions(self):
-        with self.assertRaises(ec.EngineMissing) as caught:
-            self.start(driver="535.10")
-        self.assertIn("580.65", str(caught.exception))
-        self.assertIn("535.10", str(caught.exception))
-        self.assertTrue(self.start(driver=None), "an unreadable driver is not a refusal")
+        self.assertIn("this PC needs cpu", str(caught.exception))
 
     def test_signature_policy_and_hook(self):
         self.assertEqual(ec.verify_signature(ec.read_manifest(self.folder), {}), "unsigned")

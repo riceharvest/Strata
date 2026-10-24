@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-import json
 import os
-import stat
 import sys
 import tempfile
 import unittest
@@ -81,40 +79,6 @@ class CalibrateWithoutAFullFolder(unittest.TestCase):
                 os.environ["STRATA_INSTALL_DIR"] = d
                 with mock.patch("importlib.util.find_spec", return_value=None):
                     self.assertTrue(calibration._tools_available())
-
-
-class HipPackageForAnotherCard(unittest.TestCase):
-    """A HIP package built for gfx1200/gfx1201 must not be chosen for a Phoenix iGPU (gfx1103): P2006 resolved it as usable."""
-
-    def _kfd(self, root: Path, versions):
-        for number, value in enumerate(versions):
-            node = root / str(number)
-            node.mkdir()
-            (node / "properties").write_text("cpu_cores_count 1\ngfx_target_version " + value + "\n", encoding="utf-8")
-
-    def test_gfx_target_version_becomes_the_gfx_name(self):
-        from strata_control import engine_component as ec
-        with tempfile.TemporaryDirectory() as d:
-            self._kfd(Path(d), ["0", "110003", "120001", "90010", "100300"])
-            self.assertEqual(ec.hip_archs_present(d), ["gfx1103", "gfx1201", "gfx90a", "gfx1030"])
-        self.assertEqual(ec.hip_archs_present("/nonexistent/kfd"), [])
-
-    def test_a_package_without_the_cards_arch_is_not_chosen_and_one_with_it_is(self):
-        from strata_control import engine_component as ec
-        from tests.terminal.test_engine_component import make_package, rewrite
-        with tempfile.TemporaryDirectory() as d:
-            root = Path(d)
-            folder = make_package(root, backend="hip")
-            rewrite(folder, schema_version=2, archs=["gfx1200", "gfx1201"], build_id="test")
-            with mock.patch.object(ec, "hip_archs_present", return_value=["gfx1103"]):
-                with self.assertRaises(ec.EngineMissing) as ctx:
-                    ec.resolve(root, backend="hip")
-            self.assertIn("gfx1103", str(ctx.exception))
-            self.assertIn("gfx1201", str(ctx.exception))
-            with mock.patch.object(ec, "hip_archs_present", return_value=["gfx1201"]):
-                self.assertEqual(ec.resolve(root, backend="hip").backend, "hip")
-            with mock.patch.object(ec, "hip_archs_present", return_value=[]):      # cannot tell: not a refusal
-                self.assertEqual(ec.resolve(root, backend="hip").backend, "hip")
 
 
 class DeviceAccess(unittest.TestCase):

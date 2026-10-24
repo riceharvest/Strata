@@ -114,11 +114,11 @@ class Upgrade(Dsv41Engine):
     def test_a_new_engine_that_does_not_start_is_removed_and_the_old_one_keeps_running(self):
         self.publish("0.1.49.1")
         lines = []
-        self.assertIsNone(self.upgrade(lines, start=(False, "it did not start correctly (libcudart.so.13: not found)")))
+        self.assertIsNone(self.upgrade(lines, start=(False, "it did not start correctly (libsycl.so.8: not found)")))
         self.assertEqual(self.folders(), ["0.1.49"])
         self.assertTrue(self.old.is_file())
         self.assertIn("A newer DeepSeek engine is available but could not be installed", " ".join(lines))
-        self.assertIn("libcudart.so.13", " ".join(lines))
+        self.assertIn("libsycl.so.8", " ".join(lines))
         self.assertIn("still using 0.1.49", " ".join(lines))
 
     def test_source_reachable(self):

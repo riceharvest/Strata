@@ -70,9 +70,9 @@ class Ed25519(unittest.TestCase):
             signing.minisign_verify(public, base64.b64encode(text.encode()).decode(), [blob])
 
 
-def entry(version="0.1.46", backend="cuda", variant="cuda13", archs=("sm_86", "compute_89"), driver="580.65", **extra):
+def entry(version="0.1.46", backend="sycl", variant="", archs=("intel-arc",), **extra):
     base = {"version": version, "platform": "linux-x86_64", "backend": backend, "variant": variant, "archs": list(archs),
-            "min_driver": {"nvidia": driver} if backend == "cuda" else {}, "min_runtime": None, "build_id": f"b-{version}-{variant}",
+            "min_driver": {}, "min_runtime": None, "build_id": f"b-{version}-{variant}",
             "format": "tar.gz", "url": f"engine/e-{version}-{variant}.tar.gz", "size": 1000, "sha256": "a" * 64,
             "manifest_sha256": "b" * 64, "installed_bytes": 2000, "notes": ""}
     base.update(extra)
@@ -102,7 +102,7 @@ class FeedChecks(unittest.TestCase):
     def test_a_good_feed_loads(self):
         feed = self.load(*signed(document(), self.key))
         self.assertEqual((feed.sequence, feed.channel, feed.key_id), (5, "stable", self.key["key_id"]))
-        self.assertEqual(feed.engine[0].label, "0.1.46 linux-x86_64-cuda-cuda13")
+        self.assertEqual(feed.engine[0].label, "0.1.46 linux-x86_64-sycl")
 
     def test_a_bad_signature_is_refused(self):
         payload, sig = signed(document(), self.key)
@@ -143,7 +143,7 @@ class FeedChecks(unittest.TestCase):
             self.load(*signed(document(channel="beta"), self.key), channel="stable")
 
     def test_malformed_entries_are_errors_not_defaults(self):
-        for change in ({"sha256": "nothex"}, {"size": 0}, {"format": "rar"}, {"platform": "plan9"}, {"backend": "tpu"},
+        for change in ({"sha256": "nothex"}, {"size": 0}, {"format": "rar"}, {"platform": "plan9"},
                        {"version": "latest"}, {"archs": []}, {"manifest_sha256": None}, {"size": True}):
             with self.subTest(change=change):
                 with self.assertRaises(feedmod.FeedError):
@@ -153,6 +153,14 @@ class FeedChecks(unittest.TestCase):
         with self.assertRaises(feedmod.FeedError):
             self.load(b"not json", signed(document(), self.key)[1])
 
+    def test_an_entry_for_another_make_of_card_is_left_out(self):
+        cuda = entry(backend="cuda", variant="cuda13", archs=("sm_86",))
+        feed = self.load(*signed(document(engine={"packages": [cuda, entry()]}, dsv41={"packages": [cuda]}), self.key))
+        self.assertEqual([p.backend for p in feed.engine], ["sycl"])
+        self.assertEqual(feed.dsv41, ())
+        tpu = self.load(*signed(document(engine={"packages": [entry(backend="tpu"), entry()]}), self.key))
+        self.assertEqual([p.backend for p in tpu.engine], ["sycl"], "a backend this build does not know is left out too")
+
     def test_versions_are_strict_and_ordered(self):
         self.assertLess(feedmod.version_key("0.1.9"), feedmod.version_key("0.1.10"))
         self.assertLess(feedmod.version_key("0.1.45"), feedmod.version_key("0.1.45.1"))
@@ -161,44 +169,25 @@ class FeedChecks(unittest.TestCase):
 
 
 class Selection(unittest.TestCase):
-    HW = {"platform": "linux-x86_64", "backend": "cuda", "runtime": "0.1.45", "nvidia_driver": "615.71", "cuda_archs": ["sm_86"], "gfx": []}
+    HW = {"platform": "linux-x86_64", "backend": "sycl", "runtime": "0.1.45"}
 
     def pick(self, packages, **hw):
         parsed = [feedmod._engine_package(p) for p in packages]
         return feedmod.select_engine(parsed, {**self.HW, **hw})
 
-    def test_cuda_13_when_the_driver_is_new_enough_else_12(self):
-        both = [entry(variant="cuda12", driver="575.51", archs=("sm_60", "sm_86", "compute_89")), entry(variant="cuda13")]
-        self.assertEqual(self.pick(both)[0].variant, "cuda13")
-        old = self.pick(both, nvidia_driver="576.02")
-        self.assertEqual(old[0].variant, "cuda12")
-        self.assertTrue(any("580.65" in r for r in old[1]))
-        self.assertIsNone(self.pick(both, nvidia_driver="500.00")[0])
-
-    def test_the_newest_version_wins_and_the_card_must_be_covered(self):
+    def test_the_newest_version_wins(self):
         newer = [entry("0.1.45"), entry("0.1.46")]
         self.assertEqual(self.pick(newer)[0].version, "0.1.46")
-        pascal = self.pick([entry(archs=("sm_75", "sm_86", "compute_86"))], cuda_archs=["sm_61"])
-        self.assertIsNone(pascal[0])
-        self.assertIn("this PC's GPU is sm_61", pascal[1][0])
-        self.assertIsNotNone(self.pick([entry(archs=("sm_75", "compute_75"))], cuda_archs=["sm_120"])[0], "PTX covers a newer card")
 
-    def test_hip_by_gfx_sycl_and_metal_by_platform(self):
-        hip = [entry(backend="hip", variant="", archs=("gfx1200", "gfx1201"))]
-        self.assertIsNotNone(self.pick(hip, backend="hip", gfx=["gfx1201"])[0])
-        self.assertIsNone(self.pick(hip, backend="hip", gfx=["gfx1100"])[0])
-        self.assertIsNotNone(self.pick(hip, backend="hip", gfx=[])[0], "an unreadable gfx is not a refusal")
-        self.assertIsNone(self.pick(hip, backend="cuda")[0], "a HIP package is not offered to an NVIDIA PC")
-        sycl = [entry(backend="sycl", variant="", archs=("intel-arc",))]
-        self.assertIsNotNone(self.pick(sycl, backend="sycl")[0])
-        metal = dict(entry(backend="metal", variant="", archs=("apple-gpu",)), platform="macos-arm64")
-        self.assertIsNone(self.pick([metal])[0], "wrong platform")
-        self.assertIsNotNone(self.pick([metal], platform="macos-arm64", backend="metal")[0])
+    def test_the_backend_and_the_platform_decide(self):
+        sycl = [entry()]
+        self.assertIsNotNone(self.pick(sycl)[0])
+        self.assertIsNone(self.pick(sycl, backend="cpu")[0], "a SYCL package is not offered to a CPU-only PC")
+        self.assertIsNone(self.pick(sycl, platform="windows-x86_64")[0], "wrong platform")
 
     def test_min_runtime(self):
         got = self.pick([entry(min_runtime="0.1.50")])
         self.assertIsNone(got[0])
-        self.assertIn("needs control 0.1.50", got[1][0])
 
 
 class References(unittest.TestCase):
@@ -293,9 +282,9 @@ class DeepSeekEnginePackages(FeedChecks):
     """The ``dsv41`` feed member: the DeepSeek engine is its own download, never one of the ``engine`` packages."""
 
     def test_the_member_is_parsed_apart_from_the_engine_list(self):
-        ds = entry(version="0.1.49", variant="cuda13", url="dsv41/strata-dsv41-0.1.49-linux-x86_64-cuda-cuda13.tar.gz")
+        ds = entry(version="0.1.49", url="dsv41/strata-dsv41-0.1.49-linux-x86_64-sycl.tar.gz")
         feed = self.load(*signed(document(dsv41={"packages": [ds]}), self.key))
-        self.assertEqual([p.label for p in feed.dsv41], ["0.1.49 linux-x86_64-cuda-cuda13"])
+        self.assertEqual([p.label for p in feed.dsv41], ["0.1.49 linux-x86_64-sycl"])
         self.assertEqual([p.version for p in feed.engine], ["0.1.46"], "a DeepSeek package is not an engine package")
 
     def test_a_feed_without_the_member_has_none_and_a_malformed_member_is_an_error(self):
@@ -306,9 +295,9 @@ class DeepSeekEnginePackages(FeedChecks):
             self.load(*signed(document(dsv41={"packages": [entry(), entry()]}), self.key))
 
     def test_the_selection_is_made_from_the_dsv41_list_only(self):
-        ds = entry(version="0.1.49", archs=("sm_86", "sm_120"))
+        ds = entry(version="0.1.49")
         feed = self.load(*signed(document(dsv41={"packages": [ds]}), self.key))
-        hw = {"platform": "linux-x86_64", "gpus": [{"vendor": "nvidia", "arch": "sm_86", "driver": "590.0"}]}
+        hw = {"platform": "linux-x86_64", "backend": "sycl"}
         try:
             picked, _ = feedmod.select_engine(feed.dsv41, hw)
         except Exception:                                   # noqa: BLE001 - the hardware dict shape is Control's; only the list matters here

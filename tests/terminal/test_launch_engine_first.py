@@ -18,8 +18,8 @@ from strata_control import engine_component as ec
 
 ROOT = Path(__file__).resolve().parents[2]
 
-WRONG_FAMILY = ec.arch_notice(("gfx1100", "gfx1101", "gfx1102"), ["gfx1201"])
-USABLE = {"usable": True, "engine": {"version": "0.1.45", "backend": "hip"}, "notice": None}
+WRONG_FAMILY = "This build of Strata is for other cards than this computer has."     # an engine notice, relayed as it is
+USABLE = {"usable": True, "engine": {"version": "0.1.45", "backend": "sycl"}, "notice": None}
 UNUSABLE = {"usable": False, "engine": None, "notice": "No engine for this PC was found in /x: the component folder holds no engine package. "
                                                        "The app never downloads an engine while it starts or serves."}
 
@@ -116,8 +116,7 @@ class EngineBeforeModel(unittest.TestCase):
         self.assertIsNone(err)
         self.assertEqual(r.engine_problem, WRONG_FAMILY)
         text = r.events[-1].text
-        self.assertIn("This build of Strata is for AMD RX 7000 cards. This computer has an AMD RX 9000 card (gfx1201).", text)
-        self.assertIn("Ask for the RX 9000 build)", text)
+        self.assertIn(WRONG_FAMILY, text)
 
     def test_installed_wrong_family_package_uses_its_plain_notice(self):
         report = {"usable": False, "engine": None, "notice": WRONG_FAMILY}
@@ -173,7 +172,7 @@ class EngineBeforeModel(unittest.TestCase):
         self.assertEqual(result.engine_problem, WRONG_FAMILY)
         self.assertEqual(result.final_text, no_engine_final(WRONG_FAMILY))
         self.assertIn("The model is ready, but Strata can't start it yet", result.final_text)
-        self.assertIn("Ask for the RX 9000 build)", result.final_text)
+        self.assertIn(WRONG_FAMILY, result.final_text)
         self.assertIn(NO_ENGINE_STEP, result.final_text)
 
     def test_the_setup_child_is_told_to_go_on_without_an_engine(self):
@@ -233,7 +232,7 @@ class SetupControlStep(unittest.TestCase):
         exc = ec.EngineMissing("nothing matched", Path("/c"), notice=WRONG_FAMILY)
         res, out = self.step(exc, {"STRATA_NEED_ENGINE": "1"})
         self.assertIsInstance(res, SystemExit)
-        self.assertIn("Ask for the RX 9000 build.", out)
+        self.assertIn(WRONG_FAMILY, out)
         self.assertIn("nothing was downloaded", out)
 
     def test_wrong_family_goes_on_with_a_warning_when_launch_said_go_on(self):
@@ -254,7 +253,7 @@ class SetupControlStep(unittest.TestCase):
         with mock.patch.dict(os.environ, env, clear=True):
             res, out = self.step(exc, {})
         self.assertNotIsInstance(res, SystemExit)
-        self.assertIn("Ask for the RX 9000 build.", out)
+        self.assertIn(WRONG_FAMILY, out)
         self.assertIn("The model is downloaded and prepared now", out)
 
     def test_no_engine_stops_before_the_download_for_launch(self):

@@ -26,12 +26,12 @@ def build(parent: Path, version: str, key: dict, padding: int = 0) -> Path:
     src = parent / f"src-{version}"
     src.mkdir(parents=True)
     (src / EXE).write_bytes(b"stub strata-dsv41 " + (os.urandom(padding) if padding else b"x" * 100))
-    library = "cudart64_13.dll" if os.name == "nt" else "libcudart.so.13"
+    library = "sycl8.dll" if os.name == "nt" else "libsycl.so.8"
     (src / library).write_bytes(b"a runtime library " * 50)
     out = parent / "built"
     out.mkdir(exist_ok=True)
-    folder = package_engine.build(src, "cuda", version, components.host_platform(), out, entry=EXE, archs=("sm_86",),
-                                  min_driver={"nvidia": "580.65"}, build_id=f"dsv41-{version}", variant="cuda13")
+    folder = package_engine.build(src, "sycl", version, components.host_platform(), out, entry=EXE, archs=("intel-arc",),
+                                  build_id=f"dsv41-{version}")
     feed_tool.sign_package(folder, key)
     return folder
 
@@ -45,13 +45,11 @@ class Dsv41Engine(unittest.TestCase):
         trust = self.root / "trust.json"
         trust.write_text(json.dumps({"keys": [signing.public_part(self.key)]}))
         for p in (mock.patch.dict(os.environ, {"STRATA_UPDATE_TRUSTED_KEYS": str(trust), "STRATA_COMPONENTS_DIR": str(self.root / "c")}),
-                  mock.patch.object(signing, "BUILTIN_KEYS", self.root / "none.json"),
-                  mock.patch.object(ec, "cuda_archs_present", return_value=["sm_86"]),
-                  mock.patch.object(ec, "nvidia_driver_version", return_value="610.47")):
+                  mock.patch.object(signing, "BUILTIN_KEYS", self.root / "none.json")):
             p.start()
             self.addCleanup(p.stop)
         self.addCleanup(ec.register_signature_verifier, None)
-        self.hw = {"platform": host_platform(), "backend": "cuda", "runtime": None, "nvidia_driver": "610.47", "cuda_archs": ["sm_86"], "gfx": []}
+        self.hw = {"platform": host_platform(), "backend": "sycl", "runtime": None}
         self.release = self.root / "release"
         self.release.mkdir()
         self.server = fx.FeedServer(self.release)
@@ -108,10 +106,9 @@ class Dsv41Engine(unittest.TestCase):
 
     def test_no_package_for_this_pc_is_a_plain_line_not_a_crash(self):
         self.publish()
-        self.hw = {**self.hw, "cuda_archs": ["sm_61"], "gfx": []}
+        self.hw = {**self.hw, "backend": "cpu"}                     # a PC without the Intel card
         lines = []
-        with mock.patch.object(ec, "cuda_archs_present", return_value=["sm_61"]):
-            self.assertIsNone(self.install(lines))
+        self.assertIsNone(self.install(lines))
         self.assertTrue(lines)
         self.assertEqual(self.tree(self.eng), self.before)
 
@@ -174,8 +171,8 @@ class ManualPackage(Dsv41Engine):
         src = self.root / "qsrc"
         src.mkdir()
         (src / "strata").write_bytes(b"qwen engine")
-        folder = package_engine.build(src, "cuda", "0.1.49", components.host_platform(), self.root / "qout", entry="strata", archs=("sm_86",),
-                                      min_driver={"nvidia": "580.65"}, build_id="q", variant="cuda13")
+        folder = package_engine.build(src, "sycl", "0.1.49", components.host_platform(), self.root / "qout", entry="strata", archs=("intel-arc",),
+                                      build_id="q")
         feed_tool.sign_package(folder, self.key)
         lines = []
         self.assertIsNone(dsv41_engine.install_package(self.root / "data" / "engine-dsv41", folder, emit=lines.append))

@@ -81,7 +81,7 @@ class TestStartFailed(UpdateError):
 
     #: reasons that say the graphics card or memory was busy, not that the engine is broken
     BUSY = re.compile(r"timed?[ -]?out|out of memory|\boom\b|not enough (gpu |video |free )?memory|vram|memory allocation|"
-                      r"cudaerrormemory|device (is )?(busy|in use)|resource busy|no free (gpu|memory)", re.I)
+                      r"device (is )?(busy|in use)|resource busy|no free (gpu|memory)", re.I)
 
     @staticmethod
     def plain(label: str, reason: str, busy: bool, hint: str | None) -> str:
@@ -206,68 +206,12 @@ class State:
 
 # ---------------------------------------------------------------------------------------------- hardware
 
-def _gfx_names() -> list[str]:
-    found: list[str] = []
-    kfd = Path("/sys/class/kfd/kfd/topology/nodes")
-    if kfd.is_dir():
-        for node in sorted(kfd.iterdir()):
-            try:
-                text = (node / "properties").read_text()
-            except OSError:
-                continue
-            match = re.search(r"^gfx_target_version\s+(\d+)", text, re.MULTILINE)
-            if match and int(match.group(1)) > 0:
-                value = int(match.group(1))
-                found.append(f"gfx{value // 10000}{(value // 100) % 100:x}{value % 100:x}")
-    if not found:
-        tool = shutil.which("rocminfo") if os.name != "nt" else shutil.which("hipInfo")
-        if tool:
-            try:
-                done = subprocess.run([tool], capture_output=True, text=True, timeout=10,
-                                      creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-                found = sorted(set(re.findall(r"\bgfx[0-9a-f]{3,4}\b", done.stdout)))
-            except (OSError, subprocess.SubprocessError):
-                pass
-    if not found and os.name == "nt":
-        # a normal Windows PC has no hipInfo (it ships with the HIP SDK): the display adapters' PCI ids / names say which gfx it is
-        try:
-            found = ec.hip_archs_present()
-        except Exception:                                   # noqa: BLE001 - detection is best effort
-            found = []
-    return sorted(set(found))
-
-
-def _amd_card_names() -> list[str]:
-    if os.name != "nt":
-        return []
-    try:
-        return [c["name"] for c in ec.windows_amd_cards() if c.get("name")]
-    except Exception:                                       # noqa: BLE001
-        return []
-
-
 def detect_hardware(environ=None) -> dict:
-    """What the package choice depends on. Read-only probes of tools that are already installed (nvidia-smi, rocminfo, sysfs);
-    ``STRATA_ENGINE_BACKEND`` overrides the backend like it does for a start. Anything unreadable is left empty, which the
-    selection treats as "cannot tell", never as a refusal."""
+    """What the package choice depends on: the platform, the backend (sycl-ls or the PCI vendor; ``STRATA_ENGINE_BACKEND``
+    overrides it like it does for a start) and the runtime version. Read-only."""
     environ = os.environ if environ is None else environ
-    prefer = ""
-    forced = str(environ.get(ec.ENV_BACKEND, "")).strip().lower()
-    if forced.startswith("hip-") and forced not in ec.BACKEND_MATRIX:
-        # "hip-rx9070" is how the feed labels a package; accept it as "the hip family, this variant"
-        prefer = forced[4:]
-        environ = {**environ, ec.ENV_BACKEND: "hip"}
     backend, how = ec.detect_backend(environ)
-    hw = {"platform": host_platform(), "backend": backend, "backend_source": how, "runtime": ec.runtime_version(),
-          "nvidia_driver": None, "cuda_archs": [], "gfx": [], "gpu_names": [], "variant_wanted": prefer,
-          "makes": sorted(ec.gpu_makes_present())}
-    if backend == "cuda":
-        hw["nvidia_driver"] = ec.nvidia_driver_version()
-        hw["cuda_archs"] = ec.cuda_archs_present()
-    elif backend == "hip":
-        hw["gfx"] = _gfx_names()
-        hw["gpu_names"] = _amd_card_names()
-    return hw
+    return {"platform": host_platform(), "backend": backend, "backend_source": how, "runtime": ec.runtime_version()}
 
 
 # ---------------------------------------------------------------------------------------------- serving
@@ -524,55 +468,9 @@ def decide_engine(feed: feedmod.Feed, ctx: Context, state: State) -> dict:
     return _choose_engine(feed, ctx, state)[0]
 
 
-GPU_MAKES = ("cuda", "hip", "sycl")
-
-
-def installed_gpu_makes(root: Path, platform: str | None) -> set[str]:
-    """The GPU makes (cuda / hip / sycl) of the engines installed for this platform, whatever their state."""
-    try:
-        found, _ = ec.scan(root)
-    except OSError:
-        return set()
-    return {item.backend for item in found if item.platform == platform and item.backend in GPU_MAKES}
-
-
-def make_guard(ctx: Context) -> str | None:
-    """Never cross GPU makes (#3688). An update replaces the engine; it does not convert the PC from one make of card to another,
-    and a package for the wrong make can only fail its test start. When the engine already installed is for a different make
-    than the one detected:
-      - if this PC really has a card of the installed make too (the display adapters / PCI vendors say so), the update stays
-        on the installed make (a PC with an NVIDIA card and an AMD card keeps the engine it was set up with);
-      - otherwise nothing is chosen and the returned sentence says why.
-    An explicit ask (``--backend``, ``STRATA_ENGINE_BACKEND``) is the person's decision and passes. Returns None when the update
-    may go on."""
-    hw = ctx.hardware
-    want = hw.get("backend")
-    if want not in GPU_MAKES or hw.get("backend_source") in ("environment", "requested", "installed engine"):
-        return None
-    have = installed_gpu_makes(ctx.components, hw.get("platform"))
-    if not have or want in have:
-        return None
-    here = set(hw.get("makes") or [])
-    keep = [make for make in GPU_MAKES if make in have and make in here]
-    if keep:
-        ctx.hardware = {**detect_hardware({**ctx.environ, ec.ENV_BACKEND: keep[0]}), "backend_source": "installed engine"}
-        return None
-    mine = " and ".join(ec.MAKE_NAMES[m] for m in GPU_MAKES if m in have)
-    return (f"The engine installed here is for {mine} cards, but this update would give your PC {ec.MAKE_NAMES[want]} one. "
-            f"Nothing was changed. If you really changed your graphics card, download the {ec.MAKE_NAMES[want]} version "
-            f"from {ec.RELEASES_URL}.")
-
-
 def _choose_engine(feed: feedmod.Feed, ctx: Context, state: State) -> tuple[dict, feedmod.EnginePackage | None]:
-    refusal = make_guard(ctx)
-    if refusal:
-        installed, _ = installed_engine(ctx.components, {**ctx.hardware, "backend": next(iter(sorted(installed_gpu_makes(ctx.components, ctx.hardware.get("platform")))), None)})
-        return {"installed": _engine_view(installed), "offered": None, "reasons": [refusal], "status": "wrong-make", "note": refusal,
-                "download_bytes": 0, "previous": state.section("engine").get("previous"), "pinned": state.section("engine").get("pinned"),
-                "problem": None}, None
     installed, missing_reason = installed_engine(ctx.components, ctx.hardware)
-    sticky = {**ctx.hardware, "installed_variant": installed.variant if installed is not None and installed.backend == "hip" else ""}
-    offered, reasons = feedmod.select_engine([p for p in feed.engine], sticky)
+    offered, reasons = feedmod.select_engine([p for p in feed.engine], ctx.hardware)
     section = state.section("engine")
     report = {"installed": _engine_view(installed), "offered": offered.to_dict() if offered else None,
               "reasons": reasons, "status": "none-for-this-pc", "download_bytes": 0,
@@ -581,12 +479,6 @@ def _choose_engine(feed: feedmod.Feed, ctx: Context, state: State) -> tuple[dict
     if offered is None:
         if not feed.engine:
             report["status"] = "not-in-feed"
-        else:
-            hip = [p for p in feed.engine if p.backend == "hip" and p.platform == ctx.hardware.get("platform")]
-            if hip and ctx.hardware.get("backend") == "hip" and ctx.hardware.get("gfx") and not any(
-                    feedmod.engine_fit_reasons(p, ctx.hardware) == [] for p in hip):
-                # a build for another AMD card family: one plain line instead of the list of reasons
-                report["note"] = ec.arch_notice(tuple(sorted({a for p in hip for a in p.archs if a.startswith("gfx")})), ctx.hardware["gfx"])
         return report, None
     report["download_bytes"] = offered.size
     if installed is None:
@@ -740,7 +632,7 @@ def _patched_environ(values: dict):
 def binary_smoke(component: ec.EngineComponent, timeout: float = 60) -> dict:
     """No model installed yet: the engine must at least load (its libraries resolve, the GPU runtime initialises the loader) and
     report its version. Weaker than a one-token answer, and reported as such."""
-    var = "PATH" if os.name == "nt" else ("DYLD_LIBRARY_PATH" if sys.platform == "darwin" else "LD_LIBRARY_PATH")
+    var = "PATH" if os.name == "nt" else "LD_LIBRARY_PATH"
     env = dict(os.environ)
     env[var] = os.pathsep.join(ec.package_lib_dirs(component.root)) + os.pathsep + env.get(var, "")
     try:
@@ -936,9 +828,6 @@ def update_engine(ctx: Context, feed: feedmod.Feed, state: State) -> dict:
             result["reasons"] = decision["reasons"]
         return result
     root = ctx.components
-    have_makes = installed_gpu_makes(root, pkg.platform)
-    if pkg.backend in GPU_MAKES and have_makes and pkg.backend not in have_makes and ctx.hardware.get("backend_source") not in ("environment", "requested"):
-        raise UpdateError(f"the {pkg.label} engine is for another make of graphics card than the installed one; nothing was staged", 5)
     _warn_if_deep(ctx, ec.engine_dir(root) / folder_name(pkg), longpath.LONGEST_IN_PACKAGE.get(pkg.backend, longpath.LONGEST_IN_PACKAGE_DEFAULT) + 1)
     _free_space_check(root, pkg.size + pkg.installed_bytes, ctx, pkg.sha256, "engine")
     archive = _download(ctx, "engine", pkg.url, pkg.size, pkg.sha256, f"engine {pkg.label}", feed)
