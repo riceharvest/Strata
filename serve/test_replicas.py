@@ -244,11 +244,8 @@ class ReplicaService(unittest.TestCase):
                                        "observed_monotonic": time.monotonic()}
         second.terminal_stage_sample = {"elapsed_us": 1_000_000, "in_flight_us": [700_000, 500_000],
                                         "observed_monotonic": time.monotonic()}
-        self.svc.backend = "cuda"
-        for child, cards in ((first, [0, 1]), (second, [2, 3])):
-            child.spawn = (*child.spawn[:4], {"CUDA_DEVICE_ORDER": "PCI_BUS_ID",
-                                              "CUDA_VISIBLE_DEVICES": ",".join(map(str, cards))},
-                           *child.spawn[5:])
+        self.svc.backend = "sycl"
+        for child in (first, second):
             child.terminal_stages = [
                 {"stage": 0, "layer_start": 0, "layer_end": 19, "engine_ordinal": 0},
                 {"stage": 1, "layer_start": 20, "layer_end": 39, "engine_ordinal": 1}]
@@ -273,15 +270,9 @@ class ReplicaService(unittest.TestCase):
                          [(0, [800_000, 600_000]), (1, [700_000, 500_000])])
         self.assertNotIn("stage_in_flight_us", snapshot["work"])
         self.assertEqual(snapshot["topology"]["stages"], [])
-        self.assertEqual(snapshot["topology"]["replica_stages"][1]["stages"][1]["device_index"], 3)
+        self.assertIsNone(snapshot["topology"]["replica_stages"][1]["stages"][1]["device_index"])   # SYCL: no ordinal mapping is claimed
         self.assertEqual(snapshot["topology"]["replica_devices"],
                          [{"replica": 0, "devices": [0, 1]}, {"replica": 1, "devices": [2, 3]}])
-        second.spawn = (*second.spawn[:4], {"CUDA_DEVICE_ORDER": "PCI_BUS_ID",
-                                            "CUDA_VISIBLE_DEVICES": "9,3"}, *second.spawn[5:])
-        with urllib.request.urlopen(self.base + "/v1/telemetry", timeout=10) as response:
-            mismatch = json.load(response)
-        self.assertIsNone(mismatch["topology"]["replica_stages"][1]["stages"][0]["device_index"])
-        self.assertEqual(mismatch["topology"]["replica_stages"][1]["stages"][1]["device_index"], 3)
 
     def test_engines_without_slots_run_one_each_at_once(self):
         self.start(slots=0)

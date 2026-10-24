@@ -69,7 +69,6 @@ from strata_control import engine_component  # noqa: E402
 from strata_control import tls  # noqa: E402
 
 tls.install()       # #3722: image URLs and tool servers over HTTPS are checked against the operating system's certificates
-from strata_control import hipblaslt_tuning  # noqa: E402
 from strata_control import vision_reader  # noqa: E402
 from strata_control import draft_layer  # noqa: E402
 from strata_control import drafting  # noqa: E402
@@ -898,17 +897,9 @@ def read_engine_stage_log(path: str | None, start: int, limit: int = 2 << 20) ->
 
 
 def visible_device_order(env: dict | None, backend: str | None) -> list[int]:
-    """Map engine ordinals to OS GPU indices only when the visibility list is unambiguous."""
-    if backend not in (None, "cuda", "hip"):
-        return []
-    if backend != "hip" and (env or {}).get("CUDA_DEVICE_ORDER") != "PCI_BUS_ID":
-        return []
-    name = "HIP_VISIBLE_DEVICES" if backend == "hip" else "CUDA_VISIBLE_DEVICES"
-    value = (env or {}).get(name)
-    if not isinstance(value, str) or not re.fullmatch(r"[0-9]{1,5}(?:,[0-9]{1,5}){0,15}", value):
-        return []
-    devices = [int(part) for part in value.split(",")]
-    return devices if all(0 <= device <= 65535 for device in devices) and len(set(devices)) == len(devices) else []
+    """Map engine ordinals to OS GPU indices.  The SYCL engine numbers the cards ONEAPI_DEVICE_SELECTOR gives it, and
+    no mapping is claimed from that: always []."""
+    return []
 
 
 def configure_batch_telemetry_env(env: dict, cfg: dict, override: bool | None) -> None:
@@ -1032,12 +1023,11 @@ class StrataEngine:
         pin = {}
         if cpus and hasattr(os, "sched_setaffinity"):    # replicas: this engine's own physical cores (serve/replicas.py)
             pin["preexec_fn"] = lambda: os.sched_setaffinity(0, cpus)
-        nice = engine_nice(env)                          # Linux with built-in Radeon graphics: the desktop keeps its share of the CPU
+        nice = engine_nice(env)                          # STRATA_ENGINE_NICE: the desktop keeps its share of the CPU
         if nice:
             say_nice = pin.get("preexec_fn")
             pin["preexec_fn"] = lambda: (say_nice() if say_nice else None, os.nice(nice))[0]
-            print(f"[strata] engine priority: nice +{nice} (this PC has built-in Radeon graphics that usually draw the desktop; "
-                  "STRATA_ENGINE_NICE=0 turns it off)", flush=True)
+            print(f"[strata] engine priority: nice +{nice} (STRATA_ENGINE_NICE=0 turns it off)", flush=True)
         end_leftover_engines(exe)                        # one an earlier run lost still holds the GPU and the memory
         spawned_at = time.monotonic()
         try:
@@ -2533,21 +2523,13 @@ _VISION_ARCH_SIGNS = ("device kernel image is invalid", "no kernel image is avai
 
 
 def vision_start_error(line: str, log=None, code: int | None = None, waited: float | None = None) -> str:
-    """The message when the image encoder answered something other than READY.  #1445: a card in the Exclusive_Process
-    compute mode (or one another process holds) refuses the encoder's CUDA context with "busy or unavailable"; that
-    cause is named instead of leaving the user the first line of a traceback.  `log` is the encoder's stderr file, whose
-    tail is searched too (the CUDA error is printed there).  An encoder that dies before it prints anything (#3645, #3444,
+    """The message when the image encoder answered something other than READY.  `log` is the encoder's stderr file, whose
+    tail is searched too.  An encoder that dies before it prints anything (#3645, #3444,
     #3669, #3697) used to give a blank sentence: now the last lines of its stderr, its exit status (`code`) and, for a
     kernel-image error, the card/architecture hint come with it.  `waited`: it said nothing for that many seconds."""
     text = line.strip()
     tail = vision_log_tail(log)
     both = (text + chr(10) + tail).lower()
-    if "busy or unavailable" in both:
-        return ("the vision encoder did not start: the GPU refused a second CUDA context (\"CUDA-capable device(s) "
-                "is/are busy or unavailable\"). This is usually the compute mode Exclusive_Process: only one process "
-                "may use the card, and the engine already holds it. Check with: nvidia-smi --query-gpu=compute_mode "
-                "--format=csv; set it back with: sudo nvidia-smi -c DEFAULT (or run the encoder on another card). "
-                "First line from the encoder: " + (text or "(none)"))
     lines = [x.strip() for x in tail.splitlines() if x.strip()]
     if any(sign in both for sign in _VISION_ARCH_SIGNS):
         evidence = next((x for x in reversed(lines) if any(sign in x.lower() for sign in _VISION_ARCH_SIGNS)), text)
@@ -2911,8 +2893,8 @@ class Vision:
 
 
 def gpu_list(cfg: dict) -> list[int]:
-    """The config's "gpu": one card (2), or several for a layer split ([0, 2] or "0,2"), numbered as nvidia-smi
-    numbers them; [] when it names none."""
+    """The config's "gpu": one card (2), or several for a layer split ([0, 2] or "0,2"), numbered as setup numbers
+    them; [] when it names none."""
     roles, _ = gpu_roles.saved_roles(cfg)       # "gpu_roles" (Main / Helper / Off per card) wins unless "gpu" was edited by hand
     if roles is not None:
         legacy = _gpu_numbers(cfg.get("gpu"))
@@ -2939,21 +2921,21 @@ def gpu_all_off(cfg: dict) -> bool:
 
 
 def card_roles_lines(cfg: dict) -> list[str]:
-    """The plain lines printed at start: the roles (cards numbered as nvidia-smi numbers them), a hand-edited "gpu" that beat them, and the
-    all-Off case.  SystemExit when every card is Off and the engine cannot start without one (the CUDA, HIP and SYCL engines)."""
+    """The plain lines printed at start: the roles (cards numbered as setup numbers them), a hand-edited "gpu" that beat them, and the
+    all-Off case.  SystemExit when every card is Off and the engine cannot start without one (the SYCL engine)."""
     roles, problem = gpu_roles.saved_roles(cfg)
     out = [f"[strata] {problem}"] if problem else []
     if roles is None:
         return out
     if gpu_all_off(cfg):
-        if cfg.get("backend") in ("cpu", "metal") or sys.platform == "darwin":
+        if cfg.get("backend") == "cpu":
             out.append("[strata] every graphics card is Off: " + gpu_roles.CPU_ONLY_LINE)
             return out
         raise SystemExit("[strata] every graphics card is set to Off, and this engine cannot start without one. Turn a card on "
                          "(Main or Helper) in the app or with strata launch --gpu-roles.")
     word = {"main": "Main", "helper": "Helper", "off": "Off"}
     out.append("[strata] card roles: " + ", ".join(f"{word[r]} GPU {i}" for r in ("main", "helper", "off")
-                                                    for i in sorted(roles) if roles[i] == r) + " (numbers as nvidia-smi gives them)")
+                                                    for i in sorted(roles) if roles[i] == r) + " (numbered as setup numbers them)")
     return out
 
 
@@ -3062,15 +3044,10 @@ _CARD_CLASS: list = []
 
 
 def drafting_card_class() -> str:
-    """The class of this computer's graphics card for the drafter table (strata_control/drafting.py), looked up once."""
+    """The class of this computer's graphics card for the drafter table (strata_control/drafting.py), looked up once.
+    The table has no Intel Arc row, so it is the "other" class."""
     if not _CARD_CLASS:
-        archs: list[str] = []
-        try:
-            from strata_control import engine_component
-            archs = list(engine_component.cuda_archs_present()) + list(engine_component.hip_archs_present())
-        except Exception:                                    # noqa: BLE001 - an unknown card is the "other" class, never an error
-            pass
-        _CARD_CLASS.append(drafting.card_class(archs))
+        _CARD_CLASS.append(drafting.card_class([]))
     return _CARD_CLASS[0]
 
 
@@ -3217,78 +3194,8 @@ def learned_profile_args(cfg: dict, args: list[str]) -> list[str]:
     return args
 
 
-def hip_visible(cfg: dict) -> list[int]:
-    """AMD: the devices the engine should see, as the HIP runtime numbers them (HIP_VISIBLE_DEVICES).
-
-    On Linux setup's KFD order is HIP's order, so the config's "gpu" is it.  On Windows setup finds the cards in the
-    display-adapter order, and an integrated Radeon that HIP also enumerates takes ordinal 0 and pushes the discrete
-    card to 1 (#325): setup records the ordinal `strata-device --list-devices` gave the card as "hip_ordinal", which
-    wins for a one-card config.  Without it (a config from before), the config's "gpu"."""
-    ordinal = cfg.get("hip_ordinal")
-    if ordinal is not None and str(ordinal).strip() != "" and len(gpu_list(cfg)) <= 1:
-        try:
-            return [int(str(ordinal).strip())]
-        except ValueError:
-            pass
-    return ordered_gpus(cfg)
-
-
-def gpu_speed_scores(indices: list[int]) -> dict[int, float] | None:
-    """Multiprocessors x max clock for each NVIDIA card, numbered as nvidia-smi numbers them (the CUDA driver API,
-    which every driver ships: no toolkit needed); None when it cannot say for every one of them."""
-    code = (
-        "import ctypes,sys,os\n"
-        "os.environ['CUDA_DEVICE_ORDER']='PCI_BUS_ID'\n"
-        "lib=ctypes.CDLL('nvcuda.dll' if os.name=='nt' else 'libcuda.so.1')\n"
-        "assert lib.cuInit(0)==0\n"
-        "n=ctypes.c_int()\n"
-        "assert lib.cuDeviceGetCount(ctypes.byref(n))==0\n"
-        "for i in range(n.value):\n"
-        "    d=ctypes.c_int()\n"
-        "    assert lib.cuDeviceGet(ctypes.byref(d),i)==0\n"
-        "    sm=ctypes.c_int(); mhz=ctypes.c_int()\n"
-        "    lib.cuDeviceGetAttribute(ctypes.byref(sm),16,d)\n"
-        "    lib.cuDeviceGetAttribute(ctypes.byref(mhz),13,d)\n"
-        "    print(i,sm.value,mhz.value)\n")
-    try:
-        env = dict(os.environ)
-        env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-        env.pop("CUDA_VISIBLE_DEVICES", None)
-        r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=30, env=env)
-        got = {}
-        for line in r.stdout.splitlines():
-            i, sm, khz = (int(x) for x in line.split())
-            got[i] = float(sm) * float(khz)
-    except (OSError, ValueError, subprocess.SubprocessError):
-        return None
-    return got if all(i in got and got[i] > 0 for i in indices) else None
-
-
-def hip_speed_scores(indices: list[int], root: str = "/sys/class/kfd/kfd/topology/nodes") -> dict[int, float] | None:
-    """AMD on Linux: SIMDs x max engine clock of each card, from the KFD topology (the order setup and the engine use
-    for "gpu" there: the GPU nodes in node order).  None when the files are not there (Windows, no ROCm driver)."""
-    try:
-        nodes = sorted((int(n) for n in os.listdir(root) if n.isdigit()))
-    except OSError:
-        return None
-    cards = []
-    for n in nodes:
-        try:
-            props = dict(line.split() for line in open(os.path.join(root, str(n), "properties")) if len(line.split()) == 2)
-            simd, clk = int(props.get("simd_count", 0)), int(props.get("max_engine_clk_fcompute", 0))
-        except (OSError, ValueError):
-            continue
-        if simd > 0:
-            cards.append(float(simd) * float(clk or 1))
-    got = dict(enumerate(cards))
-    return got if all(i in got for i in indices) else None
-
-
-def engine_nice(env: dict | None = None, archs: dict[int, str] | None = None, platform: str | None = None) -> int:
-    """Linux only: the nice value the engine starts with.  The engine's CPU pool spins at 100% on every physical core but one and its host
-    thread on another; with the desktop drawn by a built-in Radeon (HIP_IGPU_ARCHS: Strix Halo and the other APUs) the compositor then
-    competes with them for the CPU, which reads as a frozen screen.  +5 gives the desktop its share and costs nothing when nothing else
-    runs.  STRATA_ENGINE_NICE=N sets it (0 = off, also for any PC without such a chip).  Not on Windows / macOS."""
+def engine_nice(env: dict | None = None, platform: str | None = None) -> int:
+    """Linux only: the nice value the engine starts with: STRATA_ENGINE_NICE=N (0 = off, the default).  Not on Windows / macOS."""
     if not (platform or sys.platform).startswith("linux"):
         return 0
     asked = (env or os.environ).get("STRATA_ENGINE_NICE")
@@ -3297,186 +3204,7 @@ def engine_nice(env: dict | None = None, archs: dict[int, str] | None = None, pl
             return max(0, min(19, int(str(asked).strip())))
         except ValueError:
             return 0
-    ar = archs if archs is not None else hip_gpu_archs()
-    return 5 if ar and any(a in HIP_IGPU_ARCHS for a in ar.values()) else 0
-
-
-def hip_gpu_archs(root: str = "/sys/class/kfd/kfd/topology/nodes") -> dict[int, str] | None:
-    """AMD on Linux: {HIP ordinal: "gfx1151"} from the KFD topology (GPU nodes in node order, as hip_speed_scores and setup number them).
-    None when the files are not there (Windows, no ROCm driver)."""
-    try:
-        nodes = sorted(int(n) for n in os.listdir(root) if n.isdigit())
-    except OSError:
-        return None
-    out: dict[int, str] = {}
-    for n in nodes:
-        try:
-            props = dict(line.split() for line in open(os.path.join(root, str(n), "properties")) if len(line.split()) == 2)
-            ver, simd = int(props.get("gfx_target_version", 0)), int(props.get("simd_count", 0))
-        except (OSError, ValueError):
-            continue
-        if simd > 0 and ver > 0:
-            out[len(out)] = f"gfx{ver // 10000}{(ver // 100) % 100:x}{ver % 100:x}"
-    return out or None
-
-
-def igpu_cards(indices: list[int], archs: dict[int, str] | None) -> set[int]:
-    """The cards of `indices` that are integrated (their memory is the system RAM, and they usually draw the desktop)."""
-    return {i for i in indices if archs and archs.get(i) in HIP_IGPU_ARCHS}
-
-
-def gpu_vram_mib(indices: list[int], hip: bool = False) -> dict[int, int] | None:
-    """Total VRAM of each card in MiB (NVML / amdgpu sysfs); None when any of them cannot be read."""
-    try:
-        from serve.telemetry import gpu_reader
-    except ImportError:
-        return None
-    out = {}
-    for i in indices:
-        g = gpu_reader(i)
-        if not g.ok():
-            return None
-        total = g.read().get("mem_total")
-        if total is None:
-            return None
-        out[i] = int(total) >> 20
-    return out
-
-
-def ordered_gpus(cfg: dict, scores=None, vrams=None, archs=None) -> list[int]:
-    """#1352: the cards of a layer split in the order the engine stages them.  With "layer_split": "auto" (the
-    default) the faster card goes LAST - the last stage runs the head, the draft layer and the verify, and a prompt
-    chunk waits on it (the reporter's 4070 Ti SUPER + 5060 Ti: a 6K prompt took 50 s one way round and 15 s the
-    other); "faster" is multiprocessors x max clock.  Equal cards - scores within 5% - keep the config's order, and
-    so does anything we cannot measure.  "gpu_order": "as_given" keeps the config's order whatever the cards.  A
-    manual "layer_split" ("24") also keeps it: the user placed the layers.  #1576: the reorder is skipped when it
-    would land the last stage on a card with less total VRAM than the one the config put there - that stage's head,
-    draft and verify have a floor the smaller card cannot afford.  scores/vrams: {index: value} (tests); None asks
-    the driver - injected scores without injected vrams means no VRAM check (a test seam is a test seam)."""
-    gl = gpu_list(cfg)
-    if len(gl) < 2 or cfg.get("gpu_order") == "as_given" or gpu_roles_active(cfg):
-        return gl
-    args = cfg.get("args") or []
-    if "--peer-device" in args or "--layer-split" in args or layer_split_value(cfg) != "auto":
-        return gl
-    hip = cfg.get("backend") == "hip"
-    if hip:
-        # An integrated Radeon (Strix Halo beside an R9700) is never the LAST stage: that stage runs the head, the draft layer and the
-        # check of the guesses, and the iGPU usually draws the desktop.  Its "VRAM" is the BIOS carve-out (up to 96 GB), which made the
-        # #1576 memory guard below keep it last.  It goes first, the cards with memory of their own follow in speed order.
-        # archs: {index: "gfx1151"} (tests); None asks the KFD topology, unless scores were injected (a test seam).
-        ar = archs if archs is not None else (hip_gpu_archs() if scores is None else None)
-        ig = igpu_cards(gl, ar)
-        if ig and len(ig) < len(gl):
-            sc0 = scores if scores is not None else hip_speed_scores(gl)
-            rest = [i for i in gl if i not in ig]
-            if sc0 and all(i in sc0 for i in rest):
-                rest = sorted(rest, key=lambda i: sc0[i]) if max(sc0[i] for i in rest) >= 1.05 * min(sc0[i] for i in rest) else rest
-            out = [i for i in gl if i in ig] + rest
-            if out != gl:
-                print(f"[strata] layer split: card order {','.join(map(str, out))} (GPU {','.join(str(i) for i in sorted(ig))} is built-in "
-                      f"graphics: it takes the first layers, never the last stage; \"gpu_order\": \"as_given\" keeps {','.join(map(str, gl))})",
-                      flush=True)
-            return out
-    sc = scores if scores is not None else (hip_speed_scores(gl) if hip else gpu_speed_scores(gl))
-    if not sc or any(i not in sc for i in gl):
-        return gl
-    if max(sc[i] for i in gl) < 1.05 * min(sc[i] for i in gl):
-        return gl     # #1760: cards within 5% of each other are the same card (two 5070 Ti read 1.2% apart on the clock): keep the order
-    out = sorted(gl, key=lambda i: sc[i])
-    if out != gl:
-        vram = vrams if vrams is not None else (None if scores is not None else gpu_vram_mib(gl, hip))
-        if vram is not None and all(i in vram for i in gl) and vram[out[-1]] < vram[gl[-1]]:
-            print(f"[strata] layer split: keeping card order {','.join(map(str, gl))} - the faster card has "
-                  f"less VRAM than the one the split ends on ({vram[out[-1]]} vs {vram[gl[-1]]} MiB, #1576)",
-                  flush=True)
-            return gl
-        print(f"[strata] layer split: card order {','.join(map(str, out))} (the faster card last; "
-              f'"gpu_order": "as_given" keeps {",".join(map(str, gl))}, #1352)', flush=True)
-    return out
-
-
-#: AMD chips that share the system memory (an iGPU): never preferred over a card that has memory of its own.
-HIP_IGPU_ARCHS = ("gfx1035", "gfx1036", "gfx1037", "gfx1103", "gfx1150", "gfx1151", "gfx1152", "gfx90c")
-
-
-def parse_hip_devices(text: str) -> list[dict]:
-    """`strata-device --list-devices`: [{"index", "name", "arch", "vram_gb", "integrated", "cannot_run"}], numbered as the HIP runtime numbers them."""
-    found: list[dict] = []
-    for line in text.splitlines():
-        s = line.strip()
-        m = re.match(r"device\s+(\d+):\s*(.*)$", s)
-        if m:
-            found.append({"index": int(m.group(1)), "name": m.group(2).strip(), "arch": "", "vram_gb": 0.0, "integrated": False, "cannot_run": None})
-            continue
-        if not found:
-            continue
-        a = re.match(r"arch\s+(gfx[0-9a-f]+)\s*,\s*([\d.]+)\s*GiB(.*)$", s)
-        if a and not found[-1]["arch"]:
-            found[-1]["arch"], found[-1]["vram_gb"] = a.group(1), float(a.group(2))
-            found[-1]["integrated"] = "integrated" in a.group(3)      # a newer engine says so itself
-        elif s.startswith("cannot run:"):
-            found[-1]["cannot_run"] = s[len("cannot run:"):].strip()
-    for d in found:
-        d["integrated"] = d["integrated"] or d["arch"] in HIP_IGPU_ARCHS
-    return found
-
-
-def hip_no_card_message(devices: list[dict]) -> str:
-    """The plain line when the engine has code for none of the computer's cards."""
-    cards = ", ".join(f"{d['name'] or 'graphics card'} ({d['arch'] or 'unknown'}{', integrated' if d['integrated'] else ''})" for d in devices)
-    built = next((m.group(1) for d in devices for m in [re.search(r"compiled for \(([^)]*)\)", d["cannot_run"] or "")] if m), "")
-    text = f"[strata] none of this computer's graphics cards has code in this Strata engine{f' (it is built for {built})' if built else ''}. Cards found: {cards}."
-    note = engine_component.no_package_note([d["arch"] for d in devices])
-    return text + (f" {note}" if note else "")
-
-
-def pick_hip_devices(devices: list[dict]) -> tuple[list[int] | None, str | None]:
-    """Which card an "Automatic" start runs on: (HIP_VISIBLE_DEVICES to set, or None to leave the runtime's own order; a plain problem or
-    None).  Cards this engine has no code for are skipped, and so are integrated chips while a card of its own can run (#3203: a mini PC's
-    Radeon 760M is HIP's device 0 and the engine died on it; the RX 6800 XT behind it was never tried).  When device 0 is already the right
-    kind nothing changes."""
-    if not devices:
-        return None, None
-    runnable = [d for d in devices if not d["cannot_run"]]
-    if not runnable:
-        return None, hip_no_card_message(devices)
-    pool = [d for d in runnable if not d["integrated"]] or runnable
-    if devices[0] in pool:
-        return None, None
-    best = max(pool, key=lambda d: (round(d["vram_gb"]), -d["index"]))
-    return [best["index"]], None
-
-
-def hip_auto_devices(cfg: dict, env: dict) -> list[int] | None:
-    """HIP_VISIBLE_DEVICES for a start that names no card (see pick_hip_devices), asked of the engine package's own `strata-device`.
-    None leaves everything as it was: a card the config or the environment names, no probe next to the engine, or a probe that fails.
-    SystemExit with the plain line when no card of this computer can run."""
-    if cfg.get("backend") != "hip" or gpu_list(cfg) or gpu_all_off(cfg) or str(cfg.get("hip_ordinal") if cfg.get("hip_ordinal") is not None else "").strip() \
-            or env.get("HIP_VISIBLE_DEVICES") or env.get("ROCR_VISIBLE_DEVICES"):
-        return None
-    exe = cfg.get("exe")
-    if not isinstance(exe, str) or not exe or engine_component.is_reference(exe):
-        return None
-    probe = Path(exe).with_name("strata-device.exe" if os.name == "nt" else "strata-device")
-    if not probe.is_file():
-        return None
-    try:
-        done = subprocess.run([str(probe), "--list-devices"], capture_output=True, text=True, timeout=60, cwd=str(probe.parent), env=env,
-                              creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if done.returncode != 0:
-        return None
-    devices = parse_hip_devices(done.stdout)
-    visible, problem = pick_hip_devices(devices)
-    if problem:
-        raise SystemExit(problem)
-    if visible:
-        d = next(x for x in devices if x["index"] == visible[0])
-        print(f"[strata] automatic GPU choice: GPU {d['index']} ({d['name']}, {d['arch']}); the engine skips cards it has no code for and "
-              f"integrated chips while a card of its own can run", flush=True)
-    return visible
+    return 0
 
 
 DS41_SLOT_KEEP_DEFAULT = "1"      # the engine keeps a displaced conversation in RAM and in the slot folder (see below)
@@ -3497,18 +3225,10 @@ def deepseek_slot_env(env: dict, cfg: dict) -> None:
 
 
 def child_env(cfg: dict, *, offline: bool = False) -> dict:
-    """The engine's environment: the CUDA libraries setup installed (pip's nvidia packages, or the toolkit that
-    compiled it) first on the library search path."""
+    """The engine's environment: the config's "env" (the SYCL launcher passes on its ONEAPI_/STRATA_/... variables)
+    and its "lib_dirs" first on the library search path."""
     env = dict(os.environ)
-    if gpu_all_off(cfg):                             # every card Off: the engine sees none (a CPU engine runs; the others say so at start)
-        env["CUDA_VISIBLE_DEVICES"] = ""
-        env["HIP_VISIBLE_DEVICES"] = ""
-    elif hip_visible(cfg) and cfg.get("backend") == "hip":   # AMD: numbered as HIP numbers them (hip_visible)
-        env["HIP_VISIBLE_DEVICES"] = ",".join(str(i) for i in hip_visible(cfg))
-    elif gpu_list(cfg):                              # issue #51: the GPU(s) to run on, numbered as nvidia-smi does; CUDA's
-        env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"      # own default order (fastest first) can number the cards otherwise
-        env["CUDA_VISIBLE_DEVICES"] = ",".join(str(i) for i in ordered_gpus(cfg))
-    for k, v in (cfg.get("env") or {}).items():      # engine settings the config carries (AMD: the GEMM tuning table)
+    for k, v in (cfg.get("env") or {}).items():      # engine settings the config carries
         env[str(k)] = str(v)
     if (cfg.get("arch") or "") == "deepseek41":      # (only this engine reads these; Qwen's environment is untouched)
         deepseek_slot_env(env, cfg)
@@ -3529,122 +3249,6 @@ def child_env(cfg: dict, *, offline: bool = False) -> dict:
     if dirs:
         var = "PATH" if os.name == "nt" else "LD_LIBRARY_PATH"
         env[var] = os.pathsep.join(dirs + ([env[var]] if env.get(var) else []))
-    if cfg.get("backend") == "hip":
-        hip_env_guard(env, cfg)
-        auto = hip_auto_devices(cfg, env)
-        if auto:
-            env["HIP_VISIBLE_DEVICES"] = ",".join(str(i) for i in auto)
-    return env
-
-
-def _dir_writable(p: str) -> bool:
-    try:
-        with tempfile.TemporaryFile(dir=p):
-            return True
-    except OSError:
-        return False
-
-
-def hip_env_guard(env: dict, cfg: dict) -> list[str]:
-    """#654: two things in an AMD user's environment that crash the HIP runtime before it prints a line.  (1) HIP_PATH,
-    HIP_DEVICE_LIB_PATH or LLVM_PATH naming a folder that is gone (a ROCm build that was deleted): the bundled runtime
-    follows them.  They are dropped, and only when the folder does not exist.  (2) A TEMP / TMP / TMPDIR the engine cannot
-    create a file in: the runtime's comgr JIT builds its blit kernels through temporary files and the first call
-    crashes in amdhip64 (0xC0000005).  A writable folder next to the engine's log takes its place.  Returns what it
-    changed (said once, on stderr); a healthy environment is left exactly as it was."""
-    said: list[str] = []
-    for k in ("HIP_PATH", "HIP_DEVICE_LIB_PATH", "LLVM_PATH"):
-        v = env.get(k)
-        if v and not Path(v).exists():
-            del env[k]
-            said.append(f"{k}={v} does not exist: not passed to the engine")
-    bad = [k for k in ("TEMP", "TMP", "TMPDIR") if env.get(k) and not _dir_writable(env[k])]
-    if bad:
-        base = Path(cfg.get("log") or cfg.get("cwd") or ROOT).resolve()
-        for d in (base.parent / "tmp", ROOT / "tmp"):
-            try:
-                d.mkdir(parents=True, exist_ok=True)
-            except OSError:
-                continue
-            if _dir_writable(str(d)):
-                for k in bad:
-                    said.append(f"{k}={env[k]} is not writable: using {d}")
-                    env[k] = str(d)
-                break
-        else:
-            said.append(f"{', '.join(bad)} not writable (AMD's runtime needs a writable temporary folder)")
-    for line in said:
-        print(f"strata serve: AMD: {line}", file=sys.stderr, flush=True)
-    return said
-
-
-def igpu_split_warning(cfg: dict, archs: dict[int, str] | None = None) -> str | None:
-    """A plain line when the layers are split over built-in Radeon graphics AND a card with memory of its own.  A recommendation, not a
-    refusal: the split runs as asked.  The iGPU's memory is the RAM, it usually draws the desktop, and compute on it can freeze the screen."""
-    if cfg.get("backend") != "hip":
-        return None
-    gl = gpu_list(cfg)
-    if len(gl) < 2:
-        return None
-    ar = archs if archs is not None else hip_gpu_archs()
-    ig = igpu_cards(gl, ar)
-    if not ig or len(ig) == len(gl):
-        return None
-    return ("[strata] note: GPU " + ", ".join(str(i) for i in sorted(ig)) + " is built-in graphics (its memory is the system RAM, and it "
-            "usually draws the desktop). Running part of the model on it can freeze the screen and uses RAM twice; the cards with memory of "
-            "their own are faster alone (docs/STRIX_HALO.md). Turn it Off in the card roles, or name only the other card, to leave it out")
-
-
-def card_note(cfg: dict, env: dict) -> str | None:
-    """One plain line that ties the engine's own numbering to the person's: the engine counts the cards it is given from 0 ("GPU 0",
-    "CUDA0" in its log), so a person who chose GPU 1 would read "GPU 0" and think the choice was lost.  Said only when the two differ
-    (NVIDIA, numbered as nvidia-smi numbers them); None otherwise."""
-    if cfg.get("backend") == "hip" or not gpu_list(cfg):
-        return None
-    mine = [x.strip() for x in str((env or {}).get("CUDA_VISIBLE_DEVICES", "")).split(",") if x.strip() != ""]
-    if not mine or mine == [str(i) for i in range(len(mine))]:
-        return None
-    names = [f"CUDA{i}" for i in range(len(mine))]
-    if len(mine) == 1:
-        return f"[strata] running on GPU {mine[0]} (as nvidia-smi numbers it); the engine's log calls it GPU 0 / CUDA0"
-    return (f"[strata] cards in stage order: GPU {', then GPU '.join(mine)} (as nvidia-smi numbers them); the engine's log calls them "
-            f"{', '.join(names)} - the first runs the first layers and the picture reader, the last runs the head and the draft layer")
-
-
-def vision_card_off_igpu(env: dict, archs: dict[int, str] | None = None) -> int | None:
-    """AMD: the picture reader is a separate program that sees the engine's HIP_VISIBLE_DEVICES and runs on the FIRST visible card.  With a
-    layer split that starts on a built-in Radeon (Strix Halo beside an R9700) that is the iGPU: the card that draws the desktop and whose
-    memory is the RAM the experts live in.  Returns the HIP ordinal of the last visible card with memory of its own (the Main stage), or
-    None when nothing needs changing (one card, no integrated chip among them, or the topology is unknown)."""
-    vis = [x.strip() for x in str(env.get("HIP_VISIBLE_DEVICES") or "").split(",") if x.strip().isdigit()]
-    if len(vis) < 2:
-        return None
-    idx = [int(x) for x in vis]
-    ar = archs if archs is not None else hip_gpu_archs()
-    ig = igpu_cards(idx, ar)
-    own = [i for i in idx if i not in ig and ar and i in ar]
-    if not ig or not own:
-        return None
-    print(f"[strata] the picture reader runs on GPU {own[-1]}, not on the built-in graphics (GPU {','.join(str(i) for i in sorted(ig))}) "
-          "that draws the desktop; \"vision\": {\"cuda_device\": N} chooses another card", flush=True)
-    return own[-1]
-
-
-def vision_env(cfg: dict, env: dict, archs: dict[int, str] | None = None) -> dict:
-    """The image encoder's environment: the engine's, unless the config's vision section names its own "cuda_device"
-    (numbered like nvidia-smi) - then the encoder runs on that card alone, so a spare GPU can hold it while the engine
-    keeps all of its own cards' VRAM (#408, Efs-O).  Without it, nothing changes."""
-    dev = (cfg.get("vision") or {}).get("cuda_device")
-    if dev is None and cfg.get("backend") == "hip":
-        dev = vision_card_off_igpu(env, archs)
-    if dev is None:
-        return env
-    env = dict(env)
-    if cfg.get("backend") == "hip":
-        env["HIP_VISIBLE_DEVICES"] = str(dev)
-    else:
-        env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-        env["CUDA_VISIBLE_DEVICES"] = str(dev)
     return env
 
 
@@ -7499,36 +7103,6 @@ def warn_budget_over_ram(args) -> str | None:
     return msg
 
 
-DESKTOP_FREE_MIB = 2048          # #560 #516: below this, an AMD card that also drives a Linux desktop can run out
-DESKTOP_RESERVE_MIB = 3072       # what kept KDE/Wayland alive beside a full expert cache in both reports
-
-
-def linux_desktop(env=None) -> bool:
-    """A graphical session on Linux (Wayland or X): its compositor, browser and apps take VRAM after the model has."""
-    env = os.environ if env is None else env
-    return os.name != "nt" and sys.platform != "darwin" and bool(env.get("WAYLAND_DISPLAY") or env.get("DISPLAY"))
-
-
-def desktop_vram_note(backend, vram_free_mib, args: list, desktop: bool) -> str:
-    """#560 #516: on Linux, when the desktop needs VRAM the AMD card does not have, amdgpu moves GPU memory (the expert
-    cache, ~24 GB) to system RAM, which the experts already fill - the OOM killer then ends the compositor.  The
-    default reserve (700 MiB) is sized for a card without a desktop.  A recommendation, nothing changes: "" when it
-    does not apply."""
-    if backend != "hip" or not desktop or not isinstance(vram_free_mib, int) or vram_free_mib >= DESKTOP_FREE_MIB:
-        return ""
-    try:
-        reserve = int(args[args.index("--vram-reserve-mib") + 1]) if "--vram-reserve-mib" in args else 700
-    except (ValueError, IndexError):
-        reserve = 700
-    if reserve >= DESKTOP_RESERVE_MIB:
-        return ""
-    return (f"[strata] note: {vram_free_mib} MiB of VRAM free with the model loaded. If this AMD card also drives your "
-            "desktop and the desktop or apps crash after the start (the driver moves the expert cache to RAM and "
-            "the OOM killer ends the session), keep more VRAM free: ./setup.sh --vram-reserve-mib "
-            f"{DESKTOP_RESERVE_MIB} (remembered; the expert cache gets "
-            f"{(DESKTOP_RESERVE_MIB - reserve) / 1024:.1f} GB less, a few % of speed)")
-
-
 def lan_addresses() -> list[str]:
     """This PC's IPv4 addresses on its networks (what another device types in), without loopback/link-local."""
     import socket
@@ -8102,8 +7676,6 @@ def with_component_engine(cfg: dict) -> dict:
     cfg["exe"] = _component_exe(cfg["exe"], cfg)
     cfg["lib_dirs"] = [*engine_component.package_lib_dirs(Path(cfg["exe"]).parent), *(cfg.get("lib_dirs") or [])]
     cfg = with_current_reader(cfg, Path(cfg["exe"]).parent)
-    if cfg.get("backend") == "hip":     # AMD: the package's own hipBLASLt tuning table for this card, when its hipBLASLt version matches
-        cfg = hipblaslt_tuning.apply(cfg, Path(cfg["exe"]).parent, say=lambda line: print(line, flush=True))
     return cfg
 
 
@@ -8169,7 +7741,7 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
                     help="opt in to low-rate engine decode-window samples for /v1/telemetry")
     ap.add_argument("--offline", action="store_true",
                     help="do not fetch remote image URLs or start MCP/tool subprocesses")
-    ap.add_argument("--gpu", help="the GPU to run on, as nvidia-smi numbers them, or several for a layer split "
+    ap.add_argument("--gpu", help="the GPU to run on, as setup numbers them, or several for a layer split "
                                   "(\"0,2\"; also \"gpu\" in the config)")
     ap.add_argument("--tokenizer", default=str(ROOT / "pack/full/tokenizer"),
                     help="pack tokenizer directory (falls back to a byte tokenizer if absent)")
@@ -8371,16 +7943,10 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
                       "encoder its VRAM): the encoder starts with the model instead", flush=True)
                 vcfg["elastic"] = False
             vision = Vision(vcfg, log=open(cfg["log"], "a", encoding="utf-8") if cfg.get("log") else None,
-                            env=vision_env(cfg, env), lazy=lazy)
+                            env=env, lazy=lazy)
         print("model unloaded; the first request loads it ..." if lazy else
               "loading the model (the first start takes a minute or two) ...", flush=True)
         warn_budget_over_ram(engine_args(cfg) if "args" in cfg else [])      # #1080
-        note = card_note(cfg, env)
-        if note:
-            print(note, flush=True)
-        igpu_line = igpu_split_warning(cfg)
-        if igpu_line:
-            print(igpu_line, flush=True)
         if layer_split_of(cfg):
             try:
                 split = layer_split_value(cfg)          # #644: before the (minutes-long) start
@@ -8417,10 +7983,6 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
                                   env=env, lazy=lazy)
         engine.silence_s = silence                      # an attribute of its own: restart() keeps it
         warn_tight_ram(engine.info.get("arena_mib"))
-        note = desktop_vram_note(cfg.get("backend"), engine.info.get("vram_free_mib"), engine.spawn[1],
-                                 linux_desktop()) if not groups else None
-        if note:                                        # #560 #516: before --open starts a browser on that card
-            print(note, flush=True)
     else:
         effort_end = None
         engine, vision, sampling_defaults = MockEngine(tok, a.script or [
@@ -8592,7 +8154,7 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
                                   else "single GPU or CPU" if a.engine == "strata" else "mock")
     svc.terminal_configured_split = (layer_split_value(cfg) if a.engine == "strata" and layer_split_of(cfg)
                                      else None)
-    svc.backend = cfg.get("backend")                    # "hip": the AMD cards' readings come from sysfs (#301)
+    svc.backend = cfg.get("backend")
     if a.config:
         svc.config_path = a.config                      # #564: the web page's Settings view
     if a.config:                                        # the Chat settings shared with other apps, from last time

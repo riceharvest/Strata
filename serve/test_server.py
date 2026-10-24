@@ -1735,270 +1735,20 @@ class SharedPrefix(unittest.TestCase):
 
 
 class GpuChoice(unittest.TestCase):
-    """Issue #51: the config's \"gpu\" reaches the engine as CUDA_VISIBLE_DEVICES, numbered like nvidia-smi."""
+    """The config's "gpu" adds no CUDA/HIP visibility variables: the SYCL launcher picks the card (ONEAPI_DEVICE_SELECTOR)."""
 
     def test_env(self):
         from serve.server import child_env
-        env = child_env({"gpu": 1})
-        self.assertEqual(env["CUDA_VISIBLE_DEVICES"], "1")
-        self.assertEqual(env["CUDA_DEVICE_ORDER"], "PCI_BUS_ID")
-        plain = child_env({})                     # no choice: the environment as it was (existing installs)
-        self.assertEqual(plain.get("CUDA_VISIBLE_DEVICES"), os.environ.get("CUDA_VISIBLE_DEVICES"))
-        self.assertEqual(plain.get("CUDA_DEVICE_ORDER"), os.environ.get("CUDA_DEVICE_ORDER"))
+        env = child_env({"gpu": 1, "env": {"ONEAPI_DEVICE_SELECTOR": "level_zero:0"}})
+        self.assertEqual(env["ONEAPI_DEVICE_SELECTOR"], "level_zero:0")
+        self.assertEqual(env.get("CUDA_VISIBLE_DEVICES"), os.environ.get("CUDA_VISIBLE_DEVICES"))
 
-    def test_card_note_ties_the_engines_numbering_to_the_persons(self):
-        """The engine counts the cards it is given from 0, so GPU 1 reads "GPU 0 / CUDA0" in its log: one line says which is which."""
-        from serve.server import card_note, child_env
-        one = {"gpu": 1, "args": []}
-        self.assertIn("GPU 1", card_note(one, child_env(one)))
-        self.assertIn("GPU 0 / CUDA0", card_note(one, child_env(one)))
-        both = {"gpu": [1, 0], "args": [], "gpu_order": "as_given"}
-        line = card_note(both, child_env(both))
-        self.assertIn("GPU 1, then GPU 0", line)
-        self.assertIn("CUDA0, CUDA1", line)
-        for same in ({"gpu": 0, "args": []}, {"gpu": [0, 1], "args": [], "gpu_order": "as_given"}, {"args": []}, {"gpu": 1, "backend": "hip"}):
-            self.assertIsNone(card_note(same, child_env(same)), same)       # the numbers agree, or no card was chosen, or AMD (its own numbering)
-
-    def test_card_order(self):
-        """#1352: with an auto layer split the faster card (SMs x clock) goes last; ties, a manual split, a
-        measurement we lack, HIP and "gpu_order": "as_given" keep the config's order."""
-        from serve.server import child_env, hip_speed_scores, ordered_gpus
-        fast_first = {0: 8448.0 * 2610, 2: 4608.0 * 2575}      # 4070 Ti SUPER (66 SMs) vs 5060 Ti (36 SMs), shaped
-        base = {"gpu": [0, 2], "args": []}
-        self.assertEqual(ordered_gpus(base, fast_first), [2, 0])
-        self.assertEqual(ordered_gpus({"gpu": [2, 0], "args": []}, fast_first), [2, 0])
-        self.assertEqual(ordered_gpus(base, {0: 5.0, 2: 5.0}), [0, 2])                       # identical cards
-        self.assertEqual(ordered_gpus(base, {0: 173740000.0, 2: 171640000.0}), [0, 2])      # #1760: two 5070 Ti, 1.2% apart
-        self.assertEqual(ordered_gpus(base, {0: 106.0, 2: 100.0}), [2, 0])                    # 6% apart: a real difference
-        self.assertEqual(ordered_gpus({**base, "gpu_order": "as_given"}, fast_first), [0, 2])
-        self.assertEqual(ordered_gpus({**base, "layer_split": "24"}, fast_first), [0, 2])
-        self.assertEqual(ordered_gpus({**base, "args": ["--layer-split", "24"]}, fast_first), [0, 2])
-        self.assertEqual(ordered_gpus({**base, "backend": "hip"}, fast_first), [2, 0])           # AMD: same rule
-        self.assertEqual(ordered_gpus({**base, "backend": "hip"}, {0: 7.0, 2: 7.0}), [0, 2])      # identical cards (the R9700s)
-        self.assertEqual(ordered_gpus(base, {0: 1.0}), [0, 2])                               # a card unmeasured
-        self.assertEqual(ordered_gpus({"gpu": 1, "args": []}, {1: 1.0}), [1])
-        self.assertEqual(ordered_gpus({"gpu": [0, 1, 2], "args": []}, {0: 3.0, 1: 9.0, 2: 6.0}), [0, 2, 1])
-        self.assertEqual(ordered_gpus({"gpu": [0, 1, 2], "args": []}, {0: 3.0, 1: 3.0, 2: 3.0}), [0, 1, 2])
-        # #1576: the reorder is skipped when it would land the last stage (head + draft + verify + cache) on a card
-        # with less VRAM than the config's own last card - the reporter's fast 12 GB / slow 22 GB pair
-        fast_small = {"gpu": [0, 1], "args": []}
-        speeds = {0: 8448.0 * 2610, 1: 4352.0 * 1665}     # 4070 Ti vs 2080 Ti
-        self.assertEqual(ordered_gpus(fast_small, speeds, {0: 12288, 1: 22528}), [0, 1])   # keep: tail would shrink
-        self.assertEqual(ordered_gpus(fast_small, speeds, {0: 24576, 1: 12288}), [1, 0])   # faster AND bigger: reorder
-        self.assertEqual(ordered_gpus(fast_small, speeds, {0: 16384, 1: 16384}), [1, 0])   # equal VRAM: reorder
-        self.assertEqual(ordered_gpus(fast_small, speeds, {0: 12288}), [1, 0])             # a card unmeasured: reorder
-        self.assertEqual(ordered_gpus({"gpu": [0, 1, 2], "args": []}, {0: 3.0, 1: 9.0, 2: 6.0},
-                                    {0: 8192, 1: 12288, 2: 24576}), [0, 1, 2])  # tail 1 (12G) < given tail 2 (24G)
-        self.assertEqual(child_env({"gpu": [0, 2], "args": [], "gpu_order": "as_given"})["CUDA_VISIBLE_DEVICES"], "0,2")
-        self.assertIsNone(hip_speed_scores([0], root="/nonexistent/kfd"))
-
-    def test_igpu_is_never_the_last_stage(self):
-        """Strix Halo (gfx1151, BIOS carve-out up to 96 GB) beside an R9700 (gfx1201, 32 GB): the #1576 memory guard used to keep the
-        iGPU LAST (head, draft layer, verify).  Built-in graphics goes first, the cards with memory of their own follow."""
-        from serve.server import ordered_gpus
-        cfg = {"gpu": [0, 1], "backend": "hip", "args": []}
-        arch = {0: "gfx1151", 1: "gfx1201"}
-        speeds = {0: 80 * 2900.0, 1: 128 * 2350.0}
-        self.assertEqual(ordered_gpus(cfg, speeds, {0: 65536, 1: 32768}, arch), [0, 1])           # carve-out 64 GB > 32 GB: still first
-        self.assertEqual(ordered_gpus({**cfg, "gpu": [1, 0]}, speeds, {0: 65536, 1: 32768}, arch), [0, 1])   # given R9700 first: iGPU moves first
-        self.assertEqual(ordered_gpus({**cfg, "gpu": [1, 0]}, speeds, None, arch), [0, 1])
-        self.assertEqual(ordered_gpus({**cfg, "gpu": [1, 0], "gpu_order": "as_given"}, speeds, None, arch), [1, 0])   # the person's order stays
-        self.assertEqual(ordered_gpus({**cfg, "gpu": [1, 0], "layer_split": "24"}, speeds, None, arch), [1, 0])
-        # two cards of their own plus the iGPU: iGPU first, then the two by speed (faster last)
-        three = {"gpu": [1, 0, 2], "backend": "hip", "args": []}
-        arch3 = {0: "gfx1151", 1: "gfx1201", 2: "gfx1100"}
-        self.assertEqual(ordered_gpus(three, {0: 10.0, 1: 30.0, 2: 20.0}, None, arch3), [0, 2, 1])
-        self.assertEqual(ordered_gpus(three, {0: 10.0, 1: 30.0, 2: 30.0}, None, arch3), [0, 1, 2])   # equal cards keep their order
-        # no integrated chip, or only integrated chips: the old rule
-        self.assertEqual(ordered_gpus({"gpu": [0, 1], "backend": "hip", "args": []}, {0: 1.0, 1: 2.0}, None, {0: "gfx1201", 1: "gfx1201"}), [0, 1])
-        self.assertEqual(ordered_gpus({"gpu": [0, 1], "backend": "hip", "args": []}, {0: 2.0, 1: 1.0}, None, {0: "gfx1151", 1: "gfx1151"}), [1, 0])
-
-    def test_igpu_split_warning(self):
-        from serve.server import igpu_split_warning
-        arch = {0: "gfx1151", 1: "gfx1201"}
-        line = igpu_split_warning({"backend": "hip", "gpu": [0, 1]}, arch)
-        self.assertIn("GPU 0 is built-in graphics", line)
-        self.assertIsNone(igpu_split_warning({"backend": "hip", "gpu": [1]}, arch))              # one card
-        self.assertIsNone(igpu_split_warning({"backend": "hip", "gpu": [0]}, arch))
-        self.assertIsNone(igpu_split_warning({"backend": "hip", "gpu": [1, 2]}, {1: "gfx1201", 2: "gfx1201"}))
-        self.assertIsNone(igpu_split_warning({"backend": "cuda", "gpu": [0, 1]}, arch))          # NVIDIA: not this rule
-        self.assertIsNone(igpu_split_warning({"backend": "hip", "gpu": [0, 1]}, {0: "gfx1151", 1: "gfx1103"}))   # only integrated chips
-
-    def test_kfd_archs_and_engine_nice(self):
-        import tempfile
-        from serve.server import engine_nice, hip_gpu_archs
-        with tempfile.TemporaryDirectory() as d:
-            for n, simd, ver in ((0, 0, 0), (1, 80, 110501), (2, 128, 120001)):
-                os.makedirs(os.path.join(d, str(n)))
-                with open(os.path.join(d, str(n), "properties"), "w") as f:
-                    f.write(f"simd_count {simd}\nmax_engine_clk_fcompute 2000\ngfx_target_version {ver}\n")
-            self.assertEqual(hip_gpu_archs(root=d), {0: "gfx1151", 1: "gfx1201"})
-        self.assertIsNone(hip_gpu_archs(root="/nonexistent/kfd"))
-        arch = {0: "gfx1151", 1: "gfx1201"}
-        self.assertEqual(engine_nice({}, arch, "linux"), 5)                            # built-in Radeon on the PC
-        self.assertEqual(engine_nice({}, {0: "gfx1201"}, "linux"), 0)                  # cards only: unchanged
-        self.assertEqual(engine_nice({}, arch, "win32"), 0)
-        self.assertEqual(engine_nice({"STRATA_ENGINE_NICE": "0"}, arch, "linux"), 0)   # the off switch
-        self.assertEqual(engine_nice({"STRATA_ENGINE_NICE": "9"}, {0: "gfx1201"}, "linux"), 9)
-        self.assertEqual(engine_nice({"STRATA_ENGINE_NICE": "x"}, arch, "linux"), 0)
-
-    def test_picture_reader_not_on_the_igpu(self):
-        """The picture reader runs on the first visible card; with a split that starts on the iGPU it must use a card of its own."""
-        from serve.server import vision_env
-        arch = {0: "gfx1151", 1: "gfx1201"}
-        cfg = {"backend": "hip", "gpu": [0, 1], "vision": {"exe": "v"}}
-        env = {"HIP_VISIBLE_DEVICES": "0,1", "PATH": "x"}
-        self.assertEqual(vision_env(cfg, env, arch)["HIP_VISIBLE_DEVICES"], "1")
-        self.assertEqual(env["HIP_VISIBLE_DEVICES"], "0,1")                            # the engine's own environment is not touched
-        self.assertEqual(vision_env({**cfg, "vision": {"exe": "v", "cuda_device": 0}}, env, arch)["HIP_VISIBLE_DEVICES"], "0")   # asked: kept
-        for e in ({"HIP_VISIBLE_DEVICES": "1"}, {"HIP_VISIBLE_DEVICES": "0"}, {}):
-            self.assertIs(vision_env(cfg, e, arch), e)                                 # one card: unchanged
-        two = {"HIP_VISIBLE_DEVICES": "0,1"}
-        self.assertIs(vision_env(cfg, two, {0: "gfx1201", 1: "gfx1201"}), two)         # no integrated chip
-        self.assertIs(vision_env(cfg, two, {0: "gfx1151", 1: "gfx1103"}), two)         # nothing with memory of its own
-
-    def test_kfd_scores(self):
-        """AMD on Linux: the GPU nodes of the KFD topology, SIMDs x clock, node order = the config's index."""
-        import tempfile
-        from serve.server import hip_speed_scores
-        with tempfile.TemporaryDirectory() as d:
-            for n, simd, clk in ((0, 0, 0), (1, 128, 2350), (2, 64, 2000), (3, 128, 2350)):
-                os.makedirs(os.path.join(d, str(n)))
-                with open(os.path.join(d, str(n), "properties"), "w") as f:
-                    f.write(f"simd_count {simd}\nmax_engine_clk_fcompute {clk}\ngfx_target_version 120001\n")
-            sc = hip_speed_scores([0, 1, 2], root=d)
-            self.assertEqual(sc, {0: 128 * 2350.0, 1: 64 * 2000.0, 2: 128 * 2350.0})
-            self.assertIsNone(hip_speed_scores([0, 1, 2, 3], root=d))      # a card the topology does not have
-
-    DEVICES_MINI_PC = (
-        "device 0: AMD Radeon 760M Graphics\n  arch gfx1103, 8.0 GiB, wave32\n  cannot run: GPU 0 (AMD Radeon 760M Graphics, gfx1103) is not an "
-        "architecture this Strata engine was compiled for (gfx1200,gfx1201); compile it\n"
-        "device 1: AMD Radeon RX 9070 XT\n  arch gfx1201, 15.9 GiB, wave32\n")
-
-    def test_automatic_card_skips_what_the_engine_cannot_run(self):
-        """#3203: a mini PC's Radeon 760M is HIP's device 0 and has no code in the engine; Automatic must run on the card behind it."""
-        from serve.server import hip_auto_devices, parse_hip_devices, pick_hip_devices
-        devices = parse_hip_devices(self.DEVICES_MINI_PC)
-        self.assertEqual([(d["index"], d["arch"], d["integrated"], bool(d["cannot_run"])) for d in devices],
-                         [(0, "gfx1103", True, True), (1, "gfx1201", False, False)])
-        self.assertEqual(pick_hip_devices(devices), ([1], None))
-        # an integrated chip that does have code loses to a card of its own; the card of its own wins even when it is device 1
-        both = parse_hip_devices("device 0: Radeon 890M\n  arch gfx1150, 16.0 GiB, wave32\ndevice 1: RX 9070 XT\n  arch gfx1201, 15.9 GiB, wave32\n")
-        self.assertEqual(pick_hip_devices(both), ([1], None))
-        # an integrated chip alone stays the choice; device 0 already right: nothing is changed
-        self.assertEqual(pick_hip_devices(parse_hip_devices("device 0: Radeon 8060S\n  arch gfx1151, 64.0 GiB, wave32\n")), (None, None))
-        self.assertEqual(pick_hip_devices(parse_hip_devices("device 0: R9700\n  arch gfx1201, 31.9 GiB, wave32\ndevice 1: R9700\n  arch gfx1201, 31.9 GiB, wave32\n")), (None, None))
-        self.assertEqual(pick_hip_devices([]), (None, None))
-        # the engine's own flag for an integrated chip is honoured as well
-        flagged = parse_hip_devices("device 0: X\n  arch gfx1300, 8.0 GiB, wave32, integrated\ndevice 1: Y\n  arch gfx1201, 4.0 GiB, wave32\n")
-        self.assertEqual(pick_hip_devices(flagged), ([1], None))
-        # nothing runnable: the plain line names the cards, what the engine is built for and, for the RX 6800 XT, that no package exists
-        nothing = parse_hip_devices(
-            "device 0: AMD Radeon 760M Graphics\n  arch gfx1103, 8.0 GiB, wave32\n  cannot run: x is not an architecture this Strata engine was compiled for "
-            "(gfx1200,gfx1201); y\ndevice 1: AMD Radeon RX 6800 XT\n  arch gfx1030, 16.0 GiB, wave32\n  cannot run: z compiled for (gfx1200,gfx1201); y\n")
-        picked, problem = pick_hip_devices(nothing)
-        self.assertIsNone(picked)
-        self.assertIn("none of this computer's graphics cards has code in this Strata engine (it is built for gfx1200,gfx1201)", problem)
-        self.assertIn("AMD Radeon RX 6800 XT (gfx1030)", problem)
-        self.assertIn("760M Graphics (gfx1103, integrated)", problem)
-        # through the engine's own program, and never over a card the config or the environment names
-        with tempfile.TemporaryDirectory() as d:
-            exe = Path(d) / ("strata.exe" if os.name == "nt" else "strata")
-            probe = Path(d) / ("strata-device.exe" if os.name == "nt" else "strata-device")
-            exe.write_text("")
-            probe.write_text("")
-            cfg = {"backend": "hip", "exe": str(exe), "args": []}
-            done = SimpleNamespace(returncode=0, stdout=self.DEVICES_MINI_PC)
-            with mock.patch("serve.server.subprocess.run", return_value=done) as run, contextlib.redirect_stdout(io.StringIO()) as out:
-                self.assertEqual(hip_auto_devices(cfg, {}), [1])
-                self.assertEqual(run.call_args[0][0], [str(probe), "--list-devices"])
-                self.assertIn("automatic GPU choice: GPU 1", out.getvalue())
-            with mock.patch("serve.server.subprocess.run", return_value=done) as run:
-                self.assertIsNone(hip_auto_devices({**cfg, "gpu": 0}, {}))
-                self.assertIsNone(hip_auto_devices({**cfg, "hip_ordinal": 2}, {}))
-                self.assertIsNone(hip_auto_devices(cfg, {"HIP_VISIBLE_DEVICES": "0"}))
-                self.assertIsNone(hip_auto_devices({**cfg, "backend": "cuda"}, {}))
-                run.assert_not_called()
-            with mock.patch("serve.server.subprocess.run", return_value=SimpleNamespace(returncode=1, stdout="")):
-                self.assertIsNone(hip_auto_devices(cfg, {}))                         # a probe that fails changes nothing
-            with mock.patch("serve.server.subprocess.run", return_value=SimpleNamespace(returncode=0, stdout=(
-                            "device 0: A\n  arch gfx1030, 16.0 GiB, wave32\n  cannot run: compiled for (gfx1200)\n"))):
-                with self.assertRaises(SystemExit) as stop:
-                    hip_auto_devices(cfg, {})
-                self.assertIn("none of this computer's graphics cards", str(stop.exception))
-            exe.unlink()
-            probe.unlink()
-            self.assertIsNone(hip_auto_devices(cfg, {}))                            # no probe next to the engine: as before
-
-    def test_vision_device(self):
-        # #408: the image encoder on its own card; the engine's environment stays as it was
-        from serve.server import child_env, vision_env
-        cfg = {"gpu": [0, 1], "gpu_order": "as_given", "vision": {"exe": "v", "cuda_device": 2}}
-        env = child_env(cfg)
-        venv = vision_env(cfg, env)
-        self.assertEqual(venv["CUDA_VISIBLE_DEVICES"], "2")
-        self.assertEqual(venv["CUDA_DEVICE_ORDER"], "PCI_BUS_ID")
-        self.assertEqual(env["CUDA_VISIBLE_DEVICES"], "0,1")
-        plain = {"gpu": [0, 1], "vision": {"exe": "v"}}
-        self.assertIs(vision_env(plain, env), env)          # no cuda_device: the engine's environment, unchanged
-
-    def test_hip_ordinal(self):
-        """#325: on Windows the HIP ordinal setup resolved wins over the config's "gpu" (an iGPU takes HIP's 0)."""
-        from serve.server import child_env
-        self.assertEqual(child_env({"backend": "hip", "gpu": 1})["HIP_VISIBLE_DEVICES"], "1")       # Linux: KFD order
-        self.assertEqual(child_env({"backend": "hip", "hip_ordinal": 1})["HIP_VISIBLE_DEVICES"], "1")
-        self.assertEqual(child_env({"backend": "hip", "gpu": 0, "hip_ordinal": 1})["HIP_VISIBLE_DEVICES"], "1")
-        self.assertEqual(child_env({"backend": "hip", "gpu": [1, 0], "hip_ordinal": 2})["HIP_VISIBLE_DEVICES"],
-                         "1,0")                                          # a layer split keeps its list
-        self.assertEqual(child_env({"backend": "hip", "gpu": 0, "hip_ordinal": "x"})["HIP_VISIBLE_DEVICES"], "0")
-        plain = child_env({"backend": "hip"})
-        self.assertEqual(plain.get("HIP_VISIBLE_DEVICES"), os.environ.get("HIP_VISIBLE_DEVICES"))
-
-
-class HipEnvGuard(unittest.TestCase):
-    """#654: a HIP_PATH that points nowhere and an unwritable TEMP crash the AMD runtime; both are repaired, a healthy
-    environment is not touched."""
-
-    def test_stale_hip_path_dropped(self):
-        import tempfile
-        from serve.server import hip_env_guard
-        with tempfile.TemporaryDirectory() as d:
-            gone = os.path.join(d, "TheRock", "build")
-            env = {"HIP_PATH": gone, "HIP_DEVICE_LIB_PATH": gone, "LLVM_PATH": d}
-            said = hip_env_guard(env, {"log": os.path.join(d, "x.log")})
-            self.assertNotIn("HIP_PATH", env)
-            self.assertNotIn("HIP_DEVICE_LIB_PATH", env)
-            self.assertEqual(env["LLVM_PATH"], d)             # exists: left alone
-            self.assertEqual(len(said), 2)
-
-    def test_unwritable_temp_replaced(self):
-        import tempfile
-        from serve.server import hip_env_guard
-        with tempfile.TemporaryDirectory() as d:
-            nothing = os.path.join(d, "no", "such", "dir")
-            env = {"TEMP": nothing, "TMP": d}
-            hip_env_guard(env, {"log": os.path.join(d, "x.log")})
-            self.assertEqual(env["TMP"], d)                   # writable: untouched
-            self.assertTrue(os.path.samefile(env["TEMP"], os.path.join(d, "tmp")))
-            self.assertTrue(os.path.isdir(env["TEMP"]))
-
-    def test_healthy_untouched(self):
-        import tempfile
-        from serve.server import hip_env_guard
-        with tempfile.TemporaryDirectory() as d:
-            env = {"HIP_PATH": d, "TEMP": d}
-            before = dict(env)
-            self.assertEqual(hip_env_guard(env, {}), [])
-            self.assertEqual(env, before)
-
-    def test_only_for_hip(self):
-        from serve.server import child_env
-        os.environ["HIP_PATH"] = r"Z:\definitely\not\here"
-        try:
-            self.assertEqual(child_env({}).get("HIP_PATH"), os.environ["HIP_PATH"])
-            self.assertNotIn("HIP_PATH", child_env({"backend": "hip"}))
-        finally:
-            del os.environ["HIP_PATH"]
+    def test_engine_nice(self):
+        from serve.server import engine_nice
+        self.assertEqual(engine_nice({}, "linux"), 0)
+        self.assertEqual(engine_nice({"STRATA_ENGINE_NICE": "9"}, "linux"), 9)
+        self.assertEqual(engine_nice({"STRATA_ENGINE_NICE": "x"}, "linux"), 0)
+        self.assertEqual(engine_nice({"STRATA_ENGINE_NICE": "9"}, "win32"), 0)
 
 
 class RecordingPrompt(MockEngine):
@@ -2442,11 +2192,6 @@ class PeerDevice(unittest.TestCase):
         self.assertEqual(engine_args({"args": list(args), "gpu": [0, 1]}), args)
         self.assertEqual(engine_args({"args": list(args), "gpu": [0, 1], "split_skip_if_fits": True}), args)
 
-    def test_both_cards_visible(self):
-        from serve.server import child_env
-        env = child_env({"args": ["--peer-device", "1"], "gpu": [0, 1]})
-        self.assertEqual(env["CUDA_VISIBLE_DEVICES"], "0,1")
-
 
 class LearnedProfile(unittest.TestCase):
     """#477: "expert_profile_save" in the config: the engine saves its learned profile there, and the next start
@@ -2705,31 +2450,6 @@ class DraftHeadHint(unittest.TestCase):
         self.assertEqual(start_failure_hint(p, off), "")
         self.assertEqual(start_failure_hint(None, 0), "")
         self.assertEqual(start_failure_hint(str(Path(tempfile.mkdtemp()) / "missing.log"), 0), "")
-
-
-class DesktopVramNote(unittest.TestCase):
-    """#560 #516: an AMD card on a Linux desktop with little VRAM left after the start gets a recommended reserve."""
-
-    def test_when_it_applies(self):
-        from serve.server import desktop_vram_note
-        note = desktop_vram_note("hip", 624, ["--kv", "int8"], True)
-        self.assertIn("624 MiB of VRAM free", note)
-        self.assertIn("--vram-reserve-mib 3072", note)
-        self.assertIn("2.3 GB less", note)
-
-    def test_when_it_does_not(self):
-        from serve.server import desktop_vram_note
-        self.assertEqual(desktop_vram_note(None, 624, [], True), "")               # NVIDIA
-        self.assertEqual(desktop_vram_note("hip", 624, [], False), "")             # no desktop session
-        self.assertEqual(desktop_vram_note("hip", 2994, [], True), "")             # room left
-        self.assertEqual(desktop_vram_note("hip", None, [], True), "")             # lazy start: no INFO yet
-        self.assertEqual(desktop_vram_note("hip", 900, ["--vram-reserve-mib", "4000"], True), "")   # already raised
-
-    def test_desktop_detection(self):
-        from serve import server
-        with mock.patch.object(server.os, "name", "posix"), mock.patch.object(server.sys, "platform", "linux"):
-            self.assertTrue(server.linux_desktop({"WAYLAND_DISPLAY": "wayland-0"}))
-            self.assertFalse(server.linux_desktop({}))
 
 
 class StartFailureLog(unittest.TestCase):
