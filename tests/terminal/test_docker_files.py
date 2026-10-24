@@ -48,7 +48,7 @@ class Scripts(unittest.TestCase):
             (pkg / "strata").write_text("#!/bin/sh\n", encoding="utf-8")
             (pkg / "strata").chmod(0o755)
             ctx = Path(tmp) / "ctx"
-            r = subprocess.run([SH, sh_path(DOCKER / "build.sh"), "--flavor", "cuda", "--engine", sh_path(pkg), "--ctx", sh_path(ctx), "--ctx-only"],
+            r = subprocess.run([SH, sh_path(DOCKER / "build.sh"), "--flavor", "sycl", "--engine", sh_path(pkg), "--ctx", sh_path(ctx), "--ctx-only"],
                                capture_output=True, text=True)
             self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
             self.assertTrue((ctx / "Dockerfile").is_file())
@@ -61,7 +61,7 @@ class Scripts(unittest.TestCase):
 
 
 class Dockerfiles(unittest.TestCase):
-    FILES = (DOCKER / "Dockerfile", ROOT / "Dockerfile")
+    FILES = (DOCKER / "Dockerfile",)
 
     def test_only_legacy_builder_syntax(self):
         for f in self.FILES:
@@ -97,7 +97,7 @@ class Compose(unittest.TestCase):
         return data
 
     def test_common_settings(self):
-        for name in ("docker-compose.nvidia.yml", "docker-compose.amd.yml", "docker-compose.intel.yml"):
+        for name in ("docker-compose.intel.yml",):
             svc = self.load(name)["services"]["strata"]
             self.assertIn("strata-data:/data", svc["volumes"], name)
             self.assertEqual(svc["ulimits"]["memlock"], {"soft": -1, "hard": -1}, name)
@@ -108,19 +108,13 @@ class Compose(unittest.TestCase):
                 self.assertIn(var, svc["environment"], f"{name}: {var}")
             self.assertIn("strata-data", self.load(name)["volumes"], name)
 
-    def test_gpu_access_per_vendor(self):
-        nv = self.load("docker-compose.nvidia.yml")["services"]["strata"]
-        dev = nv["deploy"]["resources"]["reservations"]["devices"][0]
-        self.assertEqual(dev["driver"], "nvidia")
-        self.assertIn("gpu", dev["capabilities"])
-        amd = self.load("docker-compose.amd.yml")["services"]["strata"]
-        self.assertIn("/dev/kfd:/dev/kfd", amd["devices"])
-        self.assertIn("/dev/dri:/dev/dri", amd["devices"])
-        self.assertIn("video", amd["group_add"])
-        self.assertTrue(any("render" in str(g).lower() or "RENDER" in str(g) for g in amd["group_add"]))
+    def test_gpu_access_for_intel_arc(self):
         intel = self.load("docker-compose.intel.yml")["services"]["strata"]
         self.assertIn("/dev/dri:/dev/dri", intel["devices"])
-        self.assertNotIn("/dev/kfd:/dev/kfd", intel["devices"])
+        self.assertTrue(any("render" in str(g).lower() or "RENDER" in str(g) for g in intel["group_add"]))
+
+    def test_only_the_intel_compose_file_is_left(self):
+        self.assertEqual(sorted(p.name for p in (DOCKER / "compose").glob("*.yml")), ["docker-compose.intel.yml"])
 
 
 class Document(unittest.TestCase):
@@ -138,10 +132,8 @@ class Document(unittest.TestCase):
 
     def test_tags_in_the_document_match_the_compose_defaults(self):
         doc = (ROOT / "docs" / "DOCKER.md").read_text(encoding="utf-8")
-        for tag in ("0.2.3-cuda13", "0.2.3-cuda12", "0.2.3-rocm-gfx120x", "0.2.3-rocm-gfx110x", "0.2.3-rocm-gfx1151", "0.2.3-sycl"):
-            self.assertIn(tag, doc)
-        for name, tag in (("docker-compose.nvidia.yml", "ghcr.io/niko1221/strata:0.2.3-cuda13"), ("docker-compose.amd.yml", "ghcr.io/niko1221/strata:0.2.3-rocm-gfx120x"),
-                          ("docker-compose.intel.yml", "ghcr.io/niko1221/strata:0.2.3-sycl")):
+        self.assertIn("0.2.3-sycl", doc)
+        for name, tag in (("docker-compose.intel.yml", "ghcr.io/niko1221/strata:0.2.3-sycl"),):
             self.assertIn(tag, (DOCKER / "compose" / name).read_text(encoding="utf-8"))
 
     def test_the_user_doc_says_images_are_published_from_0_2_1(self):
@@ -170,7 +162,7 @@ class Publishing(unittest.TestCase):
         src = (DOCKER / "fetch-engines.py").read_text(encoding="utf-8")
         flavors = re.findall(r'^    "([a-z0-9-]+)": \("', src, re.M)
         doc = (ROOT / "docs" / "DOCKER.md").read_text(encoding="utf-8")
-        self.assertTrue({"cuda13", "cuda12", "rocm-gfx120x", "rocm-gfx110x", "rocm-gfx1151", "sycl"} <= set(flavors), flavors)
+        self.assertEqual(flavors, ["sycl"])
         for flavor in flavors:
             self.assertIn(f"0.2.3-{flavor}", doc)
 

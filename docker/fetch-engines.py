@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Fetch the engine packages for the Docker images from a release, checked against the signed update feed.
 
-    python3 docker/fetch-engines.py --release-tag v0.2.3 --flavors cuda13,cuda12,rocm-gfx120x --out ./pkgs
-    python3 docker/fetch-engines.py --source /path/to/release-folder --flavors cuda13 --out ./pkgs
+    python3 docker/fetch-engines.py --release-tag v0.2.3 --flavors sycl --out ./pkgs
+    python3 docker/fetch-engines.py --source /path/to/release-folder --flavors sycl --out ./pkgs
     python3 docker/fetch-engines.py --release-tag v0.2.3 --list
 
 What it does, in the same order and with the same code as `strata update`:
@@ -31,12 +31,7 @@ from strata_control import engine_component as ec, feed as feedmod, signing, tra
 
 #: image flavor (the tag suffix) -> (feed backend, feed variant or None for any, docker/build.sh --flavor)
 FLAVORS = {
-    "cuda13": ("cuda", "cuda13", "cuda"),
-    "cuda12": ("cuda", "cuda12", "cuda"),
-    "rocm-gfx120x": ("hip", "rx9070", "hip"),       # RX 9000, Radeon AI PRO R9700 (gfx1200 / gfx1201)
-    "rocm-gfx110x": ("hip", "rx7900", "hip"),       # RX 7000 (gfx1100 / gfx1101 / gfx1102)
-    "rocm-gfx1151": ("hip", "halo", "hip"),         # Strix Halo (gfx1151)
-    "sycl": ("sycl", None, "sycl"),                 # Intel Arc; only when the release has a Linux SYCL package
+    "sycl": ("sycl", None, "sycl"),                 # Intel Arc (Arc Pro B70); only when the release has a Linux SYCL package
 }
 PLATFORM = "linux-x86_64"
 

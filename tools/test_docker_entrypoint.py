@@ -207,10 +207,10 @@ class Entrypoint(unittest.TestCase):
     def test_run_settings_that_name_another_images_engine_folder_are_made_again(self):
         install = self.tmp / "data" / "install"
         install.mkdir(parents=True)
-        here = self.tmp / "opt" / "components" / "engine" / "0.1.46-cuda12"
+        here = self.tmp / "opt" / "components" / "engine" / "0.1.46-sycl"
         here.mkdir(parents=True)
         (here / "strata-vision").write_text("x")
-        gone = self.tmp / "opt" / "components" / "engine" / "0.1.46-cuda13"
+        gone = self.tmp / "opt" / "components" / "engine" / "0.1.45-sycl"
         (install / "strata-a.json").write_text('{"exe": "component:strata-engine", "vision": {"exe": "%s/strata-vision"}}' % gone)
         (install / "strata-b.json").write_text('{"exe": "component:strata-engine", "vision": {"exe": "%s/strata-vision"}}' % here)
         (install / "strata-c.json").write_text('{"exe": "component:strata-engine", "args": []}')
@@ -225,16 +225,17 @@ class Entrypoint(unittest.TestCase):
         self.assertIn("strata-a.json", out)
         self.assertIn("does not have", out)
 
-    def test_nvidia_card_without_gpu_access_ends_before_any_work(self):
+    def test_intel_card_without_dev_dri_ends_before_any_work(self):
         dev = self.tmp / "dev"
         dev.mkdir()
-        r = subprocess.run([SH, str(self.script)], env=self.env(STUB_BACKEND="cuda", STRATA_DEV_DIR=str(dev), MODEL="Q2_0"),
+        r = subprocess.run([SH, str(self.script)], env=self.env(STUB_BACKEND="sycl", STRATA_DEV_DIR=str(dev), MODEL="Q2_0"),
                            capture_output=True, text=True, timeout=30)
         self.assertEqual(r.returncode, 3)
-        self.assertIn("--gpus all", r.stderr)
+        self.assertIn("--device /dev/dri", r.stderr)
         self.assertNotIn("launch --no-tui", self.log.read_text())
-        (dev / "nvidia0").write_text("")                                  # with the device files the start goes on
-        p = self.start(STUB_BACKEND="cuda", STRATA_DEV_DIR=str(dev), MODEL="Q2_0")
+        (dev / "dri").mkdir()
+        (dev / "dri" / "renderD128").write_text("")                      # with the device files the start goes on
+        p = self.start(STUB_BACKEND="sycl", STRATA_DEV_DIR=str(dev), MODEL="Q2_0")
         self.wait_for("launch --no-tui")
         self.stop(p)
 

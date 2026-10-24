@@ -1,28 +1,26 @@
 # Strata container image, built from the engine COMPONENT PACKAGE: nothing is compiled on the user's side.
 #
 #   one image = the Terminal (bundled Python 3.12 + strata_cli / strata_control / serve, built exactly as the release archive)
-#             + one engine package (CUDA 13, CUDA 12, HIP gfx120X, HIP gfx110X or SYCL) + the entrypoint
+#             + one Intel Arc (SYCL) engine package + the entrypoint
 #
 # Build it with docker/build.sh (it assembles the build context: the Terminal sources and the package folder):
 #
-#     docker/build.sh --flavor cuda --engine /path/to/0.1.45.3-linux-x86_64-cuda-cuda13 --tag strata:0.2.3-cuda13
+#     docker/build.sh --engine /path/to/0.1.45.3-linux-x86_64-sycl --tag strata:0.2.3-sycl
 #
 # Plain `docker build` also works when the context folder has this layout (build.sh makes it):
 #     terminal-src/   the files package_terminal.py needs (packaging/, strata_cli/, strata_control/, serve/, tools/, data/, ...)
 #     engine/         one folder per engine package, exactly as `package_engine.py` wrote it (engine-component.json inside)
 #     docker/         entrypoint.sh, strata-wrapper.sh, healthcheck.sh
-#   docker build --build-arg FLAVOR=cuda -t strata:0.2.3-cuda13 -f Dockerfile <context>
+#   docker build -t strata:0.2.3-sycl -f Dockerfile <context>
 #
-# FLAVOR picks the small set of system libraries the runtime image adds and its base:
-#   cuda  NVIDIA: the engine package carries cudart/cublas; the driver's libcuda comes from nvidia-container-toolkit
-#   hip   AMD:    the engine package carries the ROCm runtime and kernels; the host's amdgpu driver and /dev/kfd are used
-#   sycl  Intel:  the engine package carries oneAPI's SYCL runtime; this image adds the Level Zero loader and Intel's compute runtime
-#         (Ubuntu 26.04 base: its compute runtime knows Arc A- and B-series; the 24.04 one does not know Battlemage)
+# The engine package carries oneAPI's SYCL runtime; this image adds the Level Zero loader and Intel's compute runtime
+# (Ubuntu 26.04 base: its compute runtime knows Arc A- and B-series; the 24.04 one does not know Battlemage).
+# FLAVOR stays a build argument (always sycl) because docker/publish.sh and the image labels carry it.
 #
 # Only the legacy-builder-safe Dockerfile features are used (no heredocs, no --mount), so it builds with `docker build` as shipped
 # in docker.io as well as with BuildKit.
 
-ARG BASE_IMAGE=ubuntu:24.04
+ARG BASE_IMAGE=ubuntu:26.04
 
 # ---- 1. the Terminal: the release archive, built here (pinned CPython 3.12 + hash-locked wheels, installed at build time only)
 FROM ${BASE_IMAGE} AS terminal
@@ -64,7 +62,7 @@ RUN set -e; n=0; for d in /engine/*/; do \
 
 # ---- 3. the runtime image
 FROM ${BASE_IMAGE}
-ARG FLAVOR=cuda
+ARG FLAVOR=sycl
 ARG STRATA_VERSION=dev
 ARG ENGINE_LABEL=
 ENV DEBIAN_FRONTEND=noninteractive
@@ -73,10 +71,8 @@ ENV DEBIAN_FRONTEND=noninteractive
 RUN set -e; \
     pkgs="tini ca-certificates libgomp1 libatomic1 libnuma1 zlib1g"; \
     case "$FLAVOR" in \
-      cuda) ;; \
-      hip)  pkgs="$pkgs libdrm2 libdrm-amdgpu1 libelf1t64 libtinfo6 libpci3" ;; \
       sycl) pkgs="$pkgs libze1 libze-intel-gpu1 intel-opencl-icd" ;; \
-      *) echo "FLAVOR must be cuda, hip or sycl"; exit 1 ;; \
+      *) echo "FLAVOR must be sycl"; exit 1 ;; \
     esac; \
     apt-get update; apt-get install -y --no-install-recommends $pkgs; \
     rm -rf /var/lib/apt/lists/* /var/cache/apt/*
@@ -88,12 +84,12 @@ COPY docker/entrypoint.sh docker/healthcheck.sh /opt/strata/
 COPY docker/strata-wrapper.sh /usr/local/bin/strata
 RUN chmod 0755 /opt/strata/entrypoint.sh /opt/strata/healthcheck.sh /usr/local/bin/strata
 
-# Does the dynamic linker find every library of the package inside this image? (the GPU driver's libcuda / libnvidia-* come from the host)
+# Does the dynamic linker find every library of the package inside this image? (the GPU driver's Level Zero backend comes from the compute runtime)
 RUN set -e; \
     for d in /opt/strata/components/engine/*/; do \
       miss=$(find "$d" -type f \( -name 'strata*' -o -name '*.so' -o -name '*.so.*' \) ! -name '*.json' ! -name '*.txt' | while read -r f; do \
                head -c4 "$f" | grep -q ELF || continue; \
-               LD_LIBRARY_PATH="$d" ldd "$f" 2>/dev/null | grep 'not found' | grep -v -E 'libcuda\.so|libnvidia|libnvcuvid|libze_intel_gpu|libhsa-runtime64|libdrm_amdgpu' | sed "s|^|$(basename "$f"): |"; \
+               LD_LIBRARY_PATH="$d" ldd "$f" 2>/dev/null | grep 'not found' | grep -v -E 'libze_intel_gpu' | sed "s|^|$(basename "$f"): |"; \
              done | sort -u); \
       if [ -n "$miss" ]; then echo "MISSING LIBRARIES in $d"; echo "$miss"; exit 1; fi; \
       echo "libraries of $d resolve inside this image"; \
@@ -108,8 +104,7 @@ ENV STRATA_COMPONENTS_DIR=/opt/strata/components \
     HOME=/data/home \
     PORT=8080 \
     LANG=C.UTF-8 PYTHONUNBUFFERED=1 PYTHONNOUSERSITE=1 \
-    STRATA_IN_DOCKER=1 \
-    NVIDIA_VISIBLE_DEVICES=all NVIDIA_DRIVER_CAPABILITIES=compute,utility
+    STRATA_IN_DOCKER=1
 VOLUME ["/data"]
 EXPOSE 8080
 

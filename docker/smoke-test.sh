@@ -3,7 +3,7 @@
 #
 #   IMAGE=strata:0.1.45-sycl NAME=strata-t PORT=18080 BASE=http://127.0.0.1:18080 \
 #   RUN_FLAGS="--device /dev/dri -p 18080:8080" ENVS="-e MODEL=IQ3_S -e MODEL_PATH=/models -e API_KEY=..." VOLS="-v $HOME/dt/data:/data -v /m:/models:ro" \
-#   GPU_USED_CMD='nvidia-smi --query-gpu=memory.used --format=csv,noheader' OUT=$HOME/dt/out docker/smoke-test.sh
+#   GPU_USED_CMD='<a command that prints the card memory in use>' OUT=$HOME/dt/out docker/smoke-test.sh
 #
 # Steps: run -> wait for the model (health check) -> GET /v1/models -> pong chat -> tool call -> docker exec strata monitor --once ->
 # strata connect opencode --check (from inside) -> docker stop (time, exit code, log) -> GPU memory back, no strata process left.

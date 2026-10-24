@@ -2,16 +2,14 @@
 # Build a Strata image from an engine component package. Run it on a Linux x86_64 machine with Docker (it needs the internet
 # for the base image and for the Terminal's pinned Python and locked wheels; the engine package is local).
 #
-#   docker/build.sh --flavor cuda --engine ~/pkgs/0.1.45.3-linux-x86_64-cuda-cuda13 --tag strata:0.2.3-cuda13
-#   docker/build.sh --flavor hip  --engine ~/pkgs/0.1.45.3-linux-x86_64-hip-gfx120X  --tag strata:0.2.3-rocm-gfx120x
-#   docker/build.sh --flavor sycl --engine ~/pkgs/0.1.45.3-linux-x86_64-sycl         --tag strata:0.2.3-sycl
+#   docker/build.sh --engine ~/pkgs/0.1.45.3-linux-x86_64-sycl --tag strata:0.2.3-sycl
 #
 # --engine is the package FOLDER that packaging/package_engine.py wrote (engine-component.json inside). It can be given more than
 # once to put several packages in one image (the Terminal picks the one that fits the card).
 #
-#   --flavor cuda|hip|sycl   which system libraries the runtime adds (see docker/Dockerfile)
+#   --flavor sycl            the image flavor (the only one: Intel Arc; default sycl, kept for docker/publish.sh)
 #   --tag NAME               image name (default strata:<version>-<flavor>)
-#   --base IMAGE             base image (default ubuntu:24.04; sycl: ubuntu:26.04)
+#   --base IMAGE             base image (default ubuntu:26.04: its compute runtime knows Battlemage)
 #   --repo DIR               the Strata source tree (default: the one this script is in)
 #   --version V              label (default: read from CMakeLists.txt)
 #   --ctx DIR                keep the build context here (default: a temporary folder, removed after the build)
@@ -23,7 +21,7 @@ set -eu
 
 here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
 repo=$(CDPATH= cd -- "$here/.." && pwd -P)
-flavor=""; tag=""; base=""; version=""; ctx=""; nocache=""; ctxonly=""
+flavor="sycl"; tag=""; base=""; version=""; ctx=""; nocache=""; ctxonly=""
 engines=""
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -37,14 +35,13 @@ $2"; shift 2 ;;
     --ctx) ctx=$2; shift 2 ;;
     --no-cache) nocache=--no-cache; shift ;;
     --ctx-only) ctxonly=1; shift ;;
-    -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,18p' "$0"; exit 0 ;;
     *) echo "build.sh: unknown option $1" >&2; exit 2 ;;
   esac
 done
-[ -n "$flavor" ] || { echo "build.sh: --flavor cuda|hip|sycl is required" >&2; exit 2; }
-case "$flavor" in cuda|hip|sycl) ;; *) echo "build.sh: --flavor must be cuda, hip or sycl" >&2; exit 2 ;; esac
+case "$flavor" in sycl) ;; *) echo "build.sh: --flavor must be sycl (the Intel Arc image is the only one)" >&2; exit 2 ;; esac
 [ -n "$engines" ] || { echo "build.sh: --engine <package folder> is required" >&2; exit 2; }
-[ -n "$base" ] || { [ "$flavor" = sycl ] && base=ubuntu:26.04 || base=ubuntu:24.04; }
+[ -n "$base" ] || base=ubuntu:26.04
 if [ -z "$version" ]; then
   version=$(sed -n 's/^[[:space:]]*project([^)]*VERSION[[:space:]]*\([0-9][0-9.]*\).*/\1/p' "$repo/CMakeLists.txt" | head -1)
   version=${version:-dev}

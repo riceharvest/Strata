@@ -28,38 +28,42 @@ class FetchEngines(unittest.TestCase):
         self.release.mkdir()
         self.trust = self.root / "trust.json"
         self.trust.write_text(json.dumps({"keys": [{k: self.key[k] for k in ("alg", "key_id", "public")}]}), encoding="utf-8")
-        folder = fx.build_package(self.root / "pub", "0.1.45", key=self.key, backend="cuda", variant="cuda13")
+        folder = fx.build_package(self.root / "pub", "0.1.45", key=self.key, backend="sycl", variant="", archs=("intel-arc",))
         from feed_tool import build_feed, pack_engine
         pack_engine(folder, self.release, url_prefix="")
         build_feed(self.release, key=self.key, sequence=1, engine_dir=self.release)
         self.out = self.root / "out"
 
-    def run_script(self, *args, trust=True):
+    def run_script(self, *args, trust=True, release=None):
         env = dict(os.environ)
         env.pop("STRATA_UPDATE_TRUSTED_KEYS", None)
         if trust:
             env["STRATA_UPDATE_TRUSTED_KEYS"] = str(self.trust)
-        return subprocess.run([sys.executable, str(SCRIPT), "--source", str(self.release), "--out", str(self.out), *args],
+        return subprocess.run([sys.executable, str(SCRIPT), "--source", str(release or self.release), "--out", str(self.out), *args],
                               capture_output=True, text=True, env=env, cwd=str(ROOT))
 
     def test_fetches_and_verifies_a_package_for_the_flavor(self):
-        r = self.run_script("--flavors", "cuda13")
+        r = self.run_script("--flavors", "sycl")
         self.assertEqual(r.returncode, 0, r.stderr)
         flavor, build_flavor, folder = r.stdout.strip().split("\t")
-        self.assertEqual((flavor, build_flavor), ("cuda13", "cuda"))
+        self.assertEqual((flavor, build_flavor), ("sycl", "sycl"))
         self.assertTrue((Path(folder) / "engine-component.json").is_file())
         self.assertIn("signature and every file verified", r.stderr)
 
     def test_a_flavor_without_a_package_is_an_error_unless_skipped(self):
-        r = self.run_script("--flavors", "cuda13,sycl")
+        empty = self.root / "empty-release"                     # a release whose feed lists no engine package
+        (empty / "engine").mkdir(parents=True)
+        from feed_tool import build_feed
+        build_feed(empty, key=self.key, sequence=1, engine_dir=empty / "engine")
+        r = self.run_script("--flavors", "sycl", release=empty)
         self.assertEqual(r.returncode, 3, r.stderr)
         self.assertIn("no linux-x86_64 package", r.stderr)
-        r = self.run_script("--flavors", "sycl", "--skip-missing")
+        r = self.run_script("--flavors", "sycl", "--skip-missing", release=empty)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(r.stdout.strip().split("\t")[-1], "SKIP")
 
     def test_a_feed_signed_by_a_key_we_do_not_trust_is_refused(self):
-        r = self.run_script("--flavors", "cuda13", trust=False)
+        r = self.run_script("--flavors", "sycl", trust=False)
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("not trusted", r.stderr + r.stdout)
         self.assertFalse(self.out.exists() and any(self.out.iterdir()))
@@ -69,7 +73,7 @@ class FetchEngines(unittest.TestCase):
         data = bytearray(archive.read_bytes())
         data[len(data) // 2] ^= 0xFF
         archive.write_bytes(bytes(data))
-        r = self.run_script("--flavors", "cuda13")
+        r = self.run_script("--flavors", "sycl")
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("SHA-256", r.stderr + r.stdout)
         self.assertEqual(r.stdout.strip(), "")
@@ -77,7 +81,7 @@ class FetchEngines(unittest.TestCase):
     def test_a_tampered_feed_is_refused(self):
         feed = self.release / "strata-feed.json"
         feed.write_bytes(feed.read_bytes().replace(b'"sequence": 1', b'"sequence": 2'))
-        r = self.run_script("--flavors", "cuda13")
+        r = self.run_script("--flavors", "sycl")
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("not trusted", r.stderr + r.stdout)
 
