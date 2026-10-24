@@ -988,7 +988,7 @@ struct Model::Impl {
     // layer after (from L's input too); DS4_AHEAD_EXTRA: guesses past the next layer's top k (< 0: fewer - the guess's
     // picks by rank on Sun: 97 91 81 70 57 41 %, past the top 6 29 20 %: reads wasted on an SSD-bound PC).
     int ahead_mode = std::getenv("DS4_AHEAD") ? std::atoi(std::getenv("DS4_AHEAD")) : 1;
-    int ahead_extra = std::getenv("DS4_AHEAD_EXTRA") ? std::atoi(std::getenv("DS4_AHEAD_EXTRA")) : (o.ssd_cache_gb > 0.0 ? 2 : 0);
+    int ahead_extra = 0;   // (set in load(): DS4_AHEAD_EXTRA, 0 when unset)
     // (DS4_AHEAD_ORDER=0: the CPU lane computes a layer's experts in expert order, not the ones asked for early first)
     bool ahead_order = std::getenv("DS4_AHEAD_ORDER") == nullptr || std::atoi(std::getenv("DS4_AHEAD_ORDER")) != 0;
     std::vector<uint8_t> ahead_fl;     // [layer][1024]: 1 the top-k guess, 2 any guess, a layer before; 4 two layers before;
@@ -1038,17 +1038,10 @@ struct Model::Impl {
     // weights is below this and whose pages are not in RAM now (the page cache or the RAM tier; os::in_ram - Linux every
     // page, Windows sampled pages of the working set), so a token waits on the SSD only for the experts that weigh; the
     // weight it carried is lost (no renormalisation).  On layers from STRATA_DS4_DISK_SKIP_FROM (0) on.  An expert left
-    // out still counts as used (the expert cache, the profile).
-    const float disk_skip_w = [this] {
-        if (o.disk_skip_w >= 0.0f) return o.disk_skip_w;
-        const char* v = std::getenv("STRATA_DS4_DISK_SKIP_W");
-        return v != nullptr ? std::max(0.0f, (float) std::atof(v)) : 0.0f;
-    }();
-    const int disk_skip_from = [this] {
-        if (o.disk_skip_from > 0) return o.disk_skip_from;
-        const char* v = std::getenv("STRATA_DS4_DISK_SKIP_FROM");
-        return v != nullptr ? std::max(0, std::atoi(v)) : 0;
-    }();
+    // out still counts as used (the expert cache, the profile).  --disk-skip-w / --disk-skip-from say the same; set in
+    // load(), once the options are known (a member initialiser runs before load() copies them in).
+    float disk_skip_w = 0.0f;
+    int disk_skip_from = 0;
     // the RAM store (--ssd-cache): the CPU lane's experts in slots a policy owns, read unbuffered (null: off)
     std::unique_ptr<ExpertStore> store;
     uint8_t* zc_stage_buf = nullptr;   // device: k staging slots for the store's experts of a decode token
@@ -1854,6 +1847,20 @@ struct Model::Impl {
     // ---- loading
     bool load(const Options& opt, std::string& err) {
         o = opt;
+        ahead_extra = std::getenv("DS4_AHEAD_EXTRA") ? std::atoi(std::getenv("DS4_AHEAD_EXTRA")) : 0;
+        disk_skip_w = [this] {
+            if (o.disk_skip_w >= 0.0f) return o.disk_skip_w;
+            const char* v = std::getenv("STRATA_DS4_DISK_SKIP_W");
+            return v != nullptr ? std::max(0.0f, (float) std::atof(v)) : 0.0f;
+        }();
+        disk_skip_from = [this] {
+            if (o.disk_skip_from > 0) return o.disk_skip_from;
+            const char* v = std::getenv("STRATA_DS4_DISK_SKIP_FROM");
+            return v != nullptr ? std::max(0, std::atoi(v)) : 0;
+        }();
+        if (disk_skip_w > 0.0f)
+            std::fprintf(stderr, "ds4: WARNING: disk skip %.3f (from layer %d) leaves out routed experts that are not in RAM: the "
+                                 "answers change and depend on what the page cache holds\n", disk_skip_w, disk_skip_from);
         const double t0 = now_ms();
         if (!pk.load(o.pack, err)) return false;
         g.from(pk);
