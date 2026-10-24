@@ -1,14 +1,15 @@
 # AGENTS.md
 
 Strata runs the Qwen3.8-Flash-Next mixture-of-experts model (and its Coder, Swift 1.5, Unsloth, Gyro and NVFP4
-variants, and Qwen3.6-35B-A3B) on a normal PC: one NVIDIA or AMD graphics card plus system RAM on Windows or Linux,
-or an Apple Silicon Mac. Version 0.2.3, engine 0.1.48. It has three parts:
+variants, and DeepSeek-V4.1-Flash) on one machine type: an Intel Arc Pro B70 (Battlemage, 32 GB, xe driver) plus system
+RAM on Linux, through the SYCL engine in `sycl/`. Version 0.2.3, engine 0.1.48. It has three parts:
 
 - **The app** (`apps/desktop`, the Tauri shell; `apps/host`, the Node host and the web UI). It is for people who do
   not want a terminal. The installer has the engine inside.
 - **The Terminal** (`strata.py`, `strata_cli/`, `strata_control/`): the `strata` command. It sets up a model, serves
   it and watches it. Agents use this part.
-- **The engine and the server** (`src/`, `include/`, `metal/`, `sycl/` for the C++/CUDA/HIP/SYCL/Metal engine;
+- **The engine and the server** (`sycl/` for the SYCL engine, built with `sycl/tools/build.sh` in the `strata-sycl-dev`
+  image, docs/B70.md; `src/` and `include/` for the CPU-side code it compiles;
   `serve/` for the Python server with an OpenAI- and Anthropic-compatible API and a web page). `setup.py`, started by
   `START-HERE.bat` or `setup.sh`, is the older one-click installer from source.
 
@@ -55,11 +56,10 @@ Terminal cannot run. Strata's MCP server ([docs/MCP_SERVER.md](docs/MCP_SERVER.m
   the [paper](docs/paper/Strata-Paper.pdf).
 - The Terminal: [docs/TERMINAL.md](docs/TERMINAL.md) and [docs/TERMINAL_LAUNCH.md](docs/TERMINAL_LAUNCH.md). The app,
   the packages and the update feed: [packaging/README.md](packaging/README.md) and [packaging/UPDATES.md](packaging/UPDATES.md).
-- AMD (HIP) build and validation: [docs/AMD_HIP.md](docs/AMD_HIP.md); multi-GPU: [docs/MULTI_GPU.md](docs/MULTI_GPU.md);
-  Mac (Metal): [docs/MAC.md](docs/MAC.md).
+- The B70 / Intel engine: [docs/B70.md](docs/B70.md), [docs/INTEL.md](docs/INTEL.md); DeepSeek-V4.1: [docs/DEEPSEEK41.md](docs/DEEPSEEK41.md).
 - Tests: the Terminal and Control tests are in `tests/terminal` (`python -m pytest tests/terminal`). The app's UI
   tests run with `npm test` in `apps/host`. Setup's own tests run without a GPU or downloads:
-  `python tools/test_setup_<name>.py` (for example `tools/test_setup_amd.py`, `tools/test_setup_choices.py`).
+  `python tools/test_setup_<name>.py` (for example `tools/test_setup_sycl.py`, `tools/test_setup_choices.py`).
 - Keep the docs' style: plain words, short sentences, written for non-technical users first. Give measured numbers
   with what they were measured on. Make no claim without a measurement.
 
@@ -75,7 +75,7 @@ follow it whether a person or an agent writes the text. The short version:
 - One problem per pull request. Lead with the problem and the result, then the approach, then the validation
   (passed, failed and not run, kept apart) and the limits.
 - A new feature is opt-in, and the default path stays byte-identical to the last release. Say how you checked.
-- Build every backend a file touches (CUDA, HIP, SYCL) before asking for review.
+- Build the SYCL engine (`strata`, and `strata-dsv41` when a file of its path changes) before asking for review.
 - Change a default only where you measured it faster, and show the numbers with what they were measured on.
 - Never submit measurements, logs or reproduction steps you did not produce. Mark a finding from reading code as
   unconfirmed static analysis.
