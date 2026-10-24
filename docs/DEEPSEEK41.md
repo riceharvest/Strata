@@ -1,7 +1,7 @@
 # DeepSeek-V4.1-Flash
 
 DeepSeek-V4.1-Flash is a large mixture-of-experts model: 40 layers, 384 experts in each (6 are used for every word), and a 203 GB
-n-gram table next to them. Strata runs it with its own engine, `strata-dsv41` (`src/dsv41`, ported from Project Maya's
+n-gram table next to them. Strata runs it with its own engine, `strata-dsv41` (`sycl/src/dsv41`, ported from Project Maya's
 `maya-ds4`, MIT; the notice is in `third_party/project-maya`). The file is Unsloth's UD-Q8_K_XL, pinned in `setup.py`: nine
 shards, 508.4 GB, the experts as MXFP4 and the rest in BF16. The two official 2-bit sets (below) are what a normal PC runs.
 
