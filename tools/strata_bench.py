@@ -482,40 +482,6 @@ def cpu_name() -> str | None:
     return platform.processor() or None
 
 
-def gpu_info_local() -> dict:
-    out = run_cmd(["nvidia-smi", "--query-gpu=name,memory.total,driver_version", "--format=csv,noheader,nounits"])
-    gpus = []
-    for line in out.splitlines():
-        p = [x.strip() for x in line.split(",")]
-        if len(p) >= 3:
-            gpus.append({"name": p[0], "vram_mib": int(float(p[1])) if p[1].replace(".", "").isdigit() else None, "driver": p[2]})
-    info = {"gpus": gpus}
-    head = run_cmd(["nvidia-smi"])
-    m = re.search(r"CUDA Version:\s*([\d.]+)", head)
-    if m:
-        info["cuda"] = m.group(1)
-    if not gpus:
-        rocm = run_cmd(["rocm-smi", "--showproductname"])
-        names = re.findall(r"Card [Ss]eries:\s*(.+)", rocm) or re.findall(r"Card [Mm]odel:\s*(.+)", rocm)
-        info["gpus"] = [{"name": n.strip(), "vram_mib": None, "driver": None} for n in names]
-        v = run_cmd(["rocm-smi", "--showdriverversion"])
-        m2 = re.search(r"Driver version:\s*(\S+)", v)
-        if m2:
-            info["rocm_driver"] = m2.group(1)
-    if not info["gpus"] and os.name == "nt":
-        # #1587: Windows with only an AMD card has neither nvidia-smi nor rocm-smi; the display class in the registry
-        # names the card, its VRAM and its driver (the run was labelled "CPU only" before)
-        try:
-            if str(ROOT) not in sys.path:
-                sys.path.insert(0, str(ROOT))
-            from serve.telemetry import windows_amd_cards
-            info["gpus"] = [{"name": c["name"], "vram_mib": (c["vram_bytes"] >> 20) if c["vram_bytes"] else None,
-                             "driver": c["driver"]} for c in windows_amd_cards()]
-        except Exception:   # noqa: BLE001 - a report without the card's name is still a report
-            pass
-    return info
-
-
 QUANT = re.compile(r"(?i)(?:^|[-_.])((?:UD-)?(?:IQ\d_[A-Z]+|Q\d_[A-Z0-9_]+|Q\d_K(?:_[A-Z]+)?|IQ\d_?[A-Z]*|BF16|F16|Q\d))(?=[-_.]|$)")
 SECRET_KEY = re.compile(r"(?i)key|token|secret|password|auth")
 
@@ -576,28 +542,6 @@ def git_commit() -> str | None:
     return out or None
 
 
-def gpu_selection(cfg: dict | None, gpu_arg: str | None = None) -> list[int]:
-    """#1985: the GPU numbers (as nvidia-smi numbers them) the engine is told to use: the bench's --gpu when it starts
-    the server, else the config's "gpu" (one card, a list or "0,2"), else a "--gpu" in the config's args.  [] when
-    nothing says."""
-    def parse(v):
-        if v is None or v == "":
-            return []
-        items = v if isinstance(v, (list, tuple)) else str(v).split(",")
-        out = []
-        for x in items:
-            x = str(x).strip()
-            if x.isdigit():
-                out.append(int(x))
-        return out
-    sel = parse(gpu_arg) or parse((cfg or {}).get("gpu"))
-    if not sel:
-        args = [str(x) for x in ((cfg or {}).get("args") or [])]
-        if "--gpu" in args and args.index("--gpu") + 1 < len(args):
-            sel = parse(args[args.index("--gpu") + 1])
-    return sel
-
-
 def collect_machine(base: str, key: str, cfg: dict | None, gpu_arg: str | None = None) -> dict:
     status = try_json(base, "/v1/status", key) or {}
     metrics = try_json(base, "/metrics", key, 30) or {}
@@ -605,36 +549,18 @@ def collect_machine(base: str, key: str, cfg: dict | None, gpu_arg: str | None =
     models = try_json(base, "/v1/models", key) or {}
     static = metrics.get("hardware_static") or {}
     eng = metrics.get("engine") or {}
-    local = gpu_info_local()
     view = config_view(cfg) if cfg else {}
-    # #1985: only the GPUs the engine uses - the config's / --gpu selection; with none given the engine runs on one card
-    # (the one the server reports), not on every card the PC has
-    used = local["gpus"]
-    sel = gpu_selection(cfg, gpu_arg)
-    if sel:
-        used = [local["gpus"][i] for i in sel if 0 <= i < len(local["gpus"])] or used
-    elif len(used) > 1 and static.get("gpu_name"):
-        named = [g for g in used if g["name"] == static["gpu_name"]]
-        used = named[:1] or used[:1]
-    gpu_names = [g["name"] for g in used] or ([static["gpu_name"]] if static.get("gpu_name") else [])
+    # the server names the cards it reads (" + " between them) and their VRAM total: the engine's own view of the B70
+    gpu_names = [n for n in (static.get("gpu_name") or "").split(" + ") if n and n != "?"]
     m = status.get("machine") or {}
     vram_mib = (m.get("gpu") or {}).get("total_mib") or None
-    # #2001: the server names the cards it reads (" + " between them).  A name nvidia-smi does not list means the
-    # engine runs on another vendor's card (an Intel Arc beside a GeForce): the server's names are the right ones, and
-    # so is its VRAM total - the PC's NVIDIA cards were not used.
-    served = [n for n in (static.get("gpu_name") or "").split(" + ") if n and n != "?"]
-    if served and not all(n in {g["name"] for g in local["gpus"]} for n in served):
-        gpu_names, used = served, []
-        local = {**local, "cuda": None}            # the PC's CUDA belongs to cards the engine did not use
-    elif used and used[0].get("vram_mib"):
-        vram_mib = sum(g.get("vram_mib") or 0 for g in used)
     n_ctx = None
     for d in models.get("data") or []:
         n_ctx = (d.get("meta") or {}).get("n_ctx") or n_ctx
     n_ctx = n_ctx or (props.get("default_generation_settings") or {}).get("n_ctx")
     return {
-        "gpu": gpu_names, "gpu_vram_mib": vram_mib, "gpu_driver": (used[0].get("driver") if used else local.get("rocm_driver")),
-        "cuda": local.get("cuda"), "cpu": static.get("cpu_name") or cpu_name(), "cpu_cores": static.get("cores"),
+        "gpu": gpu_names, "gpu_vram_mib": vram_mib, "gpu_driver": None,
+        "cpu": static.get("cpu_name") or cpu_name(), "cpu_cores": static.get("cores"),
         "cpu_threads": static.get("threads") or os.cpu_count(), "ram_gib": total_ram_gib(),
         "os": f"{platform.system()} {platform.release()} ({platform.version()})" if os.name == "nt" else f"{platform.system()} {platform.release()}",
         "python": platform.python_version(),
@@ -819,7 +745,7 @@ def render_readme(res: dict) -> str:
          f"- GPU and VRAM: {gpu}, {vram}",
          f"- CPU: {mc.get('cpu') or 'not read'} ({mc.get('cpu_cores') or '?'} cores, {mc.get('cpu_threads') or '?'} threads); "
          f"installed RAM: {mc.get('ram_gib') or '?'} GiB; storage: not measured",
-         f"- OS: {mc.get('os')}; GPU driver: {mc.get('gpu_driver') or 'not read'}; CUDA: {mc.get('cuda') or 'not read'}",
+         f"- OS: {mc.get('os')}; GPU driver: {mc.get('gpu_driver') or 'not read'}",
          f"- Strata: project {mc.get('strata_version') or '?'}, commit {mc.get('strata_commit') or 'not a git checkout'}; "
          f"engine {mc.get('engine_version') or 'not read'}",
          "- Background workloads and power limits: not recorded", "",
@@ -871,7 +797,7 @@ def render_readme(res: dict) -> str:
     L += ["", "Per-request data: `results.json`. Engine log lines from the start: `engine-log-excerpt.txt` (when this run started the server).", "",
           "## Correctness and limitations", "",
           "Not measured: this is a speed suite. The conversation uses the model's own replies, so token counts differ a little between runs. "
-          "Machine details come from the server, `nvidia-smi`/`rocm-smi` and the OS; background load and power limits are not recorded. "
+          "Machine details come from the server and the OS; background load and power limits are not recorded. "
           f"Total time of the suite: {res['elapsed_s']:.0f} s.", ""]
     return "\n".join(L)
 

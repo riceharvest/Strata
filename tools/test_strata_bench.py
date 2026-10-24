@@ -207,11 +207,6 @@ class RedactionTests(unittest.TestCase):
 
 
 class ReportTests(unittest.TestCase):
-    def setUp(self):
-        p = mock.patch.object(B, "gpu_info_local", return_value={"gpus": []})     # the server's own GPU name, not this PC's
-        p.start()
-        self.addCleanup(p.stop)
-
     def run_main(self, srv, out_dir, *extra):
         argv = ["--url", srv.base, "--out", out_dir, "--runs", "2", "--quiet", *extra]
         return B.main(argv)
@@ -257,27 +252,6 @@ class ReportTests(unittest.TestCase):
             self.assertIn("+100.0%", table)
             self.assertIn("engine: 1.0 -> 9.9.9", table)
 
-    def test_only_the_gpus_the_engine_uses_are_listed(self):
-        """#1985: a PC with two cards, the engine on one: the report names that one, with its VRAM."""
-        srv = FakeStrata()
-        self.addCleanup(srv.stop)
-        two = {"gpus": [{"name": "NVIDIA GeForce RTX 3060", "vram_mib": 12288, "driver": "560.1"},
-                        {"name": "NVIDIA GeForce RTX 9999", "vram_mib": 16384, "driver": "560.1"}]}
-        with mock.patch.object(B, "gpu_info_local", return_value=two):
-            m = B.collect_machine(srv.base, "", {"gpu": 1})
-            self.assertEqual((m["gpu"], m["gpu_vram_mib"]), (["NVIDIA GeForce RTX 9999"], 16384))
-            m = B.collect_machine(srv.base, "", {"gpu": [0, 1]})
-            self.assertEqual((m["gpu"], m["gpu_vram_mib"]), (["NVIDIA GeForce RTX 3060", "NVIDIA GeForce RTX 9999"], 28672))
-            m = B.collect_machine(srv.base, "", {"gpu": "0"}, "1")            # the bench's own --gpu wins
-            self.assertEqual(m["gpu"], ["NVIDIA GeForce RTX 9999"])
-            m = B.collect_machine(srv.base, "", {"args": ["--gpu", "0"]})
-            self.assertEqual(m["gpu"], ["NVIDIA GeForce RTX 3060"])
-            # nothing selected: one card, the one the server reports (not every card of the PC)
-            m = B.collect_machine(srv.base, "", {})
-            self.assertEqual((m["gpu"], m["gpu_vram_mib"]), (["NVIDIA GeForce RTX 9999"], 16384))
-        self.assertEqual(B.gpu_selection({"gpu": "0,2"}), [0, 2])
-        self.assertEqual(B.gpu_selection({}, None), [])
-
     def test_the_slug_names_mixed_cards_one_by_one(self):
         """#2062: two different cards are not N copies of the first."""
         a, b = "NVIDIA GeForce RTX 5070 Ti", "NVIDIA RTX A4000"
@@ -287,16 +261,14 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(B.gpu_slug({"gpu": [b, b]}), "2x-rtx-a4000")
         self.assertEqual(B.gpu_slug({"gpu": [b, a, b]}), "2x-rtx-a4000-plus-rtx-5070-ti")
 
-    def test_a_card_the_pc_s_nvidia_smi_does_not_list_is_the_servers_own(self):
-        """#2001: the engine on an Intel Arc beside a GeForce: the report names the Arc (the name the server reads)."""
+    def test_the_card_is_the_one_the_server_names(self):
+        """#2001: the report names the card the server reads (the engine's own view), with no local probe."""
         srv = FakeStrata()
         self.addCleanup(srv.stop)
-        nv = {"gpus": [{"name": "NVIDIA GeForce RTX 3080 Ti", "vram_mib": 12288, "driver": "560.1"}], "cuda": "12.6"}
-        with mock.patch.object(B, "gpu_info_local", return_value=nv), mock.patch.object(
-                B, "try_json", side_effect=lambda base, path, *a, **k: (
-                    {"hardware_static": {"gpu_name": "Intel Arc Pro B70"}} if path == "/metrics" else {})):
+        with mock.patch.object(B, "try_json", side_effect=lambda base, path, *a, **k: (
+                {"hardware_static": {"gpu_name": "Intel Arc Pro B70"}} if path == "/metrics" else {})):
             m = B.collect_machine(srv.base, "", {"backend": "sycl"})
-        self.assertEqual((m["gpu"], m["cuda"]), (["Intel Arc Pro B70"], None))
+        self.assertEqual(m["gpu"], ["Intel Arc Pro B70"])
 
     def test_a_bench_server_never_saves_over_the_users_profile(self):
         """#2088: --expert-profile-save writes the profile at quit; the bench's own server runs without it."""

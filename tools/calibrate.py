@@ -18,14 +18,9 @@ measured on (a Ryzen 5 7600 + RTX 5070 on PCIe 5):
                   magnitude between rigs (about 700 tokens on four GP100 dies, 5000 on two RTX 3090 Ti) and costs
                   when it is wrong (a fixed 1024 read 22-36% slower on two RTX 4090) - so it is measured here, once,
                   as the prompt read speed of fresh prompts, rather than guessed or learned while the PC serves.
-  STRATA_SH_STREAM (AMD only)
-                  the shared expert on its own stream.  Off by default on HIP (#816: an RX 6800 on Windows and 4x R9700
-                  decode 12-45% faster without it), but the same card family on another PC goes the other way (#1272:
-                  2x RX 6900 XT on Linux, 6-11% faster with it), so it is measured here, per PC, and written into the
-                  config's "env" only when it wins.  The output is identical either way (same token ids).
 
 The first two and the prompt chunks are measured through one engine (per-request `strata_tune` keys); the worker
-count, the adaptive tier and the shared-expert stream need a restart per value.  Those are decode speed: the prompt
+count and the adaptive tier need a restart per value.  Those are decode speed: the prompt
 path streams every expert whatever they say.
 
 A setting is kept only when it beats the default by more than MIN_GAIN in an interleaved re-measurement - the
@@ -52,7 +47,7 @@ SPEC_MIN_PS = (0.3, 0.5, 0.7)
 SWEEP_ROUNDS = 3                   # how many times the sweep visits each value (see `sweep`)
 # the adaptive tier's candidates (every, swaps, decay) against the engine's own (None): swapping more and remembering
 # longer, the rest of the set as the engine has it
-# HIP: the shared-expert stream fork, off (the HIP default) against on; an engine environment variable, not an argument
+# the AMD engine's shared-expert stream switch: no longer measured, but apply_env still removes it from an older config
 SH_STREAM = "STRATA_SH_STREAM"
 ADAPT_CANDIDATES = (None, ("1", "80", "0.97"), ("1", "160", "0.97"))
 ADAPT_FLAGS = ("--adapt-every", "--adapt-swaps", "--adapt-decay")
@@ -241,10 +236,9 @@ def run(cfg: dict, say=print, start_engine=None, *, progress=None, cancel_event=
                        json.loads((tpath / "token_type.json").read_text()))
     ids_list = [chat_ids(tok, p) for p in PROMPTS]
     if progress is None and cancel_event is None:
-        return measure(engine_args(cfg), ids_list, start_engine, say, host_worker_extras(), doc_prompt(tok),
-                       hip=cfg.get("backend") == "hip")
-    return measure(engine_args(cfg), ids_list, start_engine, say, host_worker_extras(), doc_prompt(tok),
-                   hip=cfg.get("backend") == "hip", progress=progress, cancel_event=cancel_event)
+        return measure(engine_args(cfg), ids_list, start_engine, say, host_worker_extras(), doc_prompt(tok))
+    return measure(engine_args(cfg), ids_list, start_engine, say, host_worker_extras(), doc_prompt(tok), progress=progress,
+                   cancel_event=cancel_event)
 
 
 def engine_args(cfg: dict) -> list[str]:
@@ -300,7 +294,7 @@ def sweep(s, values: list, base_tune: dict, key: str, label: str, say,
     return out
 
 
-def measure(base_args: list[str], ids_list, start_engine, say=print, extra_workers=(), long_prompt=None, hip: bool = False,
+def measure(base_args: list[str], ids_list, start_engine, say=print, extra_workers=(), long_prompt=None,
             *, progress=None, cancel_event=None) -> dict:
     t0 = time.time()
     report: dict = {}
@@ -423,32 +417,7 @@ def measure(base_args: list[str], ids_list, start_engine, say=print, extra_worke
         base_rate = statistics.median(by_adapt[a_best])
     elif by_adapt.get("default"):
         base_rate = statistics.median(by_adapt["default"])
-    # 6. HIP: the shared-expert stream fork (a restart each), with everything chosen so far.  Both values are set
-    # explicitly, so a value the config carried before does not decide the baseline.
     env = {}
-    if hip:
-        tuned = apply(base_args, settings)
-        by_fork = {}
-        for v in ("0", "1"):
-            _check_cancel(cancel_event)
-            say(f"  Measuring the shared expert {'on its own stream' if v == '1' else 'on the main stream (the AMD default)'}"
-                " (restarts the engine) ...")
-            e = restart(lambda a: start_engine(a, {SH_STREAM: v}), tuned, f"{SH_STREAM}={v}", say, report)
-            if e is None:
-                continue
-            try:
-                sf = Session(e, ids_list, cancel_event)
-                sf.warm_up(1)
-                by_fork[v] = [sf.rate(), sf.rate()]
-                say(f"    {statistics.median(by_fork[v]):.1f} tok/s")
-            finally:
-                close(e)
-        report["sh_stream"] = by_fork
-        if pick(by_fork, "0") == "1":
-            env[SH_STREAM] = "1"
-            base_rate = statistics.median(by_fork["1"])
-        elif by_fork.get("0"):
-            base_rate = statistics.median(by_fork["0"])
     report["seconds"] = round(time.time() - t0)
     report["tok_s"] = round(base_rate, 1) if base_rate else None
     _check_cancel(cancel_event)
