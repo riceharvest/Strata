@@ -35,11 +35,11 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 import setup as S  # noqa: E402
-from strata_control import vram_fit  # noqa: E402
+from strata_control import sycl_build, vram_fit  # noqa: E402
 
-SYCL_WRAPPER = ROOT / "sycl" / "serve" / "strata-sycl.sh"
+SYCL_WRAPPER = sycl_build.wrapper(ROOT)       # the paths `strata launch` and the runtime host use too (strata_control/sycl_build.py)
 SYCL_IMAGE = "strata-sycl-dev"
-SERVER = ROOT / "sycl" / "serve" / "server_intel.py"
+SERVER = sycl_build.server(ROOT)
 MOUNT = Path(os.environ.get("STRATA_SYCL_ROOT") or ROOT.parent)   # what strata-sycl.sh mounts at /work
 
 # Battlemage / Alchemist PCI device ids -> (name, VRAM GB). lspci's database lags new cards (an Arc Pro B70 reads
@@ -99,7 +99,7 @@ def sycl_engine():
     """The SYCL build: (binary, why-not)."""
     if S.WIN:
         return None, "the SYCL port runs on Linux only"
-    exe = next((b for b in (ROOT / "build-sycl-aot" / "strata", ROOT / "build-sycl" / "strata") if b.exists()), None)
+    exe = sycl_build.binary(ROOT)
     if exe is None:
         return None, "it is not built (docs/INTEL.md, \"How to build it\": Docker, then sycl/tools/build.sh in the image)"
     return exe, None
