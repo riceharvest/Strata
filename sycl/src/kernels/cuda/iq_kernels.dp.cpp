@@ -4967,14 +4967,26 @@ __dpct_inline__ void native_down_kernel_fast(
     }
 }
 
-// STRATA_IQ_DECODE_FAST=1 takes the IqFast kernels for the formats in STRATA_IQ_DECODE_FAST_FMTS (ggml type ids,
-// comma separated; default all of them: 16, 17, 18, 21, 22 gate/up and 20, 42 down).  Read once, at the first
-// expert call, as the other switches; the parity test overrides it with native_expert_set_iq_decode_fast.
+// The IqFast kernels for the formats in STRATA_IQ_DECODE_FAST_FMTS (ggml type ids, comma separated; default all of
+// them: 16, 17, 18, 21, 22 gate/up and 20, 42 down). On by default on a Battlemage card (bitwise the same outputs;
+// B70, Flash-Next IQ2_XS, greedy: decode +4-6%); STRATA_IQ_DECODE_FAST=0 turns them off, =1 on for any device.
+// Read once, at the first expert call, as the other switches; the parity test overrides it with
+// native_expert_set_iq_decode_fast.
 int g_iq_fast_force = -1;   // >= 0 overrides the environment
-bool iq_fast_on(int ty) {
-    static const bool env = [] {
-        const bool b = env_on("STRATA_IQ_DECODE_FAST");
-        if (b) std::fprintf(stderr, "strata: STRATA_IQ_DECODE_FAST=1 (cheaper IQ decodes in the grouped expert kernels)\n");
+bool iq_fast_on(int ty, const sycl::queue& q) {
+    static const bool env = [&] {
+        const char* v = std::getenv("STRATA_IQ_DECODE_FAST");
+        bool b = false;
+        if (v != nullptr && v[0] != '\0') {
+            b = v[0] != '0';
+        } else {
+            namespace ex = sycl::ext::oneapi::experimental;
+            try {
+                const auto a = q.get_device().get_info<ex::info::device::architecture>();
+                b = a == ex::architecture::intel_gpu_bmg_g21 || a == ex::architecture::intel_gpu_bmg_g31;
+            } catch (...) {}
+        }
+        if (b) std::fprintf(stderr, "strata: cheaper IQ decodes in the grouped expert kernels (STRATA_IQ_DECODE_FAST=0 turns them off)\n");
         return b;
     }();
     static const uint64_t fmts = [] {   // bit t: type t
@@ -5000,10 +5012,10 @@ bool launch_gu_fast(unsigned groups, dpct::queue_ptr s, const unsigned long long
                     const NativeExpertLayout &L, float *gate, float *up) {
     if constexpr (!(TG == 16 || TG == 17 || TG == 18 || TG == 21 || TG == 22) || LN != 8) { return false; }
     else {
-        if (!iq_fast_on(TG)) return false;
+        if (!iq_fast_on(TG, *s)) return false;
         constexpr int ROWS = (256 / LN) * kIqFastRows;
         const unsigned gx = (unsigned) ((2 * L.n_ff + ROWS - 1) / ROWS);
-        auto exp_props = sycl::ext::oneapi::experimental::properties{sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
         s->parallel_for<dpct_kernel_name<class native_gu_fast, dpct_kernel_scalar<TG>, dpct_kernel_scalar<LN>>>(
             sycl::nd_range<3>(sycl::range<3>(1, groups, (size_t) gx * 256), sycl::range<3>(1, 1, 256)), exp_props,
             [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(16)]] {
@@ -5018,10 +5030,10 @@ bool launch_down_fast(unsigned groups, dpct::queue_ptr s, const unsigned long lo
                       const NativeExpertLayout &L, float *out) {
     if constexpr (!(TD == 20 || TD == 42) || LN != 8) { return false; }
     else {
-        if (!iq_fast_on(TD)) return false;
+        if (!iq_fast_on(TD, *s)) return false;
         constexpr int ROWS = (256 / LN) * kIqFastRows;
         const unsigned gx = (unsigned) ((L.n_embd + ROWS - 1) / ROWS);
-        auto exp_props = sycl::ext::oneapi::experimental::properties{sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
         s->parallel_for<dpct_kernel_name<class native_down_fast, dpct_kernel_scalar<TD>, dpct_kernel_scalar<LN>>>(
             sycl::nd_range<3>(sycl::range<3>(1, groups, (size_t) gx * 256), sycl::range<3>(1, 1, 256)), exp_props,
             [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(16)]] {
