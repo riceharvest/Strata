@@ -2650,17 +2650,17 @@ def amd_parse_gpus(text, amd) -> list:
         try:
             sel = [int(x) for x in str(text).split(",") if x.strip()]
         except ValueError:
-            fail(f"--gpus takes AMD GPU numbers as setup lists them, e.g. --gpus 1,0 (or --gpus all), not {text!r}")
+            fail(f"--gpus takes GPU numbers as setup lists them, e.g. --gpus 1,0 (or --gpus all), not {text!r}")
     if len(sel) < 2 or len(set(sel)) != len(sel):
         fail("--gpus takes two or more different GPUs, e.g. --gpus 1,0 (one GPU: --gpu 1)",
-             "this PC has " + (f"{len(usable)} AMD card{'s' if len(usable) != 1 else ''} Strata can use"
+             "this PC has " + (f"{len(usable)} card{'s' if len(usable) != 1 else ''} Strata can use"
                                + (": " + ", ".join(f"GPU {g['index']} ({g['name']})" for g in usable) if usable else "")))
     byid = {g["index"]: g for g in amd}
     for i in sel:
         g = byid.get(i)
         p = "not found on this PC" if g is None else amd_problem(g)
         if p is not None:
-            fail(f"AMD GPU {i}{'' if g is None else ' (' + g['name'] + ')'} cannot be used: {p}",
+            fail(f"GPU {i}{'' if g is None else ' (' + g['name'] + ')'} cannot be used: {p}",
                  ("use these together: --gpus " + ",".join(str(x["index"]) for x in usable)) if len(usable) >= 2 else
                  ("use one card: --gpu " + str(usable[0]["index"])) if usable else "no card Strata can use was found")
     return [byid[i] for i in sel]
@@ -5230,7 +5230,7 @@ def main() -> int:
     elif a.gpu is not None:
         gpu = next((g for g in usable if g["index"] == a.gpu), None)
         if gpu is None:
-            fail(f"AMD GPU {a.gpu} cannot be used", "use one of: " + ", ".join(f"--gpu {g['index']}" for g in usable))
+            fail(f"GPU {a.gpu} cannot be used", "use one of: " + ", ".join(f"--gpu {g['index']}" for g in usable))
         chosen = [gpu]
     else:
         gpu = min(usable, key=amd_rank)            # the most memory

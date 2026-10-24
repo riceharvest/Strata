@@ -154,9 +154,7 @@ class Harness(unittest.TestCase):
         for prof, (ram, found) in PROFILES.items():
             with self.subTest(prof):
                 code, out, cfg, asked = install(ram, found, argv_for("qwen", None))
-                if code != 0:                       # a PC below every size's RAM floor stops (--yes alone is no consent)
-                    self.assertIn("RAM", out)
-                    continue
+                self.assertEqual(code, 0, out[-2000:])
                 self.assertEqual(cfg["backend"], "hip", out[-2000:])
                 self.assertEqual(asked, [])
                 self.assertEqual(cfg["lib_dirs"], [])
