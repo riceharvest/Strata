@@ -304,8 +304,8 @@ void launch_gu(sycl::queue& q, const GArgs a, int nrowblocks) {
 #pragma unroll
                             for (int il = 0; il < 4; ++il) {
                                 simd<uint32_t, 16> idx = ((idw >> (8 * il)) & 0xffu) | ((qhb << (8 - 2 * il)) & 0x300u);
-                                simd<uint32_t, 16> gl = gather<uint32_t, 16>(T + O_IQ2S, (idx << 3));
-                                simd<uint32_t, 16> gh = gather<uint32_t, 16>(T + O_IQ2S, (idx << 3) + 4u);
+                                simd<uint32_t, 32> g2 = gather<uint32_t, 32, 2>(T + O_IQ2S, idx << 3);   // the 8-byte entry in one message
+                                simd<uint32_t, 16> gl = g2.template select<16, 1>(0), gh = g2.template select<16, 1>(16);
                                 simd<uint32_t, 16> sbyte = (sgw >> (8 * il)) & 0xffu;
                                 simd<uint32_t, 16> vl = apply_signs(gl, sbyte & 0xfu);
                                 simd<uint32_t, 16> vh = apply_signs(gh, sbyte >> 4);
@@ -331,8 +331,8 @@ void launch_gu(sycl::queue& q, const GArgs a, int nrowblocks) {
                                 simd<uint32_t, 16> qsw = (il < 2) ? q0 : q1;
                                 simd<uint32_t, 16> qv = (il & 1) ? (qsw >> 16) : (qsw & 0xffffu);
                                 simd<uint32_t, 16> idx = qv & 511u;
-                                simd<uint32_t, 16> gl = gather<uint32_t, 16>(T + O_IQ2XS, (idx << 3));
-                                simd<uint32_t, 16> gh = gather<uint32_t, 16>(T + O_IQ2XS, (idx << 3) + 4u);
+                                simd<uint32_t, 32> g2 = gather<uint32_t, 32, 2>(T + O_IQ2XS, idx << 3);   // the 8-byte entry in one message
+                                simd<uint32_t, 16> gl = g2.template select<16, 1>(0), gh = g2.template select<16, 1>(16);
                                 simd<uint32_t, 16> sbyte = ksigns(qv >> 9);
                                 simd<uint32_t, 16> vl = apply_signs(gl, sbyte & 0xfu);
                                 simd<uint32_t, 16> vh = apply_signs(gh, sbyte >> 4);
@@ -353,8 +353,8 @@ void launch_gu(sycl::queue& q, const GArgs a, int nrowblocks) {
 #pragma unroll
                             for (int il = 0; il < 4; ++il) {
                                 simd<uint32_t, 16> idx = (q0 >> (8 * il)) & 0xffu;
-                                simd<uint32_t, 16> gl = gather<uint32_t, 16>(T + O_IQ2XXS, (idx << 3));
-                                simd<uint32_t, 16> gh = gather<uint32_t, 16>(T + O_IQ2XXS, (idx << 3) + 4u);
+                                simd<uint32_t, 32> g2 = gather<uint32_t, 32, 2>(T + O_IQ2XXS, idx << 3);   // the 8-byte entry in one message
+                                simd<uint32_t, 16> gl = g2.template select<16, 1>(0), gh = g2.template select<16, 1>(16);
                                 simd<uint32_t, 16> sbyte = ksigns((aux >> (7 * il)) & 127u);
                                 fr0.template select<16, 1>(16 * (2 * il)) = apply_signs(gl, sbyte & 0xfu);
                                 fr0.template select<16, 1>(16 * (2 * il + 1)) = apply_signs(gh, sbyte >> 4);
@@ -652,15 +652,17 @@ void launch_gu_wg(sycl::queue& q, const GArgs a, int nrowblocks) {
                                     if constexpr (F == T_IQ2S) {
                                         simd<uint32_t, 16> qhb = (((ib < 4) ? w2 : w3) >> (8 * (ib & 3))) & 0xffu;
                                         simd<uint32_t, 16> idx = ((qa >> (8 * il)) & 0xffu) | ((qhb << (8 - 2 * il)) & 0x300u);
-                                        gl = gather<uint32_t, 16>(T + O_IQ2S, idx << 3);
-                                        gh = gather<uint32_t, 16>(T + O_IQ2S, (idx << 3) + 4u);
+                                        simd<uint32_t, 32> g2 = gather<uint32_t, 32, 2>(T + O_IQ2S, idx << 3);   // the 8-byte entry in one message
+                                        gl = g2.template select<16, 1>(0);
+                                        gh = g2.template select<16, 1>(16);
                                         sbyte = (qb >> (8 * il)) & 0xffu;
                                     } else {
                                         simd<uint32_t, 16> qsw = (il < 2) ? qa : qb;
                                         simd<uint32_t, 16> qv = (il & 1) ? (qsw >> 16) : (qsw & 0xffffu);
                                         simd<uint32_t, 16> idx = qv & 511u;
-                                        gl = gather<uint32_t, 16>(T + O_IQ2XS, idx << 3);
-                                        gh = gather<uint32_t, 16>(T + O_IQ2XS, (idx << 3) + 4u);
+                                        simd<uint32_t, 32> g2 = gather<uint32_t, 32, 2>(T + O_IQ2XS, idx << 3);   // the 8-byte entry in one message
+                                        gl = g2.template select<16, 1>(0);
+                                        gh = g2.template select<16, 1>(16);
                                         sbyte = ksigns(qv >> 9);
                                     }
                                     fb.template select<16, 1>(64 * hf + 32 * il) = apply_signs(gl, sbyte & 0xfu);
@@ -729,8 +731,8 @@ void launch_gu_wg(sycl::queue& q, const GArgs a, int nrowblocks) {
 #pragma unroll
                                 for (int il = 0; il < 4; ++il) {
                                     simd<uint32_t, 16> idx = (q0 >> (8 * il)) & 0xffu;
-                                    simd<uint32_t, 16> gl = gather<uint32_t, 16>(T + O_IQ2XXS, idx << 3);
-                                    simd<uint32_t, 16> gh = gather<uint32_t, 16>(T + O_IQ2XXS, (idx << 3) + 4u);
+                                    simd<uint32_t, 32> g2 = gather<uint32_t, 32, 2>(T + O_IQ2XXS, idx << 3);   // the 8-byte entry in one message
+                                    simd<uint32_t, 16> gl = g2.template select<16, 1>(0), gh = g2.template select<16, 1>(16);
                                     simd<uint32_t, 16> sbyte = ksigns((aux >> (7 * il)) & 127u);
                                     fr0.template select<16, 1>(16 * (2 * il)) = apply_signs(gl, sbyte & 0xfu);
                                     fr0.template select<16, 1>(16 * (2 * il + 1)) = apply_signs(gh, sbyte >> 4);
