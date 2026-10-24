@@ -32,12 +32,7 @@ DRAFTERS = ("mtp", "dflash2", "off")
 # says. Fill this in as measurements come in (and change nothing else: the Terminal and the app both read it, tests/terminal/test_drafting.py
 # checks that a DFlash2 row has the evidence).
 #
-# Evidence so far (phaseA-tests/notes-dflash2-p1.md, -p02.md, -ports.md; DFlash2 against MTP, tokens per second, same prompts and flags):
-#   strix_halo  Radeon 8060S (gfx1151): faster on chat, code and json, SLOWER on tool_call (-6%).
-#   blackwell   RTX 5070 (sm_120, 12 GB): faster on code, SLOWER on chat (-1%).
-#   rdna4       Radeon AI PRO R9700 (gfx1201): slower on every prompt.
-#   ampere      RTX 3060 (sm_86, 12 GB): slower on every prompt.
-#   other       not measured.
+# Evidence so far: the Intel Arc Pro B70 (the only card this fork runs on) was not measured, so it is the "other" class.
 
 
 @dataclass(frozen=True)
@@ -48,24 +43,15 @@ class Suggestion:
 
 
 SUGGESTED: dict[str, Suggestion] = {
-    "strix_halo": Suggestion("mtp", False, "gfx1151: faster on chat, code and json; slower on tool_call (-6%)"),
-    "blackwell": Suggestion("mtp", False, "sm_120 (RTX 5070, 12 GB): faster on code; slower on chat (-1%)"),
-    "rdna4": Suggestion("mtp", False, "gfx1201 (R9700): slower on every prompt"),
-    "ampere": Suggestion("mtp", False, "sm_86 (RTX 3060, 12 GB): slower on every prompt"),
     "other": Suggestion("mtp", False, "not measured on this kind of card"),
 }
 
-#: GPU architecture (what nvidia-smi's compute capability and the kernel driver report) -> card class
-ARCH_CLASS = (
-    (re.compile(r"^gfx1151$"), "strix_halo"),
-    (re.compile(r"^gfx120[01]$"), "rdna4"),
-    (re.compile(r"^sm_12\d$"), "blackwell"),
-    (re.compile(r"^sm_86$"), "ampere"),
-)
+#: GPU architecture -> card class; no Intel Arc row has been measured yet
+ARCH_CLASS: tuple = ()
 
 
 def card_class(archs: Any) -> str:
-    """The class of the first card whose architecture the table knows (``sm_120``, ``gfx1151``...); ``other`` for an unknown or empty list."""
+    """The class of the first card whose architecture the table knows; ``other`` for an unknown or empty list."""
     for arch in ([archs] if isinstance(archs, str) else list(archs or [])):
         for pattern, name in ARCH_CLASS:
             if pattern.match(str(arch).strip().lower()):

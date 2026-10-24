@@ -30,11 +30,7 @@ def add_parser(sp) -> None:
 
 
 def _card_class() -> str:
-    try:
-        from strata_control import engine_component
-        return drafting.card_class(list(engine_component.cuda_archs_present()) + list(engine_component.hip_archs_present()))
-    except Exception:                                        # noqa: BLE001 - an unknown card is the "other" class
-        return "other"
+    return drafting.card_class([])                          # the table has no Intel Arc row: "other"
 
 
 def _inputs(a) -> dict:

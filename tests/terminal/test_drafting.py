@@ -37,33 +37,21 @@ class SuggestionTable(unittest.TestCase):
         # The owner's rule (2026-10-22): "suggest DFlash2 where the win is 100%". Today no card class qualifies.
         for klass in drafting.SUGGESTED:
             self.assertEqual(drafting.suggest(klass), "mtp", klass)
-        for klass in ("strix_halo", "blackwell", "rdna4", "ampere", "other", "never-heard-of-it"):
+        for klass in ("other", "never-heard-of-it"):
             self.assertEqual(drafting.suggest(klass), "mtp")
         # a row that says DFlash2 but not "faster everywhere" is still the MTP; only both together switch Auto
-        with mock.patch.dict(drafting.SUGGESTED, {"blackwell": drafting.Suggestion("dflash2", False, "wins on code only")}):
-            self.assertEqual(drafting.suggest("blackwell"), "mtp")
-        with mock.patch.dict(drafting.SUGGESTED, {"blackwell": drafting.Suggestion("dflash2", True, "faster on chat, code, json and tool_call")}):
-            self.assertEqual(drafting.suggest("blackwell"), "dflash2")
-            self.assertEqual(drafting.suggest("strix_halo"), "mtp", "the other classes are unchanged")
-
-    def test_the_measured_losses_are_written_down(self):
-        text = {k: v.evidence for k, v in drafting.SUGGESTED.items()}
-        self.assertIn("-6%", text["strix_halo"])
-        self.assertIn("tool_call", text["strix_halo"])
-        self.assertIn("-1%", text["blackwell"])
-        self.assertIn("chat", text["blackwell"])
-        self.assertIn("every prompt", text["rdna4"])
-        self.assertIn("every prompt", text["ampere"])
+        with mock.patch.dict(drafting.SUGGESTED, {"arc": drafting.Suggestion("dflash2", False, "wins on code only")}):
+            self.assertEqual(drafting.suggest("arc"), "mtp")
+        with mock.patch.dict(drafting.SUGGESTED, {"arc": drafting.Suggestion("dflash2", True, "faster on chat, code, json and tool_call")}):
+            self.assertEqual(drafting.suggest("arc"), "dflash2")
+            self.assertEqual(drafting.suggest("other"), "mtp", "the other classes are unchanged")
 
     def test_cards_are_classified_by_their_architecture(self):
-        self.assertEqual(drafting.card_class(["sm_120"]), "blackwell")
-        self.assertEqual(drafting.card_class(["gfx1151"]), "strix_halo")
-        self.assertEqual(drafting.card_class(["gfx1201"]), "rdna4")
-        self.assertEqual(drafting.card_class(["sm_86"]), "ampere")
         self.assertEqual(drafting.card_class([]), "other")
-        self.assertEqual(drafting.card_class(["sm_61"]), "other")
-        self.assertEqual(drafting.card_class(["sm_61", "sm_120"]), "blackwell", "the first card the table knows")
-        self.assertEqual(drafting.card_class("SM_120"), "blackwell")
+        self.assertEqual(drafting.card_class(["bmg-g31"]), "other")
+        import re as _re
+        with mock.patch.object(drafting, "ARCH_CLASS", ((_re.compile(r"^bmg"), "arc"),)):
+            self.assertEqual(drafting.card_class(["xe2", "BMG-G31"]), "arc", "the first card the table knows")
 
     def test_both_sides_know_the_same_modes(self):
         self.assertEqual(drafting.MODES, S.DRAFTING_MODES)
@@ -86,48 +74,48 @@ class Decisions(unittest.TestCase):
     def test_auto_and_mtp_run_the_mtp_with_no_extra_flags(self):
         with serving_dflash2():
             for mode in ("auto", "mtp", None):
-                d = drafting.decide(mode, klass="blackwell", model_name=GYRO, data_dir=self.data)
+                d = drafting.decide(mode, klass="other", model_name=GYRO, data_dir=self.data)
                 self.assertEqual((d.drafter, d.flags, d.note), ("mtp", (), ""), mode)
 
     def test_off_is_off(self):
-        self.assertEqual(drafting.decide("off", klass="blackwell", model_name=GYRO).drafter, "off")
+        self.assertEqual(drafting.decide("off", klass="other", model_name=GYRO).drafter, "off")
 
     def test_dflash2_needs_the_drafter_file_and_gets_the_engine_flags_when_it_is_there(self):
         with serving_dflash2():
-            gone = drafting.decide("dflash2", klass="blackwell", model_name=GYRO, data_dir=self.data)
+            gone = drafting.decide("dflash2", klass="other", model_name=GYRO, data_dir=self.data)
             self.assertEqual((gone.drafter, gone.note), ("mtp", drafting.NOT_DOWNLOADED))
-            self.assertTrue(drafting.needs_pack("dflash2", klass="blackwell", model_name=GYRO, data_dir=self.data))
+            self.assertTrue(drafting.needs_pack("dflash2", klass="other", model_name=GYRO, data_dir=self.data))
             self.ready()
-            d = drafting.decide("dflash2", klass="blackwell", model_name=GYRO, data_dir=self.data)
+            d = drafting.decide("dflash2", klass="other", model_name=GYRO, data_dir=self.data)
             self.assertEqual(d.drafter, "dflash2")
             self.assertEqual(d.flags, ("--draft", "dflash2", "--draft-model", str(drafting.pack_path(self.data))))
-            self.assertFalse(drafting.needs_pack("dflash2", klass="blackwell", model_name=GYRO, data_dir=self.data))
+            self.assertFalse(drafting.needs_pack("dflash2", klass="other", model_name=GYRO, data_dir=self.data))
 
     def test_dflash2_is_for_qwen38_flash_next_only(self):
         with serving_dflash2():
             self.ready()
             for name in ("qwen3.6-35b-a3b-q4", "qwen3.8-flash-next-coder-iq3_xxs", "qwen3.8-flash-next-swift-iq2_xs", None):
-                d = drafting.decide("dflash2", klass="blackwell", model_name=name, data_dir=self.data)
+                d = drafting.decide("dflash2", klass="other", model_name=name, data_dir=self.data)
                 self.assertEqual((d.drafter, d.note), ("mtp", drafting.NOT_SUPPORTED), name)
-                self.assertFalse(drafting.needs_pack("dflash2", klass="blackwell", model_name=name, data_dir=self.data))
+                self.assertFalse(drafting.needs_pack("dflash2", klass="other", model_name=name, data_dir=self.data))
             for name in (GYRO, "qwen3.8-flash-next-q2_0", "qwen3.8-flash-next-iq3_xxs"):
-                self.assertEqual(drafting.decide("dflash2", klass="blackwell", model_name=name, data_dir=self.data).drafter, "dflash2", name)
+                self.assertEqual(drafting.decide("dflash2", klass="other", model_name=name, data_dir=self.data).drafter, "dflash2", name)
             self.assertTrue(drafting.supported_model(family="qwen") and drafting.supported_model(family="gyro"))
             self.assertFalse(drafting.supported_model(family="coder") or drafting.supported_model(family="swift") or drafting.supported_model(family="nvfp4"))
 
     def test_while_the_engine_cannot_serve_it_the_choice_says_so_and_nothing_is_downloaded(self):
         self.assertFalse(drafting.ENGINE_SERVES_DFLASH2, "src/program/generate.cpp: --draft dflash2 is off with --serve in this release")
-        d = drafting.decide("dflash2", klass="blackwell", model_name=GYRO, data_dir=self.data)
+        d = drafting.decide("dflash2", klass="other", model_name=GYRO, data_dir=self.data)
         self.assertEqual((d.drafter, d.note), ("mtp", drafting.NOT_SERVED))
-        self.assertFalse(drafting.needs_pack("dflash2", klass="blackwell", model_name=GYRO, data_dir=self.data))
-        self.assertEqual(drafting.decide("auto", klass="blackwell", model_name=GYRO, data_dir=self.data).note, "")
+        self.assertFalse(drafting.needs_pack("dflash2", klass="other", model_name=GYRO, data_dir=self.data))
+        self.assertEqual(drafting.decide("auto", klass="other", model_name=GYRO, data_dir=self.data).note, "")
 
     def test_auto_follows_the_table(self):
-        with serving_dflash2(), mock.patch.dict(drafting.SUGGESTED, {"blackwell": drafting.Suggestion("dflash2", True, "wins everywhere")}):
+        with serving_dflash2(), mock.patch.dict(drafting.SUGGESTED, {"arc": drafting.Suggestion("dflash2", True, "wins everywhere")}):
             self.ready()
-            self.assertEqual(drafting.decide("auto", klass="blackwell", model_name=GYRO, data_dir=self.data).drafter, "dflash2")
-            self.assertEqual(drafting.decide("auto", klass="strix_halo", model_name=GYRO, data_dir=self.data).drafter, "mtp")
-            self.assertEqual(drafting.decide("auto", klass="blackwell", model_name="qwen3.6-35b-a3b-q4", data_dir=self.data).note, "",
+            self.assertEqual(drafting.decide("auto", klass="arc", model_name=GYRO, data_dir=self.data).drafter, "dflash2")
+            self.assertEqual(drafting.decide("auto", klass="other", model_name=GYRO, data_dir=self.data).drafter, "mtp")
+            self.assertEqual(drafting.decide("auto", klass="other", model_name="qwen3.6-35b-a3b-q4", data_dir=self.data).note, "",
                              "Auto never nags about a model DFlash2 is not for")
 
 
@@ -144,7 +132,7 @@ class EngineArguments(unittest.TestCase):
 
     def test_a_config_nobody_touched_keeps_its_arguments_exactly(self):
         c = self.cfg()
-        drafting.apply(c, klass="blackwell", data_dir=self.data)
+        drafting.apply(c, klass="other", data_dir=self.data)
         self.assertEqual(c["args"], self.ARGS)
         self.assertNotIn("mtp", c)
 
@@ -154,7 +142,7 @@ class EngineArguments(unittest.TestCase):
         pack.write_bytes(b"x" * (2 << 20))
         with serving_dflash2():
             c = self.cfg(drafting="dflash2", args=[*self.ARGS, "--draft", "mtp", "--draft-model", "/old.pack"])
-            d = drafting.apply(c, klass="blackwell", data_dir=self.data)
+            d = drafting.apply(c, klass="other", data_dir=self.data)
         self.assertEqual(d.drafter, "dflash2")
         self.assertEqual(c["args"], [*self.ARGS, "--draft", "dflash2", "--draft-model", str(pack)])
         self.assertEqual(c["args"].count("--draft"), 1)
@@ -162,12 +150,12 @@ class EngineArguments(unittest.TestCase):
 
     def test_mtp_removes_a_drafter_that_was_written_by_hand(self):
         c = self.cfg(drafting="mtp", args=[*self.ARGS, "--draft", "dflash2", "--draft-model", "/p"])
-        drafting.apply(c, klass="blackwell", data_dir=self.data)
+        drafting.apply(c, klass="other", data_dir=self.data)
         self.assertEqual(c["args"], self.ARGS)
 
     def test_off_is_the_draft_layers_own_switch(self):
         c = self.cfg(drafting="off")
-        d = drafting.apply(c, klass="blackwell", data_dir=self.data)
+        d = drafting.apply(c, klass="other", data_dir=self.data)
         self.assertEqual(d.drafter, "off")
         self.assertIs(c["mtp"], False)
         for flag in ("--mtp", "--spec-min-p", "--batch-mtp", "--draft"):
@@ -177,18 +165,18 @@ class EngineArguments(unittest.TestCase):
     def test_a_choice_that_cannot_be_applied_starts_the_mtp_and_says_why(self):
         c = self.cfg(drafting="dflash2", model_name="qwen3.8-flash-next-coder-iq3_xxs")
         with serving_dflash2():
-            d = drafting.apply(c, klass="blackwell", data_dir=self.data)
+            d = drafting.apply(c, klass="other", data_dir=self.data)
         self.assertEqual((d.drafter, d.note), ("mtp", drafting.NOT_SUPPORTED))
         self.assertEqual(c["args"], self.ARGS)
 
     def test_the_server_applies_it_at_every_start(self):
         from serve.server import engine_args
         pack = drafting.pack_path(Path("/d"))
-        with mock.patch("serve.server.drafting_card_class", return_value="blackwell"), serving_dflash2(), \
+        with mock.patch("serve.server.drafting_card_class", return_value="other"), serving_dflash2(), \
                 mock.patch.object(drafting, "pack_ready", return_value=True), mock.patch.object(drafting, "data_dir_of", return_value=Path("/d")):
             args = engine_args(self.cfg(drafting="dflash2"))
             self.assertEqual(args[-4:], ["--draft", "dflash2", "--draft-model", str(pack)])
-        with mock.patch("serve.server.drafting_card_class", return_value="blackwell"):
+        with mock.patch("serve.server.drafting_card_class", return_value="other"):
             self.assertEqual(engine_args(self.cfg()), self.ARGS, "no choice: nothing changes")
             off = engine_args(self.cfg(drafting="off"))
             self.assertNotIn("--mtp", off)
