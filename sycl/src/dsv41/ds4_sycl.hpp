@@ -454,36 +454,127 @@ inline cudaError_t cudaStreamWaitEvent(cudaStream_t s, cudaEvent_t e, unsigned i
     return cudaSuccess;
 }
 
-// USM allocations
+constexpr cudaError_t cudaErrorInvalidValue = 1;
+constexpr cudaError_t cudaErrorMemoryAllocation = 2;
+constexpr cudaError_t cudaErrorNotSupported = 801;
+
+constexpr unsigned int cudaHostAllocDefault = 0;
+constexpr unsigned int cudaHostAllocPortable = 1;
+constexpr unsigned int cudaHostAllocMapped = 2;
+constexpr unsigned int cudaHostRegisterPortable = 1;
+constexpr unsigned int cudaHostRegisterMapped = 2;
+constexpr unsigned int cudaStreamNonBlocking = 1;
+constexpr unsigned int cudaEventDisableTiming = 2;
+
+// The shim's own bookkeeping: the queues cudaStreamCreate* made (CUDA's device-wide waits must cover them), the bytes
+// cudaMalloc holds per device (cudaMemGetInfo's fallback), and the host ranges cudaHostRegister pinned.
+namespace ds4_shim {
+struct State {
+    std::mutex mu;
+    std::vector<sycl::queue*> queues;
+    std::unordered_map<const void*, std::pair<unsigned, size_t>> dev_allocs;   // pointer -> (dpct device id, bytes)
+    std::unordered_map<unsigned, size_t> dev_used;
+    std::map<const char*, size_t> registered;                                  // cudaHostRegister'd ranges
+};
+inline State& st() {
+    static State s;
+    return s;
+}
+inline unsigned cur_dev() { return dpct::dev_mgr::instance().current_device_id(); }
+// wait for the queues the shim made (all of them, or those of one device) and dpct's own
+inline void wait_queues(bool all_devices) {
+    std::vector<sycl::queue*> qs;
+    {
+        std::lock_guard<std::mutex> lk(st().mu);
+        qs = st().queues;
+    }
+    const sycl::device cur = dpct::get_current_device();
+    for (sycl::queue* q : qs)
+        if (all_devices || q->get_device() == cur) q->wait();
+    if (all_devices) {
+        for (unsigned i = 0; i < dpct::dev_mgr::instance().device_count(); ++i) dpct::get_device(i).queues_wait_and_throw();
+    } else {
+        dpct::get_current_device().queues_wait_and_throw();
+    }
+}
+inline bool registered(const void* p) {
+    std::lock_guard<std::mutex> lk(st().mu);
+    auto& r = st().registered;
+    auto it = r.upper_bound((const char*) p);
+    if (it == r.begin()) return false;
+    --it;
+    return (const char*) p < it->first + it->second;
+}
+// host memory that is neither USM nor cudaHostRegister'd: CUDA copies it synchronously (the caller may reuse it at once)
+inline bool pageable(const void* p, const sycl::context& ctx) {
+    return sycl::get_pointer_type(p, ctx) == sycl::usm::alloc::unknown && !registered(p);
+}
+constexpr size_t kBigFill = (size_t) 256 << 20;   // memsets of zero past this go through strata::big_fill_zero (xe: no multi-GiB blit)
+}  // namespace ds4_shim
+
+// USM allocations.  Device memory through strata::malloc_device_guarded (a big buffer is checked for aliased pages, as the main
+// engine's are); CUDA's cudaFree / cudaFreeHost wait for the device first, so these wait for every queue the shim made.
 template <typename T>
 inline cudaError_t cudaMalloc(T** p, size_t n) {
-    *p = reinterpret_cast<T*>(sycl::malloc_device(n, dpct::get_in_order_queue()));
-    return *p ? cudaSuccess : 1;
-}
-inline cudaError_t cudaMalloc(void** p, size_t n) {
-    *p = sycl::malloc_device(n, dpct::get_in_order_queue());
-    return *p ? cudaSuccess : 1;
+    void* v = strata::malloc_device_guarded(n, dpct::get_in_order_queue(), "dsv41 device buffer");
+    *p = reinterpret_cast<T*>(v);
+    if (v == nullptr) return cudaErrorMemoryAllocation;
+    std::lock_guard<std::mutex> lk(ds4_shim::st().mu);
+    const unsigned d = ds4_shim::cur_dev();
+    ds4_shim::st().dev_allocs[v] = {d, n};
+    ds4_shim::st().dev_used[d] += n;
+    return cudaSuccess;
 }
 inline cudaError_t cudaFree(void* p) {
-    if (p) sycl::free(p, dpct::get_in_order_queue());
+    if (p == nullptr) return cudaSuccess;
+    ds4_shim::wait_queues(true);
+    {
+        std::lock_guard<std::mutex> lk(ds4_shim::st().mu);
+        auto it = ds4_shim::st().dev_allocs.find(p);
+        if (it != ds4_shim::st().dev_allocs.end()) {
+            ds4_shim::st().dev_used[it->second.first] -= it->second.second;
+            ds4_shim::st().dev_allocs.erase(it);
+        }
+    }
+    strata::device_alloc_unregister(p);
+    sycl::free(p, dpct::get_in_order_queue());
     return cudaSuccess;
 }
-inline cudaError_t cudaHostAlloc(void** p, size_t n, unsigned int = 0) {
-    *p = sycl::malloc_host(n, dpct::get_in_order_queue());
-    return *p ? cudaSuccess : 1;
+// cudaHostAllocMapped: memory a running kernel polls for the host's stores (the decode rings, the CPU lane's rows), from
+// strata::host_malloc_polled as in the main engine (docs/INTEL.md, "Host-mapped flags")
+inline cudaError_t cudaHostAlloc(void** p, size_t n, unsigned int flags = 0) {
+    auto& q = dpct::get_in_order_queue();
+    *p = (flags & cudaHostAllocMapped) ? strata::host_malloc_polled(n, q) : sycl::malloc_host(n, q);
+    return *p ? cudaSuccess : cudaErrorMemoryAllocation;
 }
 inline cudaError_t cudaFreeHost(void* p) {
-    if (p) sycl::free(p, dpct::get_in_order_queue());
+    if (p == nullptr) return cudaSuccess;
+    ds4_shim::wait_queues(true);
+    strata::host_free_polled(p, dpct::get_in_order_queue());   // (either kind: it frees ordinary host USM too)
     return cudaSuccess;
 }
+// Only USM is visible to the device: an ordinary host pointer handed to a kernel page-faults on xe.
 inline cudaError_t cudaHostGetDevicePointer(void** pDev, void* pHost, unsigned int = 0) {
+    const auto t = sycl::get_pointer_type(pHost, dpct::get_in_order_queue().get_context());
+    if (t == sycl::usm::alloc::unknown) {
+        *pDev = nullptr;
+        return cudaErrorInvalidValue;
+    }
     *pDev = pHost;
     return cudaSuccess;
 }
-inline cudaError_t cudaHostRegister(void*, size_t, unsigned int = 0) {
+// Mapping ordinary (mmap'd) memory into the device is not available here: cudaHostRegisterMapped fails, so the callers fall back
+// (DS4_STORE_ZC keeps the CPU lane).  A plain registration is remembered: CUDA copies from it asynchronously (the memory outlives
+// the copy), where unregistered host memory is copied synchronously (ds4_shim::pageable).
+inline cudaError_t cudaHostRegister(void* p, size_t n, unsigned int flags = 0) {
+    if (flags & cudaHostRegisterMapped) return cudaErrorNotSupported;
+    std::lock_guard<std::mutex> lk(ds4_shim::st().mu);
+    ds4_shim::st().registered[(const char*) p] = n;
     return cudaSuccess;
 }
-inline cudaError_t cudaHostUnregister(void*) {
+inline cudaError_t cudaHostUnregister(void* p) {
+    std::lock_guard<std::mutex> lk(ds4_shim::st().mu);
+    ds4_shim::st().registered.erase((const char*) p);
     return cudaSuccess;
 }
 
@@ -500,34 +591,44 @@ inline cudaError_t cudaMemcpy(void* dst, const void* src, size_t n, cudaMemcpyKi
     q.memcpy(dst, src, n).wait();
     return cudaSuccess;
 }
+// CUDA: an async copy to or from pageable host memory returns once the host side is no longer needed - a temporary may be
+// reused or freed right after (the RAM store's table, ds4_model 4752).  SYCL's copy reads it later, so those wait.
 inline cudaError_t cudaMemcpyAsync(void* dst, const void* src, size_t n, cudaMemcpyKind, cudaStream_t s = nullptr) {
     auto q = strata::q_of(s);
-    q->memcpy(dst, src, n);
+    sycl::event e = q->memcpy(dst, src, n);
+    const sycl::context ctx = q->get_context();
+    if (ds4_shim::pageable(src, ctx) || ds4_shim::pageable(dst, ctx)) e.wait();
     return cudaSuccess;
 }
 inline cudaError_t cudaMemset(void* p, int v, size_t n) {
     auto& q = dpct::get_in_order_queue();
-    q.memset(p, v, n).wait();
+    if (v == 0 && n > ds4_shim::kBigFill) strata::big_fill_zero(q, p, n);
+    else q.memset(p, v, n).wait();
     return cudaSuccess;
 }
 inline cudaError_t cudaMemsetAsync(void* p, int v, size_t n, cudaStream_t s = nullptr) {
     auto q = strata::q_of(s);
-    q->memset(p, v, n);
+    if (v == 0 && n > ds4_shim::kBigFill) strata::big_fill_zero(*q, p, n);   // (waits: compute kernels, not one huge blit)
+    else q->memset(p, v, n);
     return cudaSuccess;
+}
+inline sycl::event ds4_copy2d(sycl::queue& q, void* dst, size_t dpitch, const void* src, size_t spitch, size_t width, size_t height) {
+    if (dpitch == width && spitch == width) return q.memcpy(dst, src, width * height);   // (one contiguous copy)
+    sycl::event e;
+    for (size_t r = 0; r < height; ++r) e = q.memcpy((char*) dst + r * dpitch, (const char*) src + r * spitch, width);
+    return e;
 }
 inline cudaError_t cudaMemcpy2D(void* dst, size_t dpitch, const void* src, size_t spitch, size_t width, size_t height, cudaMemcpyKind) {
     auto& q = dpct::get_in_order_queue();
-    for (size_t r = 0; r < height; ++r) {
-        q.memcpy((char*) dst + r * dpitch, (const char*) src + r * spitch, width);
-    }
+    ds4_copy2d(q, dst, dpitch, src, spitch, width, height);
     q.wait();
     return cudaSuccess;
 }
 inline cudaError_t cudaMemcpy2DAsync(void* dst, size_t dpitch, const void* src, size_t spitch, size_t width, size_t height, cudaMemcpyKind, cudaStream_t s = nullptr) {
     auto q = strata::q_of(s);
-    for (size_t r = 0; r < height; ++r) {
-        q->memcpy((char*) dst + r * dpitch, (const char*) src + r * spitch, width);
-    }
+    sycl::event e = ds4_copy2d(*q, dst, dpitch, src, spitch, width, height);
+    const sycl::context ctx = q->get_context();
+    if (height > 0 && (ds4_shim::pageable(src, ctx) || ds4_shim::pageable(dst, ctx))) e.wait();   // (in order: the last row's)
     return cudaSuccess;
 }
 
@@ -535,21 +636,31 @@ inline cudaError_t cudaStreamCreateWithFlags(cudaStream_t* s, unsigned int) {
     auto ctx = dpct::get_current_device().get_context();
     sycl::device dev = dpct::get_current_device();
     *s = new sycl::queue(ctx, dev, sycl::property::queue::in_order());
+    std::lock_guard<std::mutex> lk(ds4_shim::st().mu);
+    ds4_shim::st().queues.push_back(*s);
     return cudaSuccess;
 }
 inline cudaError_t cudaStreamDestroy(cudaStream_t s) {
-    if (s && s != &dpct::get_in_order_queue()) delete s;
+    if (s && s != &dpct::get_in_order_queue()) {
+        {
+            std::lock_guard<std::mutex> lk(ds4_shim::st().mu);
+            auto& v = ds4_shim::st().queues;
+            v.erase(std::remove(v.begin(), v.end(), s), v.end());
+        }
+        s->wait();
+        delete s;
+    }
     return cudaSuccess;
 }
 inline cudaError_t cudaStreamSynchronize(cudaStream_t s) {
     strata::q_of(s)->wait();
     return cudaSuccess;
 }
-inline cudaError_t cudaStreamQuery(cudaStream_t) {
-    return cudaSuccess;
+inline cudaError_t cudaStreamQuery(cudaStream_t s) {
+    return strata::q_of(s)->ext_oneapi_empty() ? cudaSuccess : cudaErrorNotReady;
 }
 inline cudaError_t cudaDeviceSynchronize() {
-    dpct::get_current_device().queues_wait_and_throw();
+    ds4_shim::wait_queues(false);
     return cudaSuccess;
 }
 
@@ -599,9 +710,29 @@ inline cudaError_t cudaDeviceGetAttribute(int* val, cudaDeviceAttr attr, int dev
     else *val = 0;
     return cudaSuccess;
 }
+// The device's own free-memory figure where the runtime has it (ext_intel_free_memory; Level Zero needs ZES_ENABLE_SYSMAN=1,
+// which ds4_main sets), never more than the card's size less what this process's cudaMalloc holds, less a margin for what is not
+// counted (the runtime, the kernels, oneMKL's scratch).  The engine sizes its expert slots from this, then takes --reserve-mib off.
 inline cudaError_t cudaMemGetInfo(size_t* free_bytes, size_t* total_bytes) {
-    *total_bytes = 32ULL * 1024 * 1024 * 1024;
-    *free_bytes = 28ULL * 1024 * 1024 * 1024;
+    constexpr size_t kMargin = (size_t) 512 << 20;
+    auto& dev = dpct::get_current_device();
+    const size_t total = dev.get_global_mem_size();
+    size_t used = 0;
+    {
+        std::lock_guard<std::mutex> lk(ds4_shim::st().mu);
+        auto it = ds4_shim::st().dev_used.find(ds4_shim::cur_dev());
+        if (it != ds4_shim::st().dev_used.end()) used = it->second;
+    }
+    size_t fr = total > used ? total - used : 0;
+    try {
+        if (dev.has(sycl::aspect::ext_intel_free_memory)) {
+            const size_t q = dev.get_info<sycl::ext::intel::info::device::free_memory>();
+            if (q > 0) fr = std::min(fr, q);   // (0: the driver does not know - keep the count)
+        }
+    } catch (...) {
+    }
+    *total_bytes = total;
+    *free_bytes = fr > kMargin ? fr - kMargin : 0;
     return cudaSuccess;
 }
 
@@ -620,14 +751,6 @@ inline cudaError_t cudaStreamIsCapturing(cudaStream_t, cudaStreamCaptureStatus* 
     *status = cudaStreamCaptureStatusNone;
     return cudaSuccess;
 }
-
-constexpr unsigned int cudaHostAllocDefault = 0;
-constexpr unsigned int cudaHostAllocPortable = 1;
-constexpr unsigned int cudaHostAllocMapped = 2;
-constexpr unsigned int cudaHostRegisterPortable = 1;
-constexpr unsigned int cudaHostRegisterMapped = 2;
-constexpr unsigned int cudaStreamNonBlocking = 1;
-constexpr unsigned int cudaEventDisableTiming = 2;
 
 #ifndef __global__
 #define __global__
