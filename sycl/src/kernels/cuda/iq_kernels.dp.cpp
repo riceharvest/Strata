@@ -147,13 +147,62 @@ __dpct_inline__ int swar_ne4(unsigned x) { return dpct::vectorized_binary<sycl::
 __dpct_inline__ int swar_sub4(unsigned a, unsigned s) { return dpct::vectorized_binary<sycl::uchar4>(a, s, std::minus<>()); }
 #endif
 
+// SYCL port: the IQ4_NL codebook in registers and its 2-byte-aligned weights as aligned loads. ggml reads 4 uint32 of
+// the codebook from global memory per lookup and each weight int as two 16-bit loads (block_iq4_nl is 18 bytes, its
+// qs 2-byte aligned); the expert down projection (IQ4_NL in 39 of 48 layers) was the largest expert kernel. Same ints
+// out, so the dots are bitwise unchanged.
+__dpct_inline__ uint32_t iq4nl_lut4(uint32_t q4) {   // four nibbles -> four kvalues_iq4nl bytes
+    constexpr uint32_t t0 = 0xBFAD9881u, t1 = 0xF6EADDCFu, t2 = 0x26190D01u, t3 = 0x71594535u;
+    uint32_t r = 0;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const uint32_t n = (q4 >> (8 * i)) & 0xF;
+        const uint32_t t = n < 4 ? t0 : n < 8 ? t1 : n < 12 ? t2 : t3;
+        r |= ((t >> (8 * (n & 3))) & 0xFF) << (8 * i);
+    }
+    return r;
+}
+__dpct_inline__ sycl::int2 iq4nl_pair(int aux) {   // = get_int_from_table_16(aux)
+    return sycl::int2((int) iq4nl_lut4((uint32_t) aux & 0x0f0f0f0fu), (int) iq4nl_lut4(((uint32_t) aux >> 4) & 0x0f0f0f0fu));
+}
+__dpct_inline__ sycl::int2 load8_a2(const uint8_t* p) {   // 8 bytes at a 2-byte-aligned address, as two ints
+    const uintptr_t a = reinterpret_cast<uintptr_t>(p);
+    const uint32_t* q = reinterpret_cast<const uint32_t*>(a & ~uintptr_t(3));
+    const uint32_t w0 = q[0], w1 = q[1];
+    if (!(a & 2)) return sycl::int2((int) w0, (int) w1);
+    const uint32_t w2 = q[2];   // only when unaligned: it then holds needed bytes, so it cannot cross a page
+    return sycl::int2((int) ((w0 >> 16) | (w1 << 16)), (int) ((w1 >> 16) | (w2 << 16)));
+}
+__dpct_inline__ int load4_a2(const uint8_t* p) {   // 4 bytes at a 2-byte-aligned address (= get_int_b2)
+    const uintptr_t a = reinterpret_cast<uintptr_t>(p);
+    const uint32_t* q = reinterpret_cast<const uint32_t*>(a & ~uintptr_t(3));
+    const uint32_t w0 = q[0];
+    if (!(a & 2)) return (int) w0;
+    return (int) ((w0 >> 16) | (q[1] << 16));   // the second word holds needed bytes: page-safe
+}
+// SYCL port: the gate/up kernels can stage their format's codebook grid in local memory (STRATA_GRID_SLM=1, compile
+// time). Measured slower and off: copying the grid into each of ~1,200 work-groups per call costs more than the
+// lookups save (IQ2_S 52.5 -> 62.7 us, IQ3_S 60.8 -> 70.0, IQ3_XXS 60.3 -> 62.1 per call; unitrace 2026-10-01).
+#ifndef STRATA_GRID_SLM
+#define STRATA_GRID_SLM 0
+#endif
+#ifndef STRATA_IQ4NL_FAST
+#define STRATA_IQ4NL_FAST 1   // compile-time: -DSTRATA_IQ4NL_FAST=0 for ggml's table/16-bit-load path
+#endif
+
 __dpct_inline__ float vec_dot_iq2_xxs_q8_1(const void *__restrict__ vbq,
                                            const block_q8_1 *__restrict__ bq8_1,
                                            const int &kbx, const int &iqs) {
     const block_iq2_xxs* bq2 = (const block_iq2_xxs*) vbq + kbx;
+#if STRATA_IQ4NL_FAST
+    const sycl::int2 qa = load8_a2((const uint8_t*) bq2->qs + 4 * iqs);
+    const int q2 = qa.x();
+    const uint32_t aux32 = (uint32_t) qa.y();
+#else
     const int q2 = get_int_b2(bq2->qs, iqs);
-    const uint8_t* aux8 = (const uint8_t*) &q2;
     const uint32_t aux32 = get_int_b2(bq2->qs, iqs + 1);
+#endif
+    const uint8_t* aux8 = (const uint8_t*) &q2;
     int sumi = 0;
 #pragma unroll
     for (int k0 = 0; k0 < 8; k0 += 2) {
@@ -184,7 +233,12 @@ __dpct_inline__ float vec_dot_iq2_xs_q8_1(const void *__restrict__ vbq,
     // SYCL port: the four 16-bit codes by shifts. ggml reads them through a uint16_t* to an int2, which is type
     // punning the SYCL device compiler does not honour (non-char aliasing): IQ2_XS products came out garbage
     // (iq_multi_parity, Swift 1.5 IQ2_XS) while the dequantizer, reading the codes directly, was exact.
+#if STRATA_IQ4NL_FAST
+    const sycl::int2 qq = load8_a2((const uint8_t*) bq2->qs + 4 * iqs);
+    const uint32_t q2_lo = (uint32_t) qq.x(), q2_hi = (uint32_t) qq.y();
+#else
     const uint32_t q2_lo = (uint32_t) get_int_b2(bq2->qs, iqs + 0), q2_hi = (uint32_t) get_int_b2(bq2->qs, iqs + 1);
+#endif
     const uint16_t q2[4] = {(uint16_t) q2_lo, (uint16_t) (q2_lo >> 16), (uint16_t) q2_hi, (uint16_t) (q2_hi >> 16)};
     const int ls0 = bq2->scales[iqs / 2] & 0x0F;
     const int ls1 = bq2->scales[iqs / 2] >> 4;
@@ -219,10 +273,15 @@ __dpct_inline__ float vec_dot_iq2_s_q8_1(const void *__restrict__ vbq,
                                          const block_q8_1 *__restrict__ bq8_1,
                                          const int &kbx, const int &iqs) {
     const block_iq2_s* bq2 = (const block_iq2_s*) vbq + kbx;
+#if STRATA_IQ4NL_FAST
+    const int qs_packed = load4_a2(bq2->qs + 4 * (iqs / 2));
+    const int signs_packed_32 = load4_a2(bq2->qs + 4 * (QK_K / 32 + iqs / 2));
+#else
     const int qs_packed = get_int_b2(bq2->qs, iqs / 2);
+    const int signs_packed_32 = get_int_b2(bq2->qs, QK_K / 32 + iqs / 2);
+#endif
     const uint8_t* qs = (const uint8_t*) &qs_packed;
     const int qh = bq2->qh[iqs / 2];
-    const int signs_packed_32 = get_int_b2(bq2->qs, QK_K / 32 + iqs / 2);
     const uint8_t* signs_packed_8 = (const uint8_t*) &signs_packed_32;
     const int ls0 = bq2->scales[iqs / 2] & 0x0F;
     const int ls1 = bq2->scales[iqs / 2] >> 4;
@@ -257,10 +316,15 @@ __dpct_inline__ float vec_dot_iq3_xxs_q8_1(const void *__restrict__ vbq,
                                            const block_q8_1 *__restrict__ bq8_1,
                                            const int &kbx, const int &iqs) {
     const block_iq3_xxs* bq3 = (const block_iq3_xxs*) vbq + kbx;
+#if STRATA_IQ4NL_FAST
+    const sycl::int2 q3_packed = load8_a2(bq3->qs + 4 * iqs);
+    const uint32_t aux32 = (uint32_t) load4_a2(bq3->qs + 4 * (QK_K / 16 + iqs / 2));
+#else
     const sycl::int2 q3_packed =
         sycl::int2(get_int_b2(bq3->qs, iqs), get_int_b2(bq3->qs, iqs + 1));
-    const uint8_t* q3 = (const uint8_t*) &q3_packed;
     const uint32_t aux32 = get_int_b2(bq3->qs, QK_K / 16 + iqs / 2);
+#endif
+    const uint8_t* q3 = (const uint8_t*) &q3_packed;
     int sumi = 0;
 #pragma unroll
     for (int l0 = 0; l0 < 8; l0 += 2) {
@@ -288,11 +352,16 @@ __dpct_inline__ float vec_dot_iq3_s_q8_1(const void *__restrict__ vbq,
                                          const block_q8_1 *__restrict__ bq8_1,
                                          const int &kbx, const int &iqs) {
     const block_iq3_s* bq3 = (const block_iq3_s*) vbq + kbx;
+#if STRATA_IQ4NL_FAST
+    const sycl::int2 qs_packed = load8_a2(bq3->qs + 4 * iqs);
+    const int signs_packed_32 = load4_a2(bq3->signs + 4 * (iqs / 2));
+#else
     const sycl::int2 qs_packed =
         sycl::int2(get_int_b2(bq3->qs, iqs + 0), get_int_b2(bq3->qs, iqs + 1));
+    const int signs_packed_32 = get_int_b2(bq3->signs, iqs / 2);
+#endif
     const uint8_t* qs = (const uint8_t*) &qs_packed;
     const int qh = bq3->qh[iqs / 2];
-    const int signs_packed_32 = get_int_b2(bq3->signs, iqs / 2);
     const uint8_t* signs_packed_8 = (const uint8_t*) &signs_packed_32;
     int sumi = 0;
 #pragma unroll
@@ -354,49 +423,6 @@ __dpct_inline__ float vec_dot_iq1_m_q8_1(const void *__restrict__ vbq,
     return d * ((sumi[0] + sumf[0]) * sc0 + (sumi[1] + sumf[1]) * sc1);
 }
 
-// SYCL port: the IQ4_NL codebook in registers and its 2-byte-aligned weights as aligned loads. ggml reads 4 uint32 of
-// the codebook from global memory per lookup and each weight int as two 16-bit loads (block_iq4_nl is 18 bytes, its
-// qs 2-byte aligned); the expert down projection (IQ4_NL in 39 of 48 layers) was the largest expert kernel. Same ints
-// out, so the dots are bitwise unchanged.
-__dpct_inline__ uint32_t iq4nl_lut4(uint32_t q4) {   // four nibbles -> four kvalues_iq4nl bytes
-    constexpr uint32_t t0 = 0xBFAD9881u, t1 = 0xF6EADDCFu, t2 = 0x26190D01u, t3 = 0x71594535u;
-    uint32_t r = 0;
-#pragma unroll
-    for (int i = 0; i < 4; ++i) {
-        const uint32_t n = (q4 >> (8 * i)) & 0xF;
-        const uint32_t t = n < 4 ? t0 : n < 8 ? t1 : n < 12 ? t2 : t3;
-        r |= ((t >> (8 * (n & 3))) & 0xFF) << (8 * i);
-    }
-    return r;
-}
-__dpct_inline__ sycl::int2 iq4nl_pair(int aux) {   // = get_int_from_table_16(aux)
-    return sycl::int2((int) iq4nl_lut4((uint32_t) aux & 0x0f0f0f0fu), (int) iq4nl_lut4(((uint32_t) aux >> 4) & 0x0f0f0f0fu));
-}
-__dpct_inline__ sycl::int2 load8_a2(const uint8_t* p) {   // 8 bytes at a 2-byte-aligned address, as two ints
-    const uintptr_t a = reinterpret_cast<uintptr_t>(p);
-    const uint32_t* q = reinterpret_cast<const uint32_t*>(a & ~uintptr_t(3));
-    const uint32_t w0 = q[0], w1 = q[1];
-    if (!(a & 2)) return sycl::int2((int) w0, (int) w1);
-    const uint32_t w2 = q[2];   // only when unaligned: it then holds needed bytes, so it cannot cross a page
-    return sycl::int2((int) ((w0 >> 16) | (w1 << 16)), (int) ((w1 >> 16) | (w2 << 16)));
-}
-__dpct_inline__ int load4_a2(const uint8_t* p) {   // 4 bytes at a 2-byte-aligned address (= get_int_b2)
-    const uintptr_t a = reinterpret_cast<uintptr_t>(p);
-    const uint32_t* q = reinterpret_cast<const uint32_t*>(a & ~uintptr_t(3));
-    const uint32_t w0 = q[0];
-    if (!(a & 2)) return (int) w0;
-    return (int) ((w0 >> 16) | (q[1] << 16));   // the second word holds needed bytes: page-safe
-}
-// SYCL port: the gate/up kernels can stage their format's codebook grid in local memory (STRATA_GRID_SLM=1, compile
-// time). Measured slower and off: copying the grid into each of ~1,200 work-groups per call costs more than the
-// lookups save (IQ2_S 52.5 -> 62.7 us, IQ3_S 60.8 -> 70.0, IQ3_XXS 60.3 -> 62.1 per call; unitrace 2026-10-01).
-#ifndef STRATA_GRID_SLM
-#define STRATA_GRID_SLM 0
-#endif
-#ifndef STRATA_IQ4NL_FAST
-#define STRATA_IQ4NL_FAST 1   // compile-time: -DSTRATA_IQ4NL_FAST=0 for ggml's table/16-bit-load path
-#endif
-
 __dpct_inline__ float vec_dot_iq4_nl_q8_1(const void *__restrict__ vbq,
                                           const block_q8_1 *__restrict__ bq8_1,
                                           const int &kbx, const int &iqs) {
@@ -434,7 +460,11 @@ __dpct_inline__ float vec_dot_iq4_xs_q8_1(const void *__restrict__ vbq,
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
         const int aux_q4 = get_int_b4(bq4->qs, iqs + j);
+#if STRATA_IQ4NL_FAST
+        const sycl::int2 v = iq4nl_pair(aux_q4);
+#else
         const sycl::int2 v = get_int_from_table_16(aux_q4, kvalues_iq4nl);
+#endif
         const int u0 = get_int_b4(bq8_1[iqs / 4].qs, j + 0);
         const int u1 = get_int_b4(bq8_1[iqs / 4].qs, j + 4);
         sumi = ggml_cuda_dp4a(v.x(), u0, sumi);
@@ -966,9 +996,15 @@ template<> struct Split<16> {   // IQ2_XXS
     template<bool STAGE_GRID = false>
     static W load(const void* __restrict__ vbq, int kbx, int iqs, const uint32_t* __restrict__ s_grid = nullptr) {
         const block_iq2_xxs* bq2 = (const block_iq2_xxs*) vbq + kbx;
+#if STRATA_IQ4NL_FAST
+        const sycl::int2 qa = load8_a2((const uint8_t*) bq2->qs + 4 * iqs);
+        const int q2 = qa.x();
+        const uint32_t aux32 = (uint32_t) qa.y();
+#else
         const int q2 = get_int_b2(bq2->qs, iqs);
-        const uint8_t* aux8 = (const uint8_t*) &q2;
         const uint32_t aux32 = get_int_b2(bq2->qs, iqs + 1);
+#endif
+        const uint8_t* aux8 = (const uint8_t*) &q2;
         const sycl::uint2 *grid_lut;
         if constexpr (STAGE_GRID) grid_lut = (const sycl::uint2 *)s_grid;
         else grid_lut = (const sycl::uint2 *)iq2xxs_grid;
@@ -977,14 +1013,10 @@ template<> struct Split<16> {   // IQ2_XXS
         for (int k0 = 0; k0 < 8; k0 += 2) {
             const sycl::uint2 grid_pos = grid_lut[aux8[k0 / 2]];
             const uint32_t signs = unpack_ksigns(aux32 >> (7 * k0 / 2));
-            const int signs0 = dpct::vectorized_binary<sycl::uchar4>(
-                signs & 0x08040201, 0, std::not_equal_to<>());
-            r.g[k0 + 0] = dpct::vectorized_binary<sycl::uchar4>(
-                grid_pos.x() ^ signs0, signs0, std::minus<>());
-            const int signs1 = dpct::vectorized_binary<sycl::uchar4>(
-                signs & 0x80402010, 0, std::not_equal_to<>());
-            r.g[k0 + 1] = dpct::vectorized_binary<sycl::uchar4>(
-                grid_pos.y() ^ signs1, signs1, std::minus<>());
+            const int signs0 = swar_ne4(signs & 0x08040201);
+            r.g[k0 + 0] = swar_sub4(grid_pos.x() ^ signs0, signs0);
+            const int signs1 = swar_ne4(signs & 0x80402010);
+            r.g[k0 + 1] = swar_sub4(grid_pos.y() ^ signs1, signs1);
         }
         r.ls = aux32 >> 27 | 1;
         r.dw = sycl::vec<sycl::half, 1>(bq2->d)
@@ -1020,7 +1052,12 @@ template<> struct Split<17> : SplitLs2 {   // IQ2_XS
     static W load(const void* __restrict__ vbq, int kbx, int iqs, const uint32_t* __restrict__ s_grid = nullptr) {
         const block_iq2_xs* bq2 = (const block_iq2_xs*) vbq + kbx;
         // SYCL port: the codes by shifts, not through a uint16_t* to an int2 (see vec_dot_iq2_xs_q8_1)
+#if STRATA_IQ4NL_FAST
+        const sycl::int2 qq = load8_a2((const uint8_t*) bq2->qs + 4 * iqs);
+        const uint32_t q2_lo = (uint32_t) qq.x(), q2_hi = (uint32_t) qq.y();
+#else
         const uint32_t q2_lo = (uint32_t) get_int_b2(bq2->qs, iqs + 0), q2_hi = (uint32_t) get_int_b2(bq2->qs, iqs + 1);
+#endif
         const uint16_t q2[4] = {(uint16_t) q2_lo, (uint16_t) (q2_lo >> 16), (uint16_t) q2_hi, (uint16_t) (q2_hi >> 16)};
         const sycl::uint2 *grid_lut;
         if constexpr (STAGE_GRID) grid_lut = (const sycl::uint2 *)s_grid;
@@ -1032,14 +1069,10 @@ template<> struct Split<17> : SplitLs2 {   // IQ2_XS
         for (int l0 = 0; l0 < 8; l0 += 2) {
             const sycl::uint2 grid_pos = grid_lut[q2[l0 / 2] & 0x1FF];
             const uint32_t signs = unpack_ksigns(q2[l0 / 2] >> 9);
-            const int signs0 = dpct::vectorized_binary<sycl::uchar4>(
-                signs & 0x08040201, 0, std::not_equal_to<>());
-            r.g[l0 + 0] = dpct::vectorized_binary<sycl::uchar4>(
-                grid_pos.x() ^ signs0, signs0, std::minus<>());
-            const int signs1 = dpct::vectorized_binary<sycl::uchar4>(
-                signs & 0x80402010, 0, std::not_equal_to<>());
-            r.g[l0 + 1] = dpct::vectorized_binary<sycl::uchar4>(
-                grid_pos.y() ^ signs1, signs1, std::minus<>());
+            const int signs0 = swar_ne4(signs & 0x08040201);
+            r.g[l0 + 0] = swar_sub4(grid_pos.x() ^ signs0, signs0);
+            const int signs1 = swar_ne4(signs & 0x80402010);
+            r.g[l0 + 1] = swar_sub4(grid_pos.y() ^ signs1, signs1);
         }
         r.dw = sycl::vec<sycl::half, 1>(bq2->d)
                    .convert<float, sycl::rounding_mode::automatic>()[0];
@@ -1051,10 +1084,15 @@ template<> struct Split<22> : SplitLs2 {   // IQ2_S
     template<bool STAGE_GRID = false>
     static W load(const void* __restrict__ vbq, int kbx, int iqs, const uint32_t* __restrict__ s_grid = nullptr) {
         const block_iq2_s* bq2 = (const block_iq2_s*) vbq + kbx;
+#if STRATA_IQ4NL_FAST
+        const int qs_packed = load4_a2(bq2->qs + 4 * (iqs / 2));
+        const int signs_packed_32 = load4_a2(bq2->qs + 4 * (QK_K / 32 + iqs / 2));
+#else
         const int qs_packed = get_int_b2(bq2->qs, iqs / 2);
+        const int signs_packed_32 = get_int_b2(bq2->qs, QK_K / 32 + iqs / 2);
+#endif
         const uint8_t* qs = (const uint8_t*) &qs_packed;
         const int qh = bq2->qh[iqs / 2];
-        const int signs_packed_32 = get_int_b2(bq2->qs, QK_K / 32 + iqs / 2);
         const uint8_t* signs_packed_8 = (const uint8_t*) &signs_packed_32;
         const uint64_t* grid_lut;
         if constexpr (STAGE_GRID) grid_lut = (const uint64_t*) s_grid;
@@ -1065,18 +1103,14 @@ template<> struct Split<22> : SplitLs2 {   // IQ2_S
 #pragma unroll
         for (int l0 = 0; l0 < 8; l0 += 2) {
             const int* grid_pos = (const int*) (grid_lut + (qs[l0 / 2] | ((qh << (8 - l0)) & 0x300)));
-            const int signs0 = dpct::vectorized_binary<sycl::uchar4>(
+            const int signs0 = swar_ne4(
                 ((signs_packed_8[l0 / 2] & 0x03) << 7) |
-                    ((signs_packed_8[l0 / 2] & 0x0C) << 21),
-                0x00000000, std::not_equal_to<>());
-            const int signs1 = dpct::vectorized_binary<sycl::uchar4>(
+                ((signs_packed_8[l0 / 2] & 0x0C) << 21));
+            const int signs1 = swar_ne4(
                 ((signs_packed_8[l0 / 2] & 0x30) << 3) |
-                    ((signs_packed_8[l0 / 2] & 0xC0) << 17),
-                0x00000000, std::not_equal_to<>());
-            r.g[l0 + 0] = dpct::vectorized_binary<sycl::uchar4>(
-                grid_pos[0] ^ signs0, signs0, std::minus<>());
-            r.g[l0 + 1] = dpct::vectorized_binary<sycl::uchar4>(
-                grid_pos[1] ^ signs1, signs1, std::minus<>());
+                ((signs_packed_8[l0 / 2] & 0xC0) << 17));
+            r.g[l0 + 0] = swar_sub4(grid_pos[0] ^ signs0, signs0);
+            r.g[l0 + 1] = swar_sub4(grid_pos[1] ^ signs1, signs1);
         }
         r.dw = sycl::vec<sycl::half, 1>(bq2->d)
                    .convert<float, sycl::rounding_mode::automatic>()[0];
@@ -1089,24 +1123,25 @@ template<> struct Split<18> {   // IQ3_XXS
     template<bool STAGE_GRID = false>
     static W load(const void* __restrict__ vbq, int kbx, int iqs, const uint32_t* __restrict__ = nullptr) {
         const block_iq3_xxs* bq3 = (const block_iq3_xxs*) vbq + kbx;
+#if STRATA_IQ4NL_FAST
+        const sycl::int2 q3_packed = load8_a2(bq3->qs + 4 * iqs);
+        const uint32_t aux32 = (uint32_t) load4_a2(bq3->qs + 4 * (QK_K / 16 + iqs / 2));
+#else
         const sycl::int2 q3_packed =
             sycl::int2(get_int_b2(bq3->qs, iqs), get_int_b2(bq3->qs, iqs + 1));
-        const uint8_t* q3 = (const uint8_t*) &q3_packed;
         const uint32_t aux32 = get_int_b2(bq3->qs, QK_K / 16 + iqs / 2);
+#endif
+        const uint8_t* q3 = (const uint8_t*) &q3_packed;
         W r;
 #pragma unroll
         for (int l0 = 0; l0 < 8; l0 += 2) {
             const sycl::int2 grid_pos =
                 sycl::int2(iq3xxs_grid[q3[l0 + 0]], iq3xxs_grid[q3[l0 + 1]]);
             const uint32_t signs = unpack_ksigns(aux32 >> (7 * l0 / 2));
-            const int signs0 = dpct::vectorized_binary<sycl::uchar4>(
-                signs & 0x08040201, 0, std::not_equal_to<>());
-            r.g[l0 + 0] = dpct::vectorized_binary<sycl::uchar4>(
-                grid_pos.x() ^ signs0, signs0, std::minus<>());
-            const int signs1 = dpct::vectorized_binary<sycl::uchar4>(
-                signs & 0x80402010, 0, std::not_equal_to<>());
-            r.g[l0 + 1] = dpct::vectorized_binary<sycl::uchar4>(
-                grid_pos.y() ^ signs1, signs1, std::minus<>());
+            const int signs0 = swar_ne4(signs & 0x08040201);
+            r.g[l0 + 0] = swar_sub4(grid_pos.x() ^ signs0, signs0);
+            const int signs1 = swar_ne4(signs & 0x80402010);
+            r.g[l0 + 1] = swar_sub4(grid_pos.y() ^ signs1, signs1);
         }
         r.ls = aux32 >> 28;
         r.dw = sycl::vec<sycl::half, 1>(bq3->d)
@@ -1128,11 +1163,16 @@ template<> struct Split<21> {   // IQ3_S
     template<bool STAGE_GRID = false>
     static W load(const void* __restrict__ vbq, int kbx, int iqs, const uint32_t* __restrict__ = nullptr) {
         const block_iq3_s* bq3 = (const block_iq3_s*) vbq + kbx;
+#if STRATA_IQ4NL_FAST
+        const sycl::int2 qs_packed = load8_a2(bq3->qs + 4 * iqs);
+        const int signs_packed_32 = load4_a2(bq3->signs + 4 * (iqs / 2));
+#else
         const sycl::int2 qs_packed = sycl::int2(get_int_b2(bq3->qs, iqs + 0),
                                                 get_int_b2(bq3->qs, iqs + 1));
+        const int signs_packed_32 = get_int_b2(bq3->signs, iqs / 2);
+#endif
         const uint8_t* qs = (const uint8_t*) &qs_packed;
         const int qh = bq3->qh[iqs / 2];
-        const int signs_packed_32 = get_int_b2(bq3->signs, iqs / 2);
         const uint8_t* signs_packed_8 = (const uint8_t*) &signs_packed_32;
         W r;
 #pragma unroll
@@ -1140,18 +1180,14 @@ template<> struct Split<21> {   // IQ3_S
             const sycl::int2 grid_pos =
                 sycl::int2(iq3s_grid[qs[l0 + 0] | ((qh << (8 - l0)) & 0x100)],
                            iq3s_grid[qs[l0 + 1] | ((qh << (7 - l0)) & 0x100)]);
-            const int signs0 = dpct::vectorized_binary<sycl::uchar4>(
+            const int signs0 = swar_ne4(
                 ((signs_packed_8[l0 / 2] & 0x03) << 7) |
-                    ((signs_packed_8[l0 / 2] & 0x0C) << 21),
-                0x00000000, std::not_equal_to<>());
-            const int signs1 = dpct::vectorized_binary<sycl::uchar4>(
+                ((signs_packed_8[l0 / 2] & 0x0C) << 21));
+            const int signs1 = swar_ne4(
                 ((signs_packed_8[l0 / 2] & 0x30) << 3) |
-                    ((signs_packed_8[l0 / 2] & 0xC0) << 17),
-                0x00000000, std::not_equal_to<>());
-            r.g[l0 + 0] = dpct::vectorized_binary<sycl::uchar4>(
-                grid_pos.x() ^ signs0, signs0, std::minus<>());
-            r.g[l0 + 1] = dpct::vectorized_binary<sycl::uchar4>(
-                grid_pos.y() ^ signs1, signs1, std::minus<>());
+                ((signs_packed_8[l0 / 2] & 0xC0) << 17));
+            r.g[l0 + 0] = swar_sub4(grid_pos.x() ^ signs0, signs0);
+            r.g[l0 + 1] = swar_sub4(grid_pos.y() ^ signs1, signs1);
         }
         r.ls = 1 + 2 * ((bq3->scales[iqs / 4] >> ((iqs << 1) & 0x04)) & 0x0F);
         r.dw = sycl::vec<sycl::half, 1>(bq3->d)
@@ -1222,8 +1258,14 @@ template<> struct Split<20> {   // IQ4_NL
     static W load(const void* __restrict__ vbq, int kbx, int iqs, const uint32_t* __restrict__ = nullptr) {
         const block_iq4_nl* bq4 = (const block_iq4_nl*) vbq + kbx;
         W r;
+#if STRATA_IQ4NL_FAST
+        const sycl::int2 qq = load8_a2(bq4->qs + 4 * iqs);
+        r.v[0] = iq4nl_pair(qq.x());
+        r.v[1] = iq4nl_pair(qq.y());
+#else
 #pragma unroll
         for (int l = 0; l < 2; ++l) r.v[l] = iq4nl_pair(get_int_b2(bq4->qs, iqs + l));   // SYCL port: = get_int_from_table_16(q)
+#endif
         r.dw = sycl::vec<sycl::half, 1>(bq4->d)
                    .convert<float, sycl::rounding_mode::automatic>()[0];
         return r;
@@ -1693,6 +1735,109 @@ auto &s_grid_buf = *sycl::ext::oneapi::group_local_memory_for_overwrite<
 struct MultiW { int w[8]; int a = 0, b = 0; float d = 0.f; };
 
 template <int TY> struct Multi { static constexpr bool has = false; static constexpr int NW = 0; };
+
+template <> struct Multi<16> {   // iq2_xxs
+    static constexpr bool has = true; static constexpr int NW = 8;
+    __dpct_inline__ static void prep(const void* vbq, int kbx, int iqs, MultiW& m, const void* grid = nullptr) {
+        const block_iq2_xxs* bq2 = (const block_iq2_xxs*) vbq + kbx;
+#if STRATA_IQ4NL_FAST
+        const sycl::int2 qa = load8_a2((const uint8_t*) bq2->qs + 4 * iqs);
+        const int q2 = qa.x();
+        const uint32_t aux32 = (uint32_t) qa.y();
+#else
+        const int q2 = get_int_b2(bq2->qs, iqs);
+        const uint32_t aux32 = get_int_b2(bq2->qs, iqs + 1);
+#endif
+        const uint8_t* aux8 = (const uint8_t*) &q2;
+        const sycl::uint2* G = grid ? (const sycl::uint2*) grid : (const sycl::uint2*) iq2xxs_grid;
+#pragma unroll
+        for (int k0 = 0; k0 < 8; k0 += 2) {
+            const sycl::uint2 grid_pos = G[aux8[k0 / 2]];
+            const uint32_t signs = unpack_ksigns(aux32 >> (7 * k0 / 2));
+            const int signs0 = swar_ne4(signs & 0x08040201);
+            const int signs1 = swar_ne4(signs & 0x80402010);
+            m.w[k0 + 0] = swar_sub4(grid_pos.x() ^ signs0, signs0);
+            m.w[k0 + 1] = swar_sub4(grid_pos.y() ^ signs1, signs1);
+        }
+        m.a = (int) ((aux32 >> 27) | 1);
+        m.d = sycl::vec<sycl::half, 1>(bq2->d).convert<float, sycl::rounding_mode::automatic>()[0];
+    }
+    __dpct_inline__ static void acts(const block_q8_1* y, int iqs, int* u, float& ds) {
+#pragma unroll
+        for (int j = 0; j < 8; ++j) u[j] = get_int_b4(y[iqs / 2].qs, j);
+        ds = y[iqs / 2].ds[0];
+    }
+    __dpct_inline__ static float finish(int s0, int s1, const MultiW& m, float ds) {
+        return m.d * ds * (float) (((s0 + s1) * m.a) / 8);
+    }
+};
+
+template <> struct Multi<17> {   // iq2_xs
+    static constexpr bool has = true; static constexpr int NW = 8;
+    __dpct_inline__ static void prep(const void* vbq, int kbx, int iqs, MultiW& m, const void* grid = nullptr) {
+        const block_iq2_xs* bq2 = (const block_iq2_xs*) vbq + kbx;
+#if STRATA_IQ4NL_FAST
+        const sycl::int2 qq = load8_a2((const uint8_t*) bq2->qs + 4 * iqs);
+        const uint32_t q2_lo = (uint32_t) qq.x(), q2_hi = (uint32_t) qq.y();
+#else
+        const uint32_t q2_lo = (uint32_t) get_int_b2(bq2->qs, iqs + 0), q2_hi = (uint32_t) get_int_b2(bq2->qs, iqs + 1);
+#endif
+        const uint16_t q2[4] = {(uint16_t) q2_lo, (uint16_t) (q2_lo >> 16), (uint16_t) q2_hi, (uint16_t) (q2_hi >> 16)};
+        const sycl::uint2* G = grid ? (const sycl::uint2*) grid : (const sycl::uint2*) iq2xs_grid;
+#pragma unroll
+        for (int l0 = 0; l0 < 8; l0 += 2) {
+            const sycl::uint2 grid_pos = G[q2[l0 / 2] & 0x1FF];
+            const uint32_t signs = unpack_ksigns(q2[l0 / 2] >> 9);
+            const int signs0 = swar_ne4(signs & 0x08040201);
+            const int signs1 = swar_ne4(signs & 0x80402010);
+            m.w[l0 + 0] = swar_sub4(grid_pos.x() ^ signs0, signs0);
+            m.w[l0 + 1] = swar_sub4(grid_pos.y() ^ signs1, signs1);
+        }
+        m.a = bq2->scales[iqs / 2] & 0x0F;
+        m.b = bq2->scales[iqs / 2] >> 4;
+        m.d = sycl::vec<sycl::half, 1>(bq2->d).convert<float, sycl::rounding_mode::automatic>()[0];
+    }
+    __dpct_inline__ static void acts(const block_q8_1* y, int iqs, int* u, float& ds) {
+#pragma unroll
+        for (int j = 0; j < 8; ++j) u[j] = get_int_b4(y[iqs / 2].qs, j);
+        ds = y[iqs / 2].ds[0];
+    }
+    __dpct_inline__ static float finish(int s0, int s1, const MultiW& m, float ds) {
+        return m.d * ds * (float) ((s0 * m.a + s1 * m.b + (s0 + s1) / 2) / 4);
+    }
+};
+
+template <> struct Multi<23> {   // iq4_xs
+    static constexpr bool has = true; static constexpr int NW = 8;
+    __dpct_inline__ static void prep(const void* vbq, int kbx, int iqs, MultiW& m, const void* = nullptr) {
+        const block_iq4_xs* bq4 = (const block_iq4_xs*) vbq + kbx;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int aux_q4 = get_int_b4(bq4->qs, iqs + j);
+#if STRATA_IQ4NL_FAST
+            const sycl::int2 v = iq4nl_pair(aux_q4);
+#else
+            const sycl::int2 v = get_int_from_table_16(aux_q4, kvalues_iq4nl);
+#endif
+            m.w[2 * j + 0] = v.x();
+            m.w[2 * j + 1] = v.y();
+        }
+        const int ls = ((bq4->scales_l[iqs / 8] >> (iqs & 0x04)) & 0x0F) | (((bq4->scales_h >> (iqs / 2)) & 0x03) << 4);
+        m.a = ls - 32;
+        m.d = sycl::vec<sycl::half, 1>(bq4->d).convert<float, sycl::rounding_mode::automatic>()[0];
+    }
+    __dpct_inline__ static void acts(const block_q8_1* y, int iqs, int* u, float& ds) {
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            u[2 * j + 0] = get_int_b4(y[iqs / 4].qs, j + 0);
+            u[2 * j + 1] = get_int_b4(y[iqs / 4].qs, j + 4);
+        }
+        ds = y[iqs / 4].ds[0];
+    }
+    __dpct_inline__ static float finish(int s0, int s1, const MultiW& m, float ds) {
+        return m.d * ds * (float) ((s0 + s1) * m.a);
+    }
+};
 
 template <> struct Multi<18> {   // iq3_xxs
     static constexpr bool has = true; static constexpr int NW = 8;

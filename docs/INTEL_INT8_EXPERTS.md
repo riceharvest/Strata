@@ -50,8 +50,8 @@ never exists and the weights are read once, compressed (2.1 MB per expert instea
   DPAS A-operand order (`[8-row tile][K/32][8 rows x 32 bytes]`, experts padded to 8 rows with zeros), the 8 row scales of a tile
   contiguous.
 * Weights: IQ3_S `d (1 + 2 s)` per 32, IQ3_XXS `d (2 s + 1) / 4`, IQ2_S `d (2 s + 1) / 8` per 16 (two DPAS per 32, the other half
-  zeroed), IQ4_NL `d` per 32, Q2_0 `d` per 64; the int8 values are the codebook entries with their signs (IQ3_S/IQ3_XXS/IQ2_S: 1..62,
-  IQ4_NL: -127..113, Q2_0: -1..2), never rounded.
+  zeroed), IQ4_XS `d (ls - 32)` per 32, IQ4_NL `d` per 32, Q2_0 `d` per 64; the int8 values are the codebook entries with their signs (IQ3_S/IQ3_XXS/IQ2_S: 1..62,
+  IQ4_XS/IQ4_NL: -127..113, Q2_0: -1..2), never rounded.
 * Each 32-block's int32 dot product (<= 32 * 127 * 127) is exact and exactly convertible to float; it is scaled by the weight scale of the
   column and the activation scale of the row and added to a float accumulator, K ascending (the float multiply and add are the only
   roundings besides the activation quantization). After gate/up, `silu(gate) * up` (the FP16 path's formula, in float, not rounded
@@ -64,9 +64,10 @@ never exists and the weights are read once, compressed (2.1 MB per expert instea
   gathers and a funnel shift when not dword aligned. The down matrix ends the expert blob, so its reads clamp the second dword of an unaligned read to the
   matrix's last dword (`ld32c`); the gate/up reads stay inside the blob (the down matrix follows them). The first version read up to 3 bytes
   past the end of a test allocation and faulted the GPU (an xe CAT error and an engine reset; nothing else was affected).
-* Supported: gate/up IQ3_S (21), IQ3_XXS (18), IQ2_S (22) with K a multiple of 256; down IQ4_NL (20) with K a multiple of 32 and Q2_0
-  (42) with K a multiple of 64; 640 FF x 2560 embedding; output rows a multiple of 16; a held group of at most 16 experts. Any other type or
-  shape makes the layer take the FP16 path (IQ4_XS gate/up, 1 of 48 layers of the IQ3_S pack). A group the kernels cannot run (no VRAM for
+* Supported: gate/up IQ3_S (21), IQ3_XXS (18), IQ2_S (22), IQ4_XS (23) with K a multiple of 256; down IQ4_NL (20) with K a multiple of 32 and Q2_0
+  (42) with K a multiple of 64; 640 FF x 2560 embedding; output rows a multiple of 16; a held group of at most 16 experts. All 48 of 48 layers of the
+  flagship IQ3_S pack (including layer 0's IQ4_XS gate/up) stay on the fused int8 path. Any other type or
+  shape makes the layer take the FP16 path. A group the kernels cannot run (no VRAM for
   the int8 scratch, a format they refuse) takes the FP16 chain for that group.
 * Multi-GPU: the codebooks, the scratch and the availability are kept per device.
 

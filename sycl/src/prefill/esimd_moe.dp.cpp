@@ -72,10 +72,10 @@ namespace xmx = sycl::ext::intel::esimd::xmx;
 using half = sycl::half;
 
 // ggml types handled
-constexpr int T_IQ3XXS = 18, T_IQ4NL = 20, T_IQ3S = 21, T_IQ2S = 22, T_Q2_0 = 42;
-template <int F> constexpr int blk_bytes() { return F == T_IQ3S ? 110 : F == T_IQ3XXS ? 98 : F == T_IQ2S ? 82 : F == T_IQ4NL ? 18 : 18; }
-constexpr int block_bytes_of(int f) { return f == T_IQ3S ? 110 : f == T_IQ3XXS ? 98 : f == T_IQ2S ? 82 : 18; }
-constexpr int block_vals_of(int f) { return (f == T_IQ3S || f == T_IQ3XXS || f == T_IQ2S) ? 256 : f == T_Q2_0 ? 64 : 32; }
+constexpr int T_IQ3XXS = 18, T_IQ4NL = 20, T_IQ3S = 21, T_IQ2S = 22, T_IQ4XS = 23, T_Q2_0 = 42;
+template <int F> constexpr int blk_bytes() { return F == T_IQ4XS ? 136 : F == T_IQ3S ? 110 : F == T_IQ3XXS ? 98 : F == T_IQ2S ? 82 : F == T_IQ4NL ? 18 : 18; }
+constexpr int block_bytes_of(int f) { return f == T_IQ4XS ? 136 : f == T_IQ3S ? 110 : f == T_IQ3XXS ? 98 : f == T_IQ2S ? 82 : 18; }
+constexpr int block_vals_of(int f) { return (f == T_IQ4XS || f == T_IQ3S || f == T_IQ3XXS || f == T_IQ2S) ? 256 : f == T_Q2_0 ? 64 : 32; }
 
 // One device table buffer (uint32 units): the codebooks the decoders gather from.
 constexpr int O_IQ3S = 0;        // iq3s_grid[512]
@@ -233,6 +233,9 @@ void launch_gu(sycl::queue& q, const GArgs a, int nrowblocks) {
                     w1 = ld32(We, ro + (P + 78));    // scales 4..7
                     w2 = ld32(We, ro + (P + 66));    // qh 0..3
                     w3 = ld32(We, ro + (P + 70));    // qh 4..7
+                } else if constexpr (F == T_IQ4XS) {
+                    w0 = ld16(We, ro + (P + 2));     // scales_h
+                    w1 = ld32(We, ro + (P + 4));     // scales_l 0..3
                 }
 #pragma unroll 1
                 for (int ib = 0; ib < 8; ++ib) {
@@ -298,6 +301,20 @@ void launch_gu(sycl::queue& q, const GArgs a, int nrowblocks) {
                             // fr0 holds values 0..15 (dwords 0..3, the rest zero), fr1 values 16..31 (dwords 4..7)
                             fr0.template select<64, 1>(64) = 0u;
                             fr1.template select<64, 1>(0) = 0u;
+                        } else if constexpr (F == T_IQ4XS) {
+                            simd<uint32_t, 16> ls = ((w1 >> (4 * ib)) & 0xfu) | (((w0 >> (2 * ib)) & 3u) << 4);
+                            sw0 = d * simd<float, 16>(simd<int, 16>(ls) - 32);
+#pragma unroll
+                            for (int j = 0; j < 4; ++j) {
+                                simd<uint32_t, 16> qd = ld32(We, ro + (P + 8 + 16 * ib + 4 * j));
+                                simd<uint32_t, 16> t0 = gather<uint32_t, 16>(T + O_IQ4, (qd & 0xffu) << 2);
+                                simd<uint32_t, 16> t1 = gather<uint32_t, 16>(T + O_IQ4, ((qd >> 8) & 0xffu) << 2);
+                                simd<uint32_t, 16> t2 = gather<uint32_t, 16>(T + O_IQ4, ((qd >> 16) & 0xffu) << 2);
+                                simd<uint32_t, 16> t3 = gather<uint32_t, 16>(T + O_IQ4, (qd >> 24) << 2);
+                                fr0.template select<16, 1>(16 * j) = (t0 & 0xffu) | ((t1 & 0xffu) << 8) | ((t2 & 0xffu) << 16) | (t3 << 24);
+                                fr0.template select<16, 1>(16 * (j + 4)) =
+                                    ((t0 >> 8) & 0xffu) | (t1 & 0xff00u) | ((t2 & 0xff00u) << 8) | ((t3 & 0xff00u) << 16);
+                            }
                         }
                     }
 #pragma unroll
@@ -501,6 +518,10 @@ void launch_gu_wg(sycl::queue& q, const GArgs a, int nrowblocks) {
                 for (int k = 0; k < 1024 / WGT / 64; ++k)
                     slm_block_store<uint32_t, 16>(lt * (1024 / WGT) + 64 * k, block_load<uint32_t, 16>(T + O_IQ3XXS + (lt * (1024 / WGT) + 64 * k) / 4, kAl16), kAl16);
                 slm_block_store<uint32_t, 16>(1024 + lt * (512 / WGT), block_load<uint32_t, 16>(T + O_KSIGNS + lt * (512 / WGT) / 4, kAl16), kAl16);
+            } else if constexpr (F == T_IQ4XS) {
+#pragma unroll
+                for (int k = 0; k < tab_bytes<F>() / WGT / 64; ++k)
+                    slm_block_store<uint32_t, 16>(lt * (tab_bytes<F>() / WGT) + 64 * k, block_load<uint32_t, 16>(T + O_IQ4 + (lt * (tab_bytes<F>() / WGT) + 64 * k) / 4, kAl16), kAl16);
             } else {   // IQ2_S
 #pragma unroll
                 for (int k = 0; k < tab_bytes<F>() / WGT / 64; ++k)
@@ -529,6 +550,8 @@ void launch_gu_wg(sycl::queue& q, const GArgs a, int nrowblocks) {
                         w0 = ld32(We, ro + (P + 106)); w1 = ld32(We, ro + (P + 66)); w2 = ld32(We, ro + (P + 70));
                     } else if constexpr (F == T_IQ2S) {
                         w0 = ld32(We, ro + (P + 74)); w1 = ld32(We, ro + (P + 78)); w2 = ld32(We, ro + (P + 66)); w3 = ld32(We, ro + (P + 70));
+                    } else if constexpr (F == T_IQ4XS) {
+                        w0 = ld16(We, ro + (P + 2)); w1 = ld32(We, ro + (P + 4));
                     }
                 }
                 const uint32_t P = (uint32_t) sb * blk_bytes<F>();
@@ -595,6 +618,20 @@ void launch_gu_wg(sycl::queue& q, const GArgs a, int nrowblocks) {
                             }
                             fr0.template select<64, 1>(64) = 0u;
                             fr1.template select<64, 1>(0) = 0u;
+                        } else if constexpr (F == T_IQ4XS) {
+                            simd<uint32_t, 16> ls = ((w1 >> (4 * ib)) & 0xfu) | (((w0 >> (2 * ib)) & 3u) << 4);
+                            sw0 = d * simd<float, 16>(simd<int, 16>(ls) - 32);
+#pragma unroll
+                            for (int j = 0; j < 4; ++j) {
+                                simd<uint32_t, 16> qd = ld32(We, ro + (P + 8 + 16 * ib + 4 * j));
+                                simd<uint32_t, 16> t0 = slm_gather<uint32_t, 16>((qd & 0xffu) << 2);
+                                simd<uint32_t, 16> t1 = slm_gather<uint32_t, 16>(((qd >> 8) & 0xffu) << 2);
+                                simd<uint32_t, 16> t2 = slm_gather<uint32_t, 16>(((qd >> 16) & 0xffu) << 2);
+                                simd<uint32_t, 16> t3 = slm_gather<uint32_t, 16>((qd >> 24) << 2);
+                                fr0.template select<16, 1>(16 * j) = (t0 & 0xffu) | ((t1 & 0xffu) << 8) | ((t2 & 0xffu) << 16) | (t3 << 24);
+                                fr0.template select<16, 1>(16 * (j + 4)) =
+                                    ((t0 >> 8) & 0xffu) | (t1 & 0xff00u) | ((t2 & 0xff00u) << 8) | ((t3 & 0xff00u) << 16);
+                            }
                         }
                     }
 #pragma unroll
@@ -978,7 +1015,7 @@ void swiglu_quantize(const float* GU, const Layout& lo, int n_ff, int8_t* Hq, fl
 bool gate_up(int gu_type, const uint8_t* const* blob, size_t up_off, int n_ff, const Layout& lo, int K, const int8_t* Xq,
              const float* dx, float* GU, void* stream) {
     if (lo.n == 0 || lo.tile0[lo.n] == 0) return true;
-    if ((gu_type != T_IQ3S && gu_type != T_IQ3XXS && gu_type != T_IQ2S) || K % 256 != 0 || (2 * n_ff) % 16 != 0 ||
+    if ((gu_type != T_IQ3S && gu_type != T_IQ3XXS && gu_type != T_IQ2S && gu_type != T_IQ4XS) || K % 256 != 0 || (2 * n_ff) % 16 != 0 ||
         (up_off & 3) != 0 || lo.n > kMaxGroup)
         return false;
     sycl::queue& q = *strata::q_of(stream);
@@ -999,14 +1036,17 @@ bool gate_up(int gu_type, const uint8_t* const* blob, size_t up_off, int n_ff, c
         if (wg_for() && gu_type != T_IQ2S && a.nkb % 4 == 0 && a.ntiles % WGT == 0) {   // IQ2_S: its 8 KB codebook copied into local memory by every group costs more than it saves (35 vs 16 us)
             if (gu_type == T_IQ3S) launch_gu_wg<T_IQ3S, MT, 256>(q, a, rb);
             else if (gu_type == T_IQ3XXS) launch_gu_wg<T_IQ3XXS, MT, 256>(q, a, rb);
+            else if (gu_type == T_IQ4XS) launch_gu_wg<T_IQ4XS, MT, 256>(q, a, rb);
             else launch_gu_wg<T_IQ2S, MT, 256>(q, a, rb);
-        } else         if (grf_for(MT) == 128) {
+        } else if (grf_for(MT) == 128) {
             if (gu_type == T_IQ3S) launch_gu<T_IQ3S, MT, 128>(q, a, rb);
             else if (gu_type == T_IQ3XXS) launch_gu<T_IQ3XXS, MT, 128>(q, a, rb);
+            else if (gu_type == T_IQ4XS) launch_gu<T_IQ4XS, MT, 128>(q, a, rb);
             else launch_gu<T_IQ2S, MT, 128>(q, a, rb);
         } else {
             if (gu_type == T_IQ3S) launch_gu<T_IQ3S, MT, 256>(q, a, rb);
             else if (gu_type == T_IQ3XXS) launch_gu<T_IQ3XXS, MT, 256>(q, a, rb);
+            else if (gu_type == T_IQ4XS) launch_gu<T_IQ4XS, MT, 256>(q, a, rb);
             else launch_gu<T_IQ2S, MT, 256>(q, a, rb);
         }
     });

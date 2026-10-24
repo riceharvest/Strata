@@ -24,6 +24,30 @@
 
 namespace strata::core {
 
+struct BuddyInfoStats {
+    uint64_t order9 = 0;              ///< free 2 MiB blocks in Normal zone
+    uint64_t order10 = 0;             ///< free 4 MiB blocks in Normal zone
+    uint64_t high_order_blocks = 0;   ///< order9 + order10
+    uint64_t high_order_bytes = 0;    ///< order9 * 2 MiB + order10 * 4 MiB
+    bool valid = false;
+};
+
+/// Parse `/proc/buddyinfo` text and sum order-9 (2 MiB) and order-10 (4 MiB) free blocks in the Normal zone.
+BuddyInfoStats parse_buddyinfo(const char* text);
+BuddyInfoStats read_buddyinfo(const char* path = "/proc/buddyinfo");
+
+/// Parse `/sys/kernel/mm/transparent_hugepage/enabled` text and return the active bracketed mode ("always", "madvise", "never").
+std::string parse_thp_mode(const char* text);
+std::string read_thp_mode(const char* path = "/sys/kernel/mm/transparent_hugepage/enabled");
+
+/// Parse `AnonHugePages: <N> kB` from `/proc/self/smaps_rollup` (or `/proc/meminfo`).
+uint64_t parse_anon_hugepages_kb(const char* text);
+uint64_t read_anon_hugepages_kb(const char* path = "/proc/self/smaps_rollup");
+
+/// Advise the kernel to back `[ptr, ptr + bytes)` with 2 MiB transparent hugepages (`MADV_HUGEPAGE`) before fault-in
+/// unless `STRATA_MIRROR_HUGEPAGE=0`. Prevents 4 KiB page fragmentation and PCIe IOTLB thrashing on Battlemage (#3681).
+bool advise_mirror_hugepage(void* ptr, size_t bytes);
+
 class GgufExpertSource : public ExpertSource {
 public:
     GgufExpertSource() = default;
@@ -55,6 +79,7 @@ public:
     /// "does this source have device-readable experts", and dereferences an alias only for `pinned()` experts.
     const uint8_t* device_alias(int64_t layer, int64_t expert) const override;
     uint64_t mirrored_bytes() const { return mirror_bytes_; }
+    uint64_t mirror_hugepage_bytes() const { return mirror_hugepage_bytes_; }
 
 private:
     int fd_of(int64_t layer, int role, std::string& err);
@@ -74,6 +99,7 @@ private:
     std::vector<uint8_t*> mirror_chunks_;          ///< USM host (pinned, device-readable); several chunks: Alchemist
                                                    ///< (Arc A-series) refuses a single host allocation past ~3 GiB
     uint64_t mirror_bytes_ = 0;
+    uint64_t mirror_hugepage_bytes_ = 0;           ///< AnonHugePages delta across mirror() allocation and fault-in
     std::vector<uint8_t*> mirror_ptr_;             ///< per (layer, expert): its blob in the chunks, null = not mirrored
     std::vector<const uint8_t*> layer_first_;      ///< per layer: its first mirrored blob, null = none
 };
