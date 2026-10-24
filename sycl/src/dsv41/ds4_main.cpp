@@ -84,8 +84,9 @@ std::vector<int> parse_ids(const std::string& s) {
 
 void usage() {
     std::fprintf(stderr,
-                 "maya-ds4 --pack <model>/maya-ds4 [--gpus 0,1,...] [--max-context N] [--reserve-mib N]\n"
-                 "           [--vram-experts F] [--cpu-threads N] [--expert-profile FILE|none] [--ssd-cache GB] [--ssd-policy lru|lfu|lfulru] [--no-expert-cache] [--verbose]\n"
+                 "strata-dsv41 --pack <model>/pack [--gpus 0,1,...] [--max-context N] [--reserve-mib N]\n"
+                 "           [--vram-experts F] [--cpu-threads N] [--expert-profile FILE|none] [--ssd-cache GB] [--ssd-policy lru|lfu|lfulru]\n"
+                 "           [--disk-skip-w F] [--disk-skip-from N] [--engram-cache-mb N] [--engram-threads N] [--no-expert-cache] [--verbose]\n"
                  "           [--tp N] [--threads on|off] [--prefill-chunk N] [--dspark on|off|none|auto] [--dspark-block N] [--dspark-conf F]\n"
                  "           [--vision on|off] [--mmap-experts on|off|auto]\n"
                  "           (--ids I,J,... [--images FILE] [--n N] [--dump-logits FILE] | --serve\n"
@@ -1219,6 +1220,10 @@ int main(int argc, char** argv) {
             const std::string v = val("--ssd-policy");
             o.ssd_policy = v == "lfu" ? 1 : v == "lfulru" ? 2 : 0;
         }
+        else if (a == "--disk-skip-w") o.disk_skip_w = (float) std::atof(val("--disk-skip-w").c_str());
+        else if (a == "--disk-skip-from") o.disk_skip_from = std::max(0, std::atoi(val("--disk-skip-from").c_str()));
+        else if (a == "--engram-cache-mb") o.engram_cache_mb = std::max(0, std::atoi(val("--engram-cache-mb").c_str()));
+        else if (a == "--engram-threads") o.engram_threads = std::max(1, std::atoi(val("--engram-threads").c_str()));
         else if (a == "--eos") eos = val("--eos");
         else if (a == "--no-expert-cache") o.expert_cache = false;
         else if (a == "--dspark") {

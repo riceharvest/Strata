@@ -988,7 +988,7 @@ struct Model::Impl {
     // layer after (from L's input too); DS4_AHEAD_EXTRA: guesses past the next layer's top k (< 0: fewer - the guess's
     // picks by rank on Sun: 97 91 81 70 57 41 %, past the top 6 29 20 %: reads wasted on an SSD-bound PC).
     int ahead_mode = std::getenv("DS4_AHEAD") ? std::atoi(std::getenv("DS4_AHEAD")) : 1;
-    int ahead_extra = std::getenv("DS4_AHEAD_EXTRA") ? std::atoi(std::getenv("DS4_AHEAD_EXTRA")) : 0;
+    int ahead_extra = std::getenv("DS4_AHEAD_EXTRA") ? std::atoi(std::getenv("DS4_AHEAD_EXTRA")) : (o.ssd_cache_gb > 0.0 ? 2 : 0);
     // (DS4_AHEAD_ORDER=0: the CPU lane computes a layer's experts in expert order, not the ones asked for early first)
     bool ahead_order = std::getenv("DS4_AHEAD_ORDER") == nullptr || std::atoi(std::getenv("DS4_AHEAD_ORDER")) != 0;
     std::vector<uint8_t> ahead_fl;     // [layer][1024]: 1 the top-k guess, 2 any guess, a layer before; 4 two layers before;
@@ -1039,11 +1039,13 @@ struct Model::Impl {
     // page, Windows sampled pages of the working set), so a token waits on the SSD only for the experts that weigh; the
     // weight it carried is lost (no renormalisation).  On layers from STRATA_DS4_DISK_SKIP_FROM (0) on.  An expert left
     // out still counts as used (the expert cache, the profile).
-    const float disk_skip_w = [] {
+    const float disk_skip_w = [this] {
+        if (o.disk_skip_w >= 0.0f) return o.disk_skip_w;
         const char* v = std::getenv("STRATA_DS4_DISK_SKIP_W");
         return v != nullptr ? std::max(0.0f, (float) std::atof(v)) : 0.0f;
     }();
-    const int disk_skip_from = [] {
+    const int disk_skip_from = [this] {
+        if (o.disk_skip_from > 0) return o.disk_skip_from;
         const char* v = std::getenv("STRATA_DS4_DISK_SKIP_FROM");
         return v != nullptr ? std::max(0, std::atoi(v)) : 0;
     }();
@@ -2459,11 +2461,23 @@ struct Model::Impl {
             //  gave +4.5% on a 4K prompt but no decode gain in every pair: DS4_ENGRAM_THREADS=64 turns them on)
 #endif
             const unsigned hw = std::max(1u, std::thread::hardware_concurrency());
-            int nth = (int) std::min(16u, std::max(4u, hw / 2));
+            int nth = o.engram_threads > 0 ? o.engram_threads :
+#if defined(_WIN32)
+                (int) std::min(16u, std::max(4u, hw / 2));
+#else
+                (int) std::min(64u, std::max(16u, hw * 2));
+#endif
             if (const char* e = std::getenv("DS4_ENGRAM_THREADS")) nth = std::max(1, std::atoi(e));
             const uint64_t avail = ram_avail();
-            uint64_t mb = avail == ~uint64_t{0} ? 64 : std::min<uint64_t>(256, std::max<uint64_t>(16, (avail >> 20) / 64));
-            if (const char* e = std::getenv("DS4_ENGRAM_CACHE_MB")) mb = std::strtoull(e, nullptr, 10);
+            uint64_t mb = 64;
+            if (o.engram_cache_mb >= 0) {
+                mb = (uint64_t) o.engram_cache_mb;
+            } else if (const char* e = std::getenv("DS4_ENGRAM_CACHE_MB")) {
+                mb = std::strtoull(e, nullptr, 10);
+            } else if (avail != ~uint64_t{0}) {
+                // Dynamically scale Engram cache up to 10% of available RAM, capped at 4096 MB
+                mb = std::min<uint64_t>(4096, std::max<uint64_t>(64, (avail >> 20) / 10));
+            }
             eg_cache.init((size_t) ((mb << 20) / row), row);
             std::vector<std::string> paths;
             for (const std::string& fn : pk.files) paths.push_back(pk.model_dir + "/" + fn);

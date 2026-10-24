@@ -211,15 +211,23 @@ def _plan_ista(model: str, cards: list[dict] | None, ram_gb: float | None, disk_
             out["args"] += ["--reserve-mib", "1024"]
             if ram_gb and float(ram_gb) >= 40.0 and float(ram_gb) < out["cpu_experts_gb"] + REST_RAM_GB:
                 ssd_cache_gb = max(16, int(float(ram_gb) - 18.0))
-                out["args"] += ["--ssd-cache", str(ssd_cache_gb)]
+                eg_mb = 4096 if float(ram_gb) >= 60.0 else 2048
+                out["args"] += ["--ssd-cache", str(ssd_cache_gb), "--ssd-policy", "lfulru",
+                                "--disk-skip-w", "0.025", "--engram-cache-mb", str(eg_mb)]
+            elif ram_gb and float(ram_gb) < 40.0:
+                out["args"] += ["--ssd-policy", "lfulru", "--disk-skip-w", "0.035", "--engram-cache-mb", "1024"]
         names = " + ".join(f"{c['name'] or 'card ' + str(c['index'])} ({c['vram_gb']:.0f} GB)" for c in out["cards"])
         lines.append(f"Graphics memory: {names}. About {in_vram:,} of the {EXPERTS:,} experts ({out['vram_experts_gb']:.0f} GB) stay on "
                      f"the card{'s' if n > 1 else ''}; the other {EXPERTS - in_vram:,} ({out['cpu_experts_gb']:.0f} GB) are computed on the "
                      "CPU from RAM, and the ones RAM cannot hold are read from the SSD when a word needs them.")
+        all_cached = out["cpu_experts_gb"] + REST_RAM_GB
+        if is_intel and ram_gb and float(ram_gb) < all_cached:
+            eg_mb = 4096 if float(ram_gb) >= 60.0 else (2048 if float(ram_gb) >= 40.0 else 1024)
+            lines.append(f"Intel B70 SSD latency optimizations active: --disk-skip-w skips blocking disk reads for tail experts (<2.5% weight), "
+                         f"--engram-cache-mb {eg_mb} caches hot n-grams in RAM, and LFU/LRU replacement keeps frequently hit experts resident.")
         if n >= 2 and out["tp"] == 2:
             lines.append("Two cards share each layer's matrices (--tp 2): measured about twice as fast at reading prompts.")
         if ram_gb:
-            all_cached = out["cpu_experts_gb"] + REST_RAM_GB
             out["ram_needed_gb"] = _round1(all_cached)
             out["spill_gb"] = _round1(max(0.0, all_cached - float(ram_gb)))
             out["spare_ram_gb"] = _round1(max(0.0, float(ram_gb) - all_cached))
