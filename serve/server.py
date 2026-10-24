@@ -3333,7 +3333,7 @@ def gpu_vram_mib(indices: list[int], hip: bool = False) -> dict[int, int] | None
         return None
     out = {}
     for i in indices:
-        g = gpu_reader(i, amd=hip)
+        g = gpu_reader(i)
         if not g.ok():
             return None
         total = g.read().get("mem_total")
@@ -4247,11 +4247,11 @@ class Service:
         threading.Thread(target=loop, daemon=True).start()
 
     def free_vram_mib(self) -> int | None:
-        """Free VRAM on the engine's (first) GPU, from the backend's reader - NVML, the amdgpu sysfs files (#301) or
-        IOKit on macOS (Metal backend); None when it can't be read (then nothing is refused)."""
+        """Free VRAM on the engine's (first) GPU, from serve/telemetry.py's reader (the Intel Arc one under
+        sycl/serve/server_intel.py); None when it can't be read (then nothing is refused)."""
         try:
             from serve.telemetry import gpu_reader
-            g = gpu_reader(int(getattr(self, "gpu_index", 0) or 0), amd=getattr(self, "backend", None) == "hip")
+            g = gpu_reader(int(getattr(self, "gpu_index", 0) or 0))
             if not g.ok():
                 return None
             r = g.read()
@@ -4521,8 +4521,7 @@ class Service:
             self.telemetry = Telemetry(extra=lambda: {"tok_s": self._tok_s(), "tok_s_mean": self._tok_s_mean(),
                                                     "prefill_tok_s_mean": self._prefill_tok_s_mean()},
                                        gpu_index=int(getattr(self, "gpu_index", 0) or 0),
-                                       gpu_indices=getattr(self, "gpu_indices", None),
-                                       amd=getattr(self, "backend", None) == "hip")
+                                       gpu_indices=getattr(self, "gpu_indices", None))
             if getattr(self, "engine", None) is not None and hasattr(self.engine, "gpu_busy"):
                 # #1317: the quick frozen-engine check does not end an engine whose GPU is busy (a long prompt chunk on a
                 # slow card keeps the GPU at work while the host thread sleeps)
