@@ -6,6 +6,9 @@
 #include "ds4_numerics.cuh"
 
 #include "ds4_sycl.hpp"
+#if defined(STRATA_XMX_SG16)
+#include <sycl/ext/oneapi/matrix/matrix.hpp>
+#endif
 
 #define GGML_COMMON_DECL_SYCL
 #define GGML_COMMON_IMPL_SYCL
@@ -893,6 +896,118 @@ __global__ void __launch_bounds__(kThreads) set_tc_kernel(const SetArgs a) {
 }
 #endif
 
+#if defined(SYCL_LANGUAGE_VERSION) && defined(STRATA_XMX_SG16)
+// The same tiles on Xe2's matrix engines (an AOT bmg / lnl build): set_tc_kernel's arithmetic - the weights decoded by deq8 and
+// rounded to F16, the rows rounded to F16, F32 sums - with SYCL joint_matrix 8x16x16 on sub-groups of 16.  A block of 256 work
+// items is 16 sub-groups: sub-group g the rows 8 (g >> 1) .. + 8 and the outputs 32 (g & 1) .. + 32 (two 16-wide tiles), of
+// gate and up.  STRATA_DS4_NO_TC=1 keeps the F32 kernel (set_kernel), as on CUDA.
+namespace xjm = sycl::ext::oneapi::experimental::matrix;
+constexpr int kXLd = 40;   // a tile row's pitch in halves (32 + 8)
+template <int T, bool GATE_UP>
+void set_xmx_kernel(const SetArgs a) {
+    struct Tiles {
+        sycl::half x[BM][kXLd], wg[BN][kXLd], wu[GATE_UP ? BN : 1][kXLd];
+    };
+    struct Out {
+        float g[BM][BN + 4], u[GATE_UP ? BM : 1][BN + 4];
+    };
+    constexpr size_t kSmem = sizeof(Tiles) > sizeof(Out) ? sizeof(Tiles) : sizeof(Out);
+    SYCL_SHARED(uint8_t[kSmem], smem);
+    SYCL_SHARED(uint32_t[Ty<T>::TAB > 0 ? Ty<T>::TAB : 1], tab);
+    SYCL_SHARED(int[BM], src);
+    Tiles& Tl = *reinterpret_cast<Tiles*>(&smem[0]);
+    Out& O = *reinterpret_cast<Out*>(&smem[0]);
+    const sycl::sub_group sg = sycl::ext::oneapi::this_work_item::get_nd_item<3>().get_sub_group();
+    const int e = blockIdx.z;
+    const int lo = a.bounds[e] - a.row0, hi = a.bounds[e + 1] - a.row0;
+    const int r0 = lo + blockIdx.x * BM;
+    if (r0 >= hi || hi - lo <= a.skip_le) return;   // (uniform; skip_le: the light kernels' experts)
+    load_tab<T>(tab);
+    const int nr = min(BM, hi - r0);
+    const int c0 = blockIdx.y * BN;
+    const uint8_t* blob = a.wbase + (size_t) e * a.stride;
+    const int K = GATE_UP ? a.n_embd : a.n_ff;
+    const size_t rb = row_bytes_t<T>(K);
+    const int tid = (int) threadIdx.x, sgi = tid >> 4;
+    if (tid < BM) src[tid] = tid < nr ? (GATE_UP ? a.idx[r0 + tid] : r0 + tid) : -1;
+    __syncthreads();
+    const int mr = (sgi >> 1) * 8, nc = (sgi & 1) * 32;
+    const bool live = mr < nr;   // (uniform in the sub-group: its 8 rows hold at least one of the block's)
+    xjm::joint_matrix<sycl::sub_group, float, xjm::use::accumulator, 8, 16> fg[2], fu[2];
+    for (int j = 0; j < 2; ++j) {
+        xjm::joint_matrix_fill(sg, fg[j], 0.0f);
+        xjm::joint_matrix_fill(sg, fu[j], 0.0f);
+    }
+    const int tr = tid >> 2, tq = tid & 3;
+    auto lp = [](const sycl::half* p) {
+        return sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(const_cast<sycl::half*>(p));
+    };
+    for (int kb = 0; kb < K / 32; ++kb) {
+        for (int m = 0; m < (GATE_UP ? 2 : 1); ++m) {
+            float w8[8];
+            deq8<T>(blob + a.tr[GATE_UP ? m : 2] + (size_t) (c0 + tr) * rb, kb, tq, tab, w8);
+            sycl::half* dst = m == 0 ? &Tl.wg[tr][tq * 8] : &Tl.wu[tr][tq * 8];
+#pragma unroll
+            for (int j = 0; j < 8; ++j) dst[j] = sycl::half(w8[j]);
+        }
+        const int sr = src[tr];
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            sycl::half v = sycl::half(0.0f);
+            if (sr >= 0) {
+                const size_t at = (size_t) sr * a.ldx + (size_t) kb * 32 + tq * 8 + j;
+                v = GATE_UP ? sycl::half(a.xf[at]) : sycl::bit_cast<sycl::half>(a.xh[at]);
+            }
+            Tl.x[tr][tq * 8 + j] = v;
+        }
+        __syncthreads();
+        if (live) {
+#pragma unroll
+            for (int kk = 0; kk < 32; kk += 16) {
+                xjm::joint_matrix<sycl::sub_group, sycl::half, xjm::use::a, 8, 16, xjm::layout::row_major> fa;
+                xjm::joint_matrix_load(sg, fa, lp(&Tl.x[mr][kk]), kXLd);
+#pragma unroll
+                for (int j = 0; j < 2; ++j) {
+                    xjm::joint_matrix<sycl::sub_group, sycl::half, xjm::use::b, 16, 16, xjm::layout::col_major> fb;
+                    xjm::joint_matrix_load(sg, fb, lp(&Tl.wg[nc + 16 * j][kk]), kXLd);
+                    xjm::joint_matrix_mad(sg, fg[j], fa, fb, fg[j]);
+                    if (GATE_UP) {
+                        xjm::joint_matrix_load(sg, fb, lp(&Tl.wu[nc + 16 * j][kk]), kXLd);
+                        xjm::joint_matrix_mad(sg, fu[j], fa, fb, fu[j]);
+                    }
+                }
+            }
+        }
+        __syncthreads();
+    }
+    if (live)
+        for (int j = 0; j < 2; ++j) {
+            xjm::joint_matrix_store(sg, fg[j], sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(&O.g[mr][nc + 16 * j]),
+                                    BN + 4, xjm::layout::row_major);
+            if (GATE_UP)
+                xjm::joint_matrix_store(sg, fu[j], sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(&O.u[mr][nc + 16 * j]),
+                                        BN + 4, xjm::layout::row_major);
+        }
+    __syncthreads();
+    for (int i = tid; i < BM * BN; i += kThreads) {
+        const int r = i / BN, c = i % BN;
+        if (r >= nr) continue;
+        const size_t lr = (size_t) (r0 + r);
+        if (GATE_UP) a.h[lr * a.ldo + c0 + c] = __half_as_ushort(__float2half_rn(swiglu(O.g[r][c], O.u[r][c], a.limit)));
+        else a.y[lr * a.ldo + c0 + c] = O.g[r][c];
+    }
+}
+template <int T, bool GU>
+void launch_set_xmx(const SetArgs& a, dim3 grid, cudaStream_t s) {
+    const sycl::range<3> local(1, 1, kThreads), global(grid.z, grid.y, (size_t) grid.x * kThreads);
+    strata::q_of(s)->parallel_for(sycl::nd_range<3>(global, local), [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(16)]] {
+        set_xmx_kernel<T, GU>(a);
+    });
+}
+#endif
+// the tiles' form: 1 the matrix engines (CUDA's tensor cores, Xe2's XMX in an AOT bmg / lnl build), 0 the F32 FMAs, -1 unset
+std::atomic<int> g_force_tc{-1};
+
 // ---------------------------------------------------------------- GEMVs
 constexpr int kMaxJobs = 8;
 struct Jobs {
@@ -1074,6 +1189,19 @@ __global__ void __launch_bounds__(kThreads) light_kernel_rows(const SetArgs a, c
         }
 }
 
+#if defined(SYCL_LANGUAGE_VERSION) && defined(STRATA_XMX_SG16)
+// Xe2's matrix engines for the prompt sets' tiles (set_xmx_kernel; an AOT bmg / lnl build): on unless STRATA_DS4_NO_TC=1, as tc_ok
+bool xmx_ok() {
+    const int f = g_force_tc.load(std::memory_order_relaxed);
+    if (f >= 0) return f == 1;
+    static const bool on = [] {
+        const char* e = std::getenv("STRATA_DS4_NO_TC");
+        return !(e != nullptr && e[0] == '1');
+    }();
+    return on;
+}
+#endif
+
 bool tc_ok() {   // as ds4_gguf.cu's: sm_70 and later, STRATA_DS4_NO_TC=1 keeps the F32 kernel
 #if defined(STRATA_USE_HIP)
     return false;
@@ -1178,6 +1306,12 @@ template <int T, bool GU>
 void launch_set(const SetArgs& a, dim3 grid, cudaStream_t s) {
 #if defined(STRATA_USE_HIP)
     if (hipk::launch<T, GU>(a, s)) return;   // (gfx12, STRATA_DS4_HIPK=1: the matrix-core tiles)
+#endif
+#if defined(SYCL_LANGUAGE_VERSION) && defined(STRATA_XMX_SG16)
+    if (xmx_ok()) {
+        launch_set_xmx<T, GU>(a, grid, s);
+        return;
+    }
 #endif
 #if !defined(STRATA_USE_HIP)
     if (tc_ok()) {
@@ -1422,6 +1556,15 @@ bool light_down(const SetArgs& a, cudaStream_t s) {
     if (is_tq(a.td)) return false;
     if (a.n_exp > kLightMaxExp || !light_on() || a.n_embd % 256 != 0 || a.n_ff % 256 != 0) return false;
     return light_set(a, false, s);
+}
+
+void force_tiles(int mode) { g_force_tc.store(mode, std::memory_order_relaxed); }
+bool tiles_xmx() {
+#if defined(SYCL_LANGUAGE_VERSION) && defined(STRATA_XMX_SG16)
+    return xmx_ok();
+#else
+    return false;
+#endif
 }
 
 bool set_gate_up(const SetArgs& a, cudaStream_t s) {

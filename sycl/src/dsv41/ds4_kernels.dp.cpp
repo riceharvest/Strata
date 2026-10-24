@@ -1457,7 +1457,9 @@ __global__ void __launch_bounds__(512) route_ahead_kernel(const float* __restric
             int ix = 0x7fffffff;
             for (int q = 0; q < (int) (blockDim.x >> 5); ++q)
                 if (bv[q] > b || (bv[q] == b && bi[q] < ix)) b = bv[q], ix = bi[q];
-            req->ahead[t][off + r] = ix < n ? ix : -1;
+            // (a pick at -1e8 or below is an expert --prune-experts masked (bias -1e9, ds4_prune.hpp): never routed to, so
+            // not a guess to read ahead; it is chosen here only when the layer keeps fewer than m experts)
+            req->ahead[t][off + r] = ix < n && b > -1e8f ? ix : -1;
             if (ix < n) bs[ix] = -FLT_MAX;
         }
         __syncthreads();

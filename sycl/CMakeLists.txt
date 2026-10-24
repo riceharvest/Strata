@@ -457,7 +457,12 @@ endif()
 # -----------------------------------------------------------------------------
 option(STRATA_BUILD_DSV41 "Build the DeepSeek-V4.1 SYCL engine path (strata-dsv41)" ON)
 if(STRATA_BUILD_DSV41)
+  # (the engine's device code, in the library so the synthetic tests below run the same kernels)
   add_library(strata_dsv41_kernels STATIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41/ds4_kernels.dp.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41/ds4_gguf.dp.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41/ds4_iq.dp.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41/ds4_tq.dp.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41/vendor/exl3.dp.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41/vendor/sampler.dp.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41/vendor/moe_win.dp.cpp
@@ -473,13 +478,9 @@ if(STRATA_BUILD_DSV41)
   add_executable(strata-dsv41
     ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41/ds4_main.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41/ds4_model.dp.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41/ds4_kernels.dp.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41/ds4_vision.dp.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41/ds4_gguf.dp.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41/ds4_gguf_cpu.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41/ds4_iq.dp.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41/ds4_iq_cpu.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41/ds4_tq.dp.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41/ds4_tq_cpu.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41/ds4_gg_cpu.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41/ds4_packinfo.cpp)
@@ -517,5 +518,15 @@ if(STRATA_BUILD_DSV41)
     target_link_libraries(ds4_shim_test PRIVATE strata_core Threads::Threads)
     add_test(NAME ds4_shim_test COMMAND ds4_shim_test)
     set_tests_properties(ds4_shim_test PROPERTIES TIMEOUT 120)   # (a hung kernel fails the test instead of holding the GPU)
+    # --prune-experts: the plan (ds4_prune.hpp) and the engine's routers with the masked biases (~3 MB of device memory)
+    add_executable(ds4_prune_test ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41/ds4_prune_test.cpp)
+    target_link_libraries(ds4_prune_test PRIVATE strata_dsv41_kernels strata_core Threads::Threads)
+    add_test(NAME ds4_prune_test COMMAND ds4_prune_test)
+    set_tests_properties(ds4_prune_test PROPERTIES TIMEOUT 120)
+    # the prompt path's GGUF expert sets on XMX (joint_matrix) against the F32 kernel and a host reference; --bench for timings
+    add_executable(ds4_xmx_test ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41/ds4_xmx_test.cpp)
+    target_link_libraries(ds4_xmx_test PRIVATE strata_dsv41_kernels strata_core Threads::Threads)
+    add_test(NAME ds4_xmx_test COMMAND ds4_xmx_test)
+    set_tests_properties(ds4_xmx_test PROPERTIES TIMEOUT 300)
   endif()
 endif()

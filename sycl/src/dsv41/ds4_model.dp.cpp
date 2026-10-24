@@ -21,6 +21,7 @@
 #include "ds4_kernels.cuh"
 #include "ds4_os.hpp"
 #include "ds4_pool.hpp"
+#include "ds4_prune.hpp"
 #include "ds4_store.hpp"
 #include "ds4_vision.cuh"
 #include "strata/dsv41/exl3_cpu.hpp"
@@ -1931,6 +1932,12 @@ struct Model::Impl {
         prompt_par = par || o.tp > 1 ||
                      ((o.prefill_chunk > 0 || (o.prefill_chunk < 0 && kChunkedPromptDefault)) &&
                       std::getenv("DS4_WINDOWS") == nullptr);
+        // an EXL3 pack's routed experts take tensor-core GEMM tiles in a chunk (x3::set_gate_up / set_down, sm_80 and
+        // later); where those are not built (HIP, the SYCL port, a CUDA card before sm_80: x3::mma_supported() false) they
+        // are empty and a chunk would leave the experts' outputs unwritten.  Such a pack's prompts run in windows of 16
+        // (x3::win_experts), which every build has
+        const bool x3_no_chunks = prompt_par && !pk.gguf && !x3::mma_supported();
+        if (x3_no_chunks) prompt_par = false;
         const bool tp_all = tp > 1 && tp == (int) devs.size();
         for (size_t i = 0; i < devs.size();) {
             Group G;
@@ -1983,7 +1990,10 @@ struct Model::Impl {
             chunk = std::min(kMaxChunk, std::max(dc != nullptr ? 16 : 256, chunk / 16 * 16));
             eg_cap = (size_t) chunk;
             tap_cap = std::max(kWin, 128);
-        } else   // (only as asked for: --prefill-chunk 0, or --tp 1 with --threads off)
+        } else if (x3_no_chunks)
+            std::fprintf(stderr, "ds4: prompts run in windows of %d tokens: this EXL3 pack's chunked prompt path needs the "
+                                 "tensor-core GEMMs (sm_80 and later CUDA), which this build or GPU does not have\n", kWin);
+        else   // (only as asked for: --prefill-chunk 0, or --tp 1 with --threads off)
             std::fprintf(stderr,
                          "ds4: prompts run in windows of %d tokens (%s): long prompts prefill far slower than in\n"
                          "     chunks (a 7-GPU RTX 3090 rig, Maya-S read in place: 8K / 32K tokens 115 / 99 tokens/s,\n"
@@ -2547,15 +2557,7 @@ struct Model::Impl {
                              nth, (unsigned long long) mb, eg_cache.capacity());
         }
         prof.assign((size_t) (g.nl + g.n_mtp) * g.n_exp, 0u);
-        if (!o.profile.empty()) {
-            std::FILE* f = std::fopen(o.profile.c_str(), "rb");
-            if (f != nullptr) {
-                std::vector<uint32_t> p(prof.size());
-                const size_t n = std::fread(p.data(), 4, p.size(), f);
-                if (n == p.size() || n == (size_t) g.nl * g.n_exp) std::copy(p.begin(), p.begin() + (long) n, prof.begin());
-                std::fclose(f);
-            }
-        }
+        prune::load_profile(o.profile, prof, (size_t) g.nl * g.n_exp);   // (missing or another size: all zeros)
 
         // the chunked prompt path's buffers (before the experts: they take what is left)
         if (chunk > 0) {
@@ -3892,106 +3894,28 @@ struct Model::Impl {
         // --prune-experts (opt-in, CHANGES THE ANSWERS): the trunk's routed layers only (the drafter's mtp layers keep all their
         // experts and take none of the budget), each layer's coldest experts by the profile masked out of the router
         auto prunable = [](const Layer& l) { return !l.mtp && l.n_exp > 0 && l.gate_bias != nullptr; };
+        std::vector<prune::LayerInfo> pl;   // (ds4_prune.hpp: the plan, tested on its own by ds4_prune_test)
+        for (const Layer& l : L) pl.push_back({l.il, l.n_exp, l.k_exp, prunable(l)});
         if (o.prune_experts > 0) {
             // without a profile row for a layer (no profile, `none`, a profile of another size) its "coldest" experts
             // would be its last indices: refuse rather than mask experts by number
-            for (const Layer& l : L) {
-                if (!prunable(l)) continue;
-                const uint32_t* p = prof.data() + (size_t) l.il * g.n_exp;
-                uint64_t sum = 0;
-                for (int e = 0; e < l.n_exp; ++e) sum += p[e];
-                if (sum == 0) {
-                    std::fprintf(stderr, "ds4: --prune-experts %d refused: the expert profile has no hits for layer %d (%s); "
-                                         "running with every expert\n",
-                                 o.prune_experts, l.il, o.profile.empty() ? "no profile" : o.profile.c_str());
-                    o.prune_experts = 0;
-                    break;
-                }
+            const int bad = prune::refused_layer(pl, prof.data(), g.n_exp);
+            if (bad >= 0) {
+                std::fprintf(stderr, "ds4: --prune-experts %d refused: the expert profile has no hits for layer %d (%s); "
+                                     "running with every expert\n",
+                             o.prune_experts, bad, o.profile.empty() ? "no profile" : o.profile.c_str());
+                o.prune_experts = 0;
             }
         }
         if (o.prune_experts > 0)
             std::fprintf(stderr, "ds4: WARNING: --prune-experts %d masks the router's coldest experts: the answers change (a "
                                  "token's pick of a masked expert goes to another one); the quality cost is not measured\n",
                          o.prune_experts);
-        std::vector<int> prune_alloc(L.size(), 0);
-        if (o.prune_experts > 0 && !L.empty()) {
-            int n_moe = 0;
-            for (const Layer& l : L)
-                if (prunable(l)) ++n_moe;
-            if (n_moe > 0) {
-                const int target_budget = std::min(o.prune_experts, L[0].n_exp) * n_moe;
-                std::vector<std::vector<double>> cum_p(L.size());
-                for (const Layer& l : L) {
-                    if (!prunable(l)) continue;
-                    const uint32_t* p = prof.data() + (size_t) l.il * g.n_exp;
-                    std::vector<uint32_t> sorted_p(p, p + l.n_exp);
-                    std::sort(sorted_p.begin(), sorted_p.end(), std::greater<uint32_t>());
-                    double sum = 0;
-                    for (uint32_t x : sorted_p) sum += x;
-                    if (sum <= 0) sum = 1.0;
-                    cum_p[(size_t) l.il].resize((size_t) l.n_exp);
-                    double cur = 0;
-                    for (int i = 0; i < l.n_exp; ++i) {
-                        cur += sorted_p[(size_t) i];
-                        cum_p[(size_t) l.il][(size_t) i] = cur / sum;
-                    }
-                }
-                // Binary search for coverage floor F in [0.0, 1.0]
-                double low = 0.0, high = 1.0;
-                for (int iter = 0; iter < 50; ++iter) {
-                    const double mid = 0.5 * (low + high);
-                    int needed = 0;
-                    for (const Layer& l : L) {
-                        if (!prunable(l)) continue;
-                        const auto& c = cum_p[(size_t) l.il];
-                        auto it = std::lower_bound(c.begin(), c.end(), mid);
-                        int idx = (int) std::distance(c.begin(), it) + 1;
-                        needed += std::max(l.k_exp, std::min(l.n_exp, idx));
-                    }
-                    if (needed > target_budget) high = mid;
-                    else low = mid;
-                }
-                int cur_budget = 0;
-                for (const Layer& l : L) {
-                    if (!prunable(l)) continue;
-                    const auto& c = cum_p[(size_t) l.il];
-                    auto it = std::lower_bound(c.begin(), c.end(), low);
-                    int idx = (int) std::distance(c.begin(), it) + 1;
-                    prune_alloc[(size_t) l.il] = std::max(l.k_exp, std::min(l.n_exp, idx));
-                    cur_budget += prune_alloc[(size_t) l.il];
-                }
-                while (cur_budget < target_budget) {
-                    int best_l = -1;
-                    double min_cov = 2.0;
-                    for (const Layer& l : L) {
-                        if (!prunable(l) || prune_alloc[(size_t) l.il] >= l.n_exp) continue;
-                        const double cov = cum_p[(size_t) l.il][(size_t) (prune_alloc[(size_t) l.il] - 1)];
-                        if (cov < min_cov) { min_cov = cov; best_l = l.il; }
-                    }
-                    if (best_l < 0) break;
-                    prune_alloc[(size_t) best_l]++;
-                    cur_budget++;
-                }
-                while (cur_budget > target_budget) {
-                    int best_l = -1;
-                    double max_cov = -1.0;
-                    for (const Layer& l : L) {
-                        if (!prunable(l) || prune_alloc[(size_t) l.il] <= l.k_exp) continue;
-                        const double cov = cum_p[(size_t) l.il][(size_t) (prune_alloc[(size_t) l.il] - 1)];
-                        if (cov > max_cov) { max_cov = cov; best_l = l.il; }
-                    }
-                    if (best_l < 0) break;
-                    prune_alloc[(size_t) best_l]--;
-                    cur_budget--;
-                }
-            }
-        }
+        const std::vector<int> prune_alloc = prune::allocate(pl, prof.data(), g.n_exp, o.prune_experts);   // (0: all)
         for (Layer& l : L) {
             // the hottest experts of the profile first, then by index
-            std::vector<int> order((size_t) l.n_exp);
-            std::iota(order.begin(), order.end(), 0);
             const uint32_t* p = prof.data() + (size_t) l.il * g.n_exp;
-            std::stable_sort(order.begin(), order.end(), [&](int a, int b) { return p[a] > p[b]; });
+            const std::vector<int> order = prune::hot_order(p, l.n_exp);
             l.slot.assign((size_t) l.n_exp, -1);
             l.host.assign((size_t) l.n_exp, nullptr);
             // a layer with experts on both sides keeps one VRAM slot free for the cache's swaps
@@ -4090,8 +4014,8 @@ struct Model::Impl {
                 CK(cudaMemcpy(x.vram_tab, tab.data(), tab.size() * 8, cudaMemcpyHostToDevice));
             }
             const int prune_n = prune_alloc[(size_t) l.il];
-            if (prune_n > 0 && prune_n < l.n_exp && prunable(l)) {
-                for (int i = prune_n; i < l.n_exp; ++i) l.heat[(size_t) order[(size_t) i]] = -1e9f;
+            if (prune::masks({l.il, l.n_exp, l.k_exp, prunable(l)}, prune_n)) {
+                prune::mask(l.heat.data(), order, prune_n, l.n_exp);
                 // every member of a group routes with its own copy of the biases: each one masked the same
                 std::vector<float> gb((size_t) l.n_exp);
                 for (int m = 0; m < l.nm; ++m) {
@@ -4100,7 +4024,7 @@ struct Model::Impl {
                     for (float* b : {x.gate_bias, x.gate_bias_vl}) {
                         if (b == nullptr) continue;
                         CK(cudaMemcpy(gb.data(), b, (size_t) l.n_exp * sizeof(float), cudaMemcpyDeviceToHost));
-                        for (int i = prune_n; i < l.n_exp; ++i) gb[(size_t) order[(size_t) i]] = -1e9f;
+                        prune::mask(gb.data(), order, prune_n, l.n_exp);
                         CK(cudaMemcpy(b, gb.data(), (size_t) l.n_exp * sizeof(float), cudaMemcpyHostToDevice));
                     }
                 }

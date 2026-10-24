@@ -95,6 +95,11 @@ struct SetArgs {
 };
 bool set_gate_up(const SetArgs& a, cudaStream_t s);
 bool set_down(const SetArgs& a, cudaStream_t s);
+/// (SYCL) The sets' GEMM tiles: 1 Xe2's XMX (joint_matrix, F16 operands as CUDA's tensor cores take them; the default in an
+/// AOT bmg / lnl build), 0 the F32 FMA kernel (STRATA_DS4_NO_TC=1), -1 back to the default.  For the tests and benchmarks.
+void force_tiles(int mode);
+/// Whether the sets' tiles run on XMX now.
+bool tiles_xmx();
 /// The light form alone (the set's experts of at most 16 rows; the others untouched), for any of these types and MXFP4
 /// (tg / td 39: ds4_gguf.cu's experts): false (nothing launched) when it is switched off - the caller's tiles take every
 /// expert then; true: they take those of more rows (skip_le 16).
