@@ -253,23 +253,26 @@ template <typename A, typename B>
 __dpct_inline__ auto min(A a, B b) { return (a < b) ? a : b; }
 template <typename A, typename B>
 __dpct_inline__ auto max(A a, B b) { return (a > b) ? a : b; }
-__dpct_inline__ float fabsf(float a) { return std::abs(a); }
+// These names are libm's C functions (<cmath> declares them extern "C"), so each definition here IS that function.  A body
+// through std:: lowers back to a call of the same symbol under -fp-model=precise: on the B70 expf called itself until the GPU
+// was killed (hc_split, swiglu: the first layer of every prompt never finished).  The sycl:: built-ins never come back here.
+__dpct_inline__ float fabsf(float a) { return sycl::fabs(a); }
 __dpct_inline__ float rsqrtf(float a) { return 1.0f / std::sqrt(a); }
 __dpct_inline__ float __fmul_rn(float a, float b) { return a * b; }
 __dpct_inline__ float __fdiv_rn(float a, float b) { return a / b; }
 __dpct_inline__ float __fsub_rn(float a, float b) { return a - b; }
 __dpct_inline__ float __fadd_rn(float a, float b) { return a + b; }
 __dpct_inline__ float __fmaf_rn(float a, float b, float c) { return std::fma(a, b, c); }
-__dpct_inline__ float expf(float x) { return std::exp(x); }
-__dpct_inline__ float __expf(float x) { return std::exp(x); }
-__dpct_inline__ float logf(float x) { return std::log(x); }
-__dpct_inline__ float __logf(float x) { return std::log(x); }
+__dpct_inline__ float expf(float x) { return sycl::exp(x); }
+__dpct_inline__ float __expf(float x) { return sycl::exp(x); }
+__dpct_inline__ float logf(float x) { return sycl::log(x); }
+__dpct_inline__ float __logf(float x) { return sycl::log(x); }
 template <typename T>
 __dpct_inline__ T __ldg(const T* ptr) { return *ptr; }
-__dpct_inline__ float erff(float x) { return std::erf(x); }
+__dpct_inline__ float erff(float x) { return sycl::erf(x); }
 __dpct_inline__ void sincosf(float x, float* s, float* c) {
-    *s = std::sin(x);
-    *c = std::cos(x);
+    *s = sycl::sin(x);
+    *c = sycl::cos(x);
 }
 __dpct_inline__ int __float2int_rn(float f) {
 #if defined(__SYCL_DEVICE_ONLY__)

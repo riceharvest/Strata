@@ -1,9 +1,10 @@
 // ds4_shim_test: checks of sycl/src/dsv41/ds4_sycl.hpp: host-evaluated launch args, __byte_perm vs CUDA, a polled-flag handshake with a
 // bounded spin, fmaxf NaN, SLM alignment, cudaMemGetInfo / cudaStreamQuery, the device list, host registration, a
-// 300 MiB zero fill.  About 300 MB of device memory.
+// 300 MiB zero fill, the libm-named math wrappers in a kernel.  About 300 MB of device memory.
 #include "ds4_sycl.hpp"
 
 #include <atomic>
+#include <cmath>
 #include <chrono>
 #include <cstdio>
 #include <thread>
@@ -73,6 +74,20 @@ static uint32_t perm_ref(uint32_t x, uint32_t y, uint32_t s) {   // CUDA __byte_
     uint32_t r = 0;
     for (int i = 0; i < 4; ++i) r |= (uint32_t) ((v >> (8 * ((s >> (4 * i)) & 7))) & 0xff) << (8 * i);
     return r;
+}
+
+// the shim's libm-named wrappers in a kernel (expf called itself on the B70 until the GPU was killed: a hang here is that bug back)
+__global__ void math_kernel(const float* x, float* y) {
+    const int i = threadIdx.x;
+    float sn, cs;
+    sincosf(x[i], &sn, &cs);
+    y[i * 7 + 0] = expf(x[i]);
+    y[i * 7 + 1] = __expf(x[i]);
+    y[i * 7 + 2] = logf(fabsf(x[i]) + 1.0f);
+    y[i * 7 + 3] = __logf(fabsf(x[i]) + 1.0f);
+    y[i * 7 + 4] = erff(x[i]);
+    y[i * 7 + 5] = sn;
+    y[i * 7 + 6] = cs;
 }
 
 int main() {
@@ -290,6 +305,28 @@ int main() {
         }
         cudaFree(d);
         cudaFreeHost(pin);
+    }
+    // 11. expf / __expf / logf / __logf / erff / sincosf / fabsf on the device against the host's libm (a few ulp)
+    {
+        constexpr int n = 32;
+        float hx[n], hy[n * 7];
+        for (int i = 0; i < n; ++i) hx[i] = -4.0f + 0.25f * (float) i;
+        float *dx = nullptr, *dy = nullptr;
+        cudaMalloc((void**) &dx, sizeof hx);
+        cudaMalloc((void**) &dy, sizeof hy);
+        cudaMemcpy(dx, hx, sizeof hx, cudaMemcpyHostToDevice);
+        STRATA_LAUNCH(s, 1, n, 0, math_kernel, (const float*) dx, dy);
+        cudaMemcpyAsync(hy, dy, sizeof hy, cudaMemcpyDeviceToHost, s);
+        cudaStreamSynchronize(s);
+        int bad = 0;
+        for (int i = 0; i < n; ++i) {
+            const double x = hx[i], want[7] = {std::exp(x), std::exp(x), std::log(std::fabs(x) + 1), std::log(std::fabs(x) + 1),
+                                               std::erf(x), std::sin(x), std::cos(x)};
+            for (int j = 0; j < 7; ++j) bad += std::fabs(hy[i * 7 + j] - want[j]) > 1e-5 * (1.0 + std::fabs(want[j]));
+        }
+        CHECK(bad == 0, "math wrappers: %d of %d values off", bad, n * 7);
+        cudaFree(dx);
+        cudaFree(dy);
     }
     cudaStreamDestroy(s);
     std::printf(fails == 0 ? "ALL OK\n" : "%d FAILED\n", fails);
