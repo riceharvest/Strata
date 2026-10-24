@@ -1,5 +1,6 @@
 // ds4_shim_test: checks of sycl/src/dsv41/ds4_sycl.hpp: host-evaluated launch args, __byte_perm vs CUDA, a polled-flag handshake with a
-// bounded spin, fmaxf NaN, SLM alignment, cudaMemGetInfo / cudaStreamQuery.  Small: < 1 MB of device memory.
+// bounded spin, fmaxf NaN, SLM alignment, cudaMemGetInfo / cudaStreamQuery, the device list, host registration, a
+// 300 MiB zero fill.  About 300 MB of device memory.
 #include "ds4_sycl.hpp"
 
 #include <atomic>
@@ -75,6 +76,20 @@ static uint32_t perm_ref(uint32_t x, uint32_t y, uint32_t s) {   // CUDA __byte_
 }
 
 int main() {
+    std::setvbuf(stdout, nullptr, _IOLBF, 0);   // (a line at a time: a timeout keeps what was printed)
+    // as ds4_main does before its first SYCL call (dpct lists every SYCL device otherwise: the card through Level Zero, the
+    // same card through OpenCL, the CPU - and the engine gave each of them layers)
+    setenv("ONEAPI_DEVICE_SELECTOR", "level_zero:gpu", 0);
+    {
+        int n = 0, bad = 0;
+        cudaGetDeviceCount(&n);
+        for (int i = 0; i < n; ++i) {
+            const sycl::device dv = dpct::dev_mgr::instance().get_device(i);
+            bad += !dv.is_gpu() || dv.get_backend() != sycl::backend::ext_oneapi_level_zero;
+        }
+        std::printf("dpct devices under ONEAPI_DEVICE_SELECTOR=%s: %d (%d not a Level Zero GPU)\n", std::getenv("ONEAPI_DEVICE_SELECTOR"), n, bad);
+        CHECK(n >= 1 && bad == 0, "dpct lists %d devices, %d of them not Level Zero GPUs", n, bad);
+    }
     std::printf("device: %s\n", dpct::get_current_device().get_info<sycl::info::device::name>().c_str());
     cudaStream_t s = nullptr;
     cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking);
@@ -208,6 +223,73 @@ int main() {
         for (int v : back) bad += v != 5;
         CHECK(bad == 0, "pageable async copy: %d of 1024 changed", bad);
         cudaFree(d);
+    }
+    // 8. host registration: Mapped is refused (the device cannot read plain mmap'd memory on xe), a plain registration is
+    // kept; cudaHostGetDevicePointer only for USM
+    {
+        std::vector<char> plain(1 << 16);
+        CHECK(cudaHostRegister(plain.data(), plain.size(), cudaHostRegisterMapped) != cudaSuccess, "cudaHostRegister(Mapped) succeeded");
+        void* dp = (void*) 1;
+        CHECK(cudaHostGetDevicePointer(&dp, plain.data(), 0) != cudaSuccess && dp == nullptr, "cudaHostGetDevicePointer(malloc'd) gave %p", dp);
+        CHECK(cudaHostRegister(plain.data(), plain.size(), 0u) == cudaSuccess, "cudaHostRegister(Default)");
+        CHECK(!ds4_shim::pageable(plain.data() + 100, dpct::get_in_order_queue().get_context()), "a registered range still pageable");
+        cudaHostUnregister(plain.data());
+        CHECK(ds4_shim::pageable(plain.data() + 100, dpct::get_in_order_queue().get_context()), "an unregistered range not pageable");
+        void* h = nullptr;
+        cudaHostAlloc(&h, 4096, cudaHostAllocMapped);
+        dp = nullptr;
+        CHECK(cudaHostGetDevicePointer(&dp, h, 0) == cudaSuccess && dp == h, "cudaHostGetDevicePointer(Mapped USM) %p for %p", dp, h);
+        cudaFreeHost(h);
+    }
+    // 9. a zero fill past 256 MiB (strata::big_fill_zero's kernels, not one blit) of an odd size: every byte, the tail too
+    {
+        const size_t n = ((size_t) 300 << 20) + 5;
+        uint8_t* d = nullptr;
+        CHECK(cudaMalloc(&d, n) == cudaSuccess, "cudaMalloc 300 MiB");
+        for (int pass = 0; pass < 2; ++pass) {
+            cudaMemset(d, 0xab, n);
+            const auto t0 = std::chrono::steady_clock::now();
+            if (pass == 0) cudaMemset(d, 0, n);
+            else {
+                cudaMemsetAsync(d, 0, n, s);
+                cudaStreamSynchronize(s);
+            }
+            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            unsigned* nz = nullptr;
+            cudaHostAlloc((void**) &nz, 64, cudaHostAllocMapped);
+            nz[0] = 0;
+            const uint8_t* cd = d;
+            dpct::get_in_order_queue().parallel_for(sycl::range<1>(n), [=](sycl::id<1> i) {
+                if (cd[i] != 0) sycl::atomic_ref<unsigned, sycl::memory_order::relaxed, sycl::memory_scope::system>(nz[0]).fetch_add(1u);
+            }).wait();
+            std::printf("%s of %zu bytes (300 MiB + 5) to 0: %.1f ms, %u bytes not 0\n", pass ? "cudaMemsetAsync" : "cudaMemset", n, ms, nz[0]);
+            CHECK(nz[0] == 0, "big zero fill (%s): %u bytes not 0", pass ? "async" : "sync", nz[0]);
+            cudaFreeHost(nz);
+        }
+        cudaFree(d);
+    }
+    // 10. a strided 2-D copy (a TP member's part of each down row: 5,120 rows of 297 of 594 bytes, IQ2_XXS) host -> device -> host,
+    // from pinned and from pageable memory, against the bytes.  (Its speed: ~12 ms on the B70 either as one ext_oneapi_memcpy2d or
+    // as a memcpy a row, measured 2026-10-24 - so the shim keeps the memcpy a row)
+    {
+        const size_t W = 297, SP = 594, H = 5120, DP = 304;
+        std::vector<uint8_t> src(SP * H), back(W * H);
+        for (size_t i = 0; i < src.size(); ++i) src[i] = (uint8_t) (i * 2654435761u >> 13);
+        uint8_t *pin = nullptr, *d = nullptr;
+        cudaHostAlloc((void**) &pin, SP * H, 0);
+        std::memcpy(pin, src.data(), SP * H);
+        cudaMalloc(&d, DP * H);
+        for (int from_pin = 0; from_pin < 2; ++from_pin) {
+            cudaMemset(d, 0, DP * H);
+            cudaMemcpy2DAsync(d, DP, from_pin ? (const uint8_t*) pin : src.data(), SP, W, H, cudaMemcpyHostToDevice, s);
+            cudaMemcpy2DAsync(back.data(), W, d, DP, W, H, cudaMemcpyDeviceToHost, s);
+            cudaStreamSynchronize(s);
+            size_t bad = 0;
+            for (size_t r = 0; r < H; ++r) bad += std::memcmp(back.data() + r * W, src.data() + r * SP, W) != 0;
+            CHECK(bad == 0, "cudaMemcpy2DAsync (%s): %zu of %zu rows wrong", from_pin ? "pinned" : "pageable", bad, H);
+        }
+        cudaFree(d);
+        cudaFreeHost(pin);
     }
     cudaStreamDestroy(s);
     std::printf(fails == 0 ? "ALL OK\n" : "%d FAILED\n", fails);
