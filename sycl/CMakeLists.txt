@@ -444,3 +444,58 @@ if(STRATA_SYCL_PARITY)
     target_link_libraries(kq_cpu_bench PRIVATE strata_kernels_cpu)
   endif()
 endif()
+
+# -----------------------------------------------------------------------------
+# DeepSeek-V4.1-Flash SYCL Engine Path (strata-dsv41)
+# -----------------------------------------------------------------------------
+option(STRATA_BUILD_DSV41 "Build the DeepSeek-V4.1 SYCL engine path (strata-dsv41)" ON)
+if(STRATA_BUILD_DSV41)
+  add_library(strata_dsv41_kernels STATIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41/vendor/exl3.dp.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41/vendor/sampler.dp.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41/vendor/moe_win.dp.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41/vendor/exl3_cpu.cpp)
+
+  target_include_directories(strata_dsv41_kernels PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41
+    ${STRATA_ROOT}/include
+    ${STRATA_ROOT}/third_party/ggml)
+  target_link_libraries(strata_dsv41_kernels PUBLIC strata_core)
+
+  add_executable(strata-dsv41
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41/ds4_main.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41/ds4_model.dp.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41/ds4_kernels.dp.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41/ds4_vision.dp.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41/ds4_gguf.dp.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41/ds4_gguf_cpu.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41/ds4_iq.dp.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41/ds4_iq_cpu.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41/ds4_tq.dp.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41/ds4_tq_cpu.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41/ds4_gg_cpu.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41/ds4_packinfo.cpp)
+
+  if(NOT STRATA_BUILD_ID AND EXISTS ${STRATA_ROOT}/BUILD_ID)
+    file(STRINGS ${STRATA_ROOT}/BUILD_ID STRATA_BUILD_ID LIMIT_COUNT 1)
+  endif()
+  if(NOT STRATA_BUILD_ID)
+    set(STRATA_BUILD_ID "sycl-b70")
+  endif()
+
+  set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41/ds4_main.cpp PROPERTIES
+    COMPILE_DEFINITIONS "DS4_BUILD_ID=\"${STRATA_BUILD_ID}\"")
+  set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41/ds4_gg_cpu.cpp PROPERTIES
+    COMPILE_OPTIONS "-mavx512f;-mavx512bw;-mavx512vl;-mavx512vnni;-mavx2;-mfma;-mf16c")
+
+  target_include_directories(strata-dsv41 PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41
+    ${STRATA_ROOT}/include
+    ${STRATA_ROOT}/third_party/ggml)
+
+  target_compile_options(strata-dsv41 PUBLIC -qmkl=sequential)
+  target_link_options(strata-dsv41 PUBLIC -qmkl=sequential)
+  target_link_libraries(strata-dsv41 PRIVATE strata_dsv41_kernels strata_core Threads::Threads)
+endif()
