@@ -39,6 +39,10 @@ struct Options {
     // most (never past the RAM the process can still get less 8 GB); 0: off, the OS page cache as before
     double ssd_cache_gb = -1.0;   // < 0: auto (the RAM the process can get less a floor, at most 48 GB; off below 4 GB), 0: off
     int ssd_policy = 0;
+    float disk_skip_w = -1.0f;        // < 0: auto (STRATA_DS4_DISK_SKIP_W, or 0.025 if ssd_cache active), 0: off
+    int disk_skip_from = 0;           // layers from which disk_skip_w takes effect
+    int engram_cache_mb = -1;         // < 0: auto (scaled to RAM, up to 4096 MB), 0: off, > 0: exact MB
+    int engram_threads = -1;          // < 0: auto (32 on Linux NVMe), > 0: exact reader thread count
     // dspark_auto: the drafter is loaded only where the routed experts fit the GPUs (more than 1.5x what they have, the verify rounds
     // read 3.3x the bytes of a token and measured no faster than plain decoding, and the drafter's 7 GB of experts take the VRAM the
     // trunk's hottest would have had); --dspark on / off / none says it outright

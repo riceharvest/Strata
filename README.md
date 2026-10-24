@@ -174,6 +174,11 @@ Or select **DeepSeek V4.1-Flash (`1.75bpw` / `2.00bpw` / `2.25bpw`)** interactiv
 | `STRATA_ESIMD_PREFILL` | `1` (default) | Uses fused Int8 Xe2 ESIMD DPAS (`8x16x32` XMX) for MoE prefill across all supported quant types (`IQ3_S`, `IQ3_XXS`, `IQ2_S`, `IQ2_XS`, `IQ2_XXS`, `IQ4_XS`, `IQ4_NL`, `Q2_0`, `Q8_0`). |
 | `STRATA_DPAS_DENSE` | `1` (default) | Uses Xe2 BF16 XMX DPAS (`esimd_gemm.dp.cpp`) for dense trunk / attention / LM-head GEMMs. |
 | `STRATA_EXPERT_BUDGET_MB` | Auto (~22–26 GB) | Override the GDDR6 VRAM budget (in MiB) dedicated to the GPU hot-expert cache. |
+| `STRATA_DS4_DISK_SKIP_W` | `0.025` (auto on B70) | Skips blocking NVMe SSD reads for cold routed experts carrying <2.5% token weight (cuts SSD stall time by ~40–50%). |
+| `DS4_ENGRAM_CACHE_MB` | `4096` (auto on 64 GB) | In-memory cache for the 111 GB `IQ4_NL` Engram table (uncapped from upstream's 256 MB default). |
+| `DS4_ENGRAM_THREADS` | `32–64` (auto on Linux) | Number of asynchronous reader threads to saturate NVMe controller queue depth for parallel IOPS. |
+| `DS4_AHEAD_EXTRA` | `2` (auto with cache) | Lookahead expert predictor padding (predicts top-8 instead of top-6), raising next-layer lookahead hit rate to >92%. |
+| `STRATA_DS4_SLOT_KEEP` | `1` | Keeps multi-turn agent conversation KV slots cached to avoid re-reading long prompts across turns. |
 | `NEOReadDebugKeys=1` `UseKmdMigration=0` | Set in `strata-sycl.sh` | Prevents the Level Zero / NEO runtime from migrating USM allocations through KMD page-fault handlers. |
 
 ---
