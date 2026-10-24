@@ -37,8 +37,9 @@ while IFS= read -r k; do
 done < <(compgen -e)
 envs=()
 for k in "${!setting[@]}"; do
-    # the engine tests the switches by presence: a value of 0 (or empty) means "not set", so it is not passed on
-    case "${setting[$k]}" in 0|"") ;; *) envs+=(-e "$k=${setting[$k]}") ;; esac
+    # an empty value is "not set" and is not passed on; a 0 is, so it turns off the engine's own B70 default
+    # (strata::apply_b70_defaults) too
+    case "${setting[$k]}" in "") ;; *) envs+=(-e "$k=${setting[$k]}") ;; esac
 done
 shm=()
 if [ "${STRATA_SYCL_SHM:-1}" != 0 ] && [ -d /dev/shm ]; then shm=(-v /dev/shm:/dev/shm); fi

@@ -102,9 +102,13 @@ inline void host_free_polled(void* p, sycl::queue& q) {
 // The kernel driver of the Intel GPU ("xe", "i915", or "" when unknown), from sysfs.  The driver decides what the GPU
 // may read: an Arc A750 (i915) reads ordinary host memory a kernel is handed; an Arc Pro B70 (xe) page-faults on it
 // (ccs0, FaultType 0, address in the CPU's mmap range) and the card times the job out.
+#include <algorithm>
+#include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <thread>
+#include <utility>
 namespace strata {
 inline const std::string& intel_gpu_driver() {
     static const std::string drv = [] {
@@ -163,6 +167,29 @@ inline IntelGpuGen intel_gpu_gen(const sycl::device& d) {
         return n[i] == 'B' ? IntelGpuGen::Battlemage : IntelGpuGen::Alchemist;
     }
     return IntelGpuGen::Unknown;
+}
+
+// The B70's run-time switches (this branch runs on an Arc Pro B70 under xe and nothing else): the device-built verify
+// plan, no host handshakes in it (xe does not show the GPU the host's flag stores), and the host copy threads, so
+// `build-sycl-aot/strata` run by hand behaves as it does under sycl/serve/strata-sycl.sh.  A variable that is set
+// wins, "0" included (STRATA_VERIFY_NO_HOST=0 turns the switch off); STRATA_B70_DEFAULTS=0 skips the table.
+inline void apply_b70_defaults() {
+    if (const char* off = std::getenv("STRATA_B70_DEFAULTS"); off != nullptr && off[0] == '0') return;
+    const unsigned hw = std::thread::hardware_concurrency();
+    const std::string stager = std::to_string(hw ? std::min(12u, hw) : 12u);
+    const std::pair<const char*, std::string> defaults[] = {
+        {"STRATA_VERIFY_DEVICE_PLAN", "1"},
+        {"STRATA_VERIFY_NO_HOST", "1"},
+        {"STRATA_STAGER_THREADS", stager},
+    };
+    std::string applied;
+    for (const auto& [k, v] : defaults) {
+        if (std::getenv(k) != nullptr) continue;
+        setenv(k, v.c_str(), 0);
+        applied += (applied.empty() ? "" : " ") + std::string(k) + "=" + v;
+    }
+    if (!applied.empty())
+        std::fprintf(stderr, "strata: B70 defaults: %s (set one to 0 to turn it off; STRATA_B70_DEFAULTS=0: none)\n", applied.c_str());
 }
 }  // namespace strata
 
