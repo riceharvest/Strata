@@ -596,6 +596,8 @@ void launch_gu_wg(sycl::queue& q, const GArgs a, int nrowblocks) {
             barrier();   // the codebook and chunk 0 are in local memory
             simd<float, 16> d = 0.f;
             simd<uint32_t, 16> w0 = 0, w1 = 0, w2 = 0, w3 = 0;
+            simd<uint32_t, NS == 2 ? 192 : 16> fb = 0x01010101u;   // NS == 2: [values 0..15 | zeros | values 16..31], see the step below
+            if constexpr (NS == 2) fb.template select<64, 1>(64) = 0u;
             for (int c = 0; c < nchunks; ++c) {
                 const int sb = c >> 1;
                 const int stage_off = L::TB + (c & 1) * L::STAGE;
@@ -617,142 +619,147 @@ void launch_gu_wg(sycl::queue& q, const GArgs a, int nrowblocks) {
 #pragma unroll 1
                 for (int ib4 = 0; ib4 < 4; ++ib4) {
                     const int ib = ((c & 1) << 2) + ib4;
-                    simd<uint32_t, 128> fr0 = 0x01010101u, fr1 = 0u;
-                    simd<float, 16> sw0 = 1.f, sw1 = 1.f;
-                    if (!(a.dbg & 1)) {
-                        if constexpr (F == T_IQ3S) {
-                            simd<uint32_t, 16> q0 = ld32(We, ro + (P + 2 + 8 * ib));
-                            simd<uint32_t, 16> q1 = ld32(We, ro + (P + 6 + 8 * ib));
-                            simd<uint32_t, 16> sg = ld32(We, ro + (P + 74 + 4 * ib));
-                            simd<uint32_t, 16> qhv = (((ib < 4) ? w1 : w2) >> (8 * (ib & 3))) & 0xffu;
-                            simd<uint32_t, 16> scn = ((w0 >> (8 * (ib >> 1))) >> (4 * (ib & 1))) & 0xfu;
-                            sw0 = d * simd<float, 16>(simd<int, 16>(scn * 2u + 1u));
-#pragma unroll
-                            for (int r = 0; r < 8; ++r) {
-                                simd<uint32_t, 16> qsw = r < 4 ? q0 : q1;
-                                simd<uint32_t, 16> idx = ((qsw >> (8 * (r & 3))) & 0xffu) | (((qhv >> r) & 1u) << 8);
-                                simd<uint32_t, 16> g = slm_gather<uint32_t, 16>(idx << 2);
-                                simd<uint32_t, 16> nib = ((sg >> (8 * (r >> 1))) >> (4 * (r & 1))) & 0xfu;
-                                fr0.template select<16, 1>(16 * r) = apply_signs(g, nib);
+                    if constexpr (NS == 2) {
+                        // IQ2_S / IQ2_XS: two scales per 32 values.  The low half's values go to fb[0, 64) and its DPAS reads fb[0, 128)
+                        // (the upper half zero), then the high half's go to fb[128, 192) and its DPAS reads fb[64, 192): one half's
+                        // operand and products are live at a time, and every output gets the low half's term before the high half's as before
+                        simd<uint32_t, 16> qa, qb, scb;
+                        simd<float, 16> sw0 = 1.f, sw1 = 1.f;
+                        if (!(a.dbg & 1)) {
+                            if constexpr (F == T_IQ2S) {
+                                qa = ld32(We, ro + (P + 2 + 4 * ib));    // grid index low bytes
+                                qb = ld32(We, ro + (P + 34 + 4 * ib));   // signs
+                                scb = (((ib < 4) ? w0 : w1) >> (8 * (ib & 3))) & 0xffu;
+                            } else {
+                                qa = ld32(We, ro + (P + 2 + 8 * ib));
+                                qb = ld32(We, ro + (P + 6 + 8 * ib));
+                                scb = (((ib < 4) ? w0 : w1) >> (8 * (ib & 3))) & 0xffu;
                             }
-                        } else if constexpr (F == T_IQ3XXS) {
-                            simd<uint32_t, 16> q0 = ld32(We, ro + (P + 2 + 8 * ib));
-                            simd<uint32_t, 16> q1 = ld32(We, ro + (P + 6 + 8 * ib));
-                            simd<uint32_t, 16> aux = ld32(We, ro + (P + 66 + 4 * ib));
-                            sw0 = d * simd<float, 16>(simd<int, 16>((aux >> 28) * 2u + 1u)) * 0.25f;
-#pragma unroll
-                            for (int il = 0; il < 4; ++il) {
-                                simd<uint32_t, 16> sbyte = slm_gather<uint32_t, 16>(1024u + (((aux >> (7 * il)) & 127u) << 2));
-#pragma unroll
-                                for (int hh = 0; hh < 2; ++hh) {
-                                    const int r = 2 * il + hh;
-                                    simd<uint32_t, 16> qsw = r < 4 ? q0 : q1;
-                                    simd<uint32_t, 16> idx = (qsw >> (8 * (r & 3))) & 0xffu;
-                                    simd<uint32_t, 16> g = slm_gather<uint32_t, 16>(idx << 2);
-                                    fr0.template select<16, 1>(16 * r) = apply_signs(g, (sbyte >> (4 * hh)) & 0xfu);
-                                }
-                            }
-                        } else if constexpr (F == T_IQ2S) {
-                            simd<uint32_t, 16> idw = ld32(We, ro + (P + 2 + 4 * ib));
-                            simd<uint32_t, 16> sgw = ld32(We, ro + (P + 34 + 4 * ib));
-                            simd<uint32_t, 16> qhb = (((ib < 4) ? w2 : w3) >> (8 * (ib & 3))) & 0xffu;
-                            simd<uint32_t, 16> scb = (((ib < 4) ? w0 : w1) >> (8 * (ib & 3))) & 0xffu;
                             sw0 = d * simd<float, 16>(simd<int, 16>((scb & 0xfu) * 2u + 1u)) * 0.125f;
                             sw1 = d * simd<float, 16>(simd<int, 16>((scb >> 4) * 2u + 1u)) * 0.125f;
+                        }
 #pragma unroll
-                            for (int il = 0; il < 4; ++il) {
-                                simd<uint32_t, 16> idx = ((idw >> (8 * il)) & 0xffu) | ((qhb << (8 - 2 * il)) & 0x300u);
-                                simd<uint32_t, 16> gl = gather<uint32_t, 16>(T + O_IQ2S, idx << 3);
-                                simd<uint32_t, 16> gh = gather<uint32_t, 16>(T + O_IQ2S, (idx << 3) + 4u);
-                                simd<uint32_t, 16> sbyte = (sgw >> (8 * il)) & 0xffu;
-                                simd<uint32_t, 16> vl = apply_signs(gl, sbyte & 0xfu);
-                                simd<uint32_t, 16> vh = apply_signs(gh, sbyte >> 4);
-                                if (il < 2) {
-                                    fr0.template select<16, 1>(16 * (2 * il)) = vl;
-                                    fr0.template select<16, 1>(16 * (2 * il + 1)) = vh;
-                                } else {
-                                    fr1.template select<16, 1>(16 * (2 * il)) = vl;
-                                    fr1.template select<16, 1>(16 * (2 * il + 1)) = vh;
+                        for (int hf = 0; hf < 2; ++hf) {
+                            if (!(a.dbg & 1)) {
+#pragma unroll
+                                for (int il = 2 * hf; il < 2 * hf + 2; ++il) {
+                                    simd<uint32_t, 16> gl, gh, sbyte;
+                                    if constexpr (F == T_IQ2S) {
+                                        simd<uint32_t, 16> qhb = (((ib < 4) ? w2 : w3) >> (8 * (ib & 3))) & 0xffu;
+                                        simd<uint32_t, 16> idx = ((qa >> (8 * il)) & 0xffu) | ((qhb << (8 - 2 * il)) & 0x300u);
+                                        gl = gather<uint32_t, 16>(T + O_IQ2S, idx << 3);
+                                        gh = gather<uint32_t, 16>(T + O_IQ2S, (idx << 3) + 4u);
+                                        sbyte = (qb >> (8 * il)) & 0xffu;
+                                    } else {
+                                        simd<uint32_t, 16> qsw = (il < 2) ? qa : qb;
+                                        simd<uint32_t, 16> qv = (il & 1) ? (qsw >> 16) : (qsw & 0xffffu);
+                                        simd<uint32_t, 16> idx = qv & 511u;
+                                        gl = gather<uint32_t, 16>(T + O_IQ2XS, idx << 3);
+                                        gh = gather<uint32_t, 16>(T + O_IQ2XS, (idx << 3) + 4u);
+                                        sbyte = gather<uint32_t, 16>(T + O_KSIGNS, (qv >> 9) << 2);
+                                    }
+                                    fb.template select<16, 1>(64 * hf + 32 * il) = apply_signs(gl, sbyte & 0xfu);
+                                    fb.template select<16, 1>(64 * hf + 32 * il + 16) = apply_signs(gh, sbyte >> 4);
                                 }
                             }
-                            fr0.template select<64, 1>(64) = 0u;
-                            fr1.template select<64, 1>(0) = 0u;
-                        } else if constexpr (F == T_IQ2XS) {
-                            simd<uint32_t, 16> q0 = ld32(We, ro + (P + 2 + 8 * ib));
-                            simd<uint32_t, 16> q1 = ld32(We, ro + (P + 6 + 8 * ib));
-                            simd<uint32_t, 16> scb = (((ib < 4) ? w0 : w1) >> (8 * (ib & 3))) & 0xffu;
-                            sw0 = d * simd<float, 16>(simd<int, 16>((scb & 0xfu) * 2u + 1u)) * 0.125f;
-                            sw1 = d * simd<float, 16>(simd<int, 16>((scb >> 4) * 2u + 1u)) * 0.125f;
+                            const simd<float, 16> sw = hf ? sw1 : sw0;
 #pragma unroll
-                            for (int il = 0; il < 4; ++il) {
-                                simd<uint32_t, 16> qsw = (il < 2) ? q0 : q1;
-                                simd<uint32_t, 16> qv = (il & 1) ? (qsw >> 16) : (qsw & 0xffffu);
-                                simd<uint32_t, 16> idx = qv & 511u;
-                                simd<uint32_t, 16> gl = gather<uint32_t, 16>(T + O_IQ2XS, idx << 3);
-                                simd<uint32_t, 16> gh = gather<uint32_t, 16>(T + O_IQ2XS, (idx << 3) + 4u);
-                                simd<uint32_t, 16> sbyte = gather<uint32_t, 16>(T + O_KSIGNS, (qv >> 9) << 2);
-                                simd<uint32_t, 16> vl = apply_signs(gl, sbyte & 0xfu);
-                                simd<uint32_t, 16> vh = apply_signs(gh, sbyte >> 4);
-                                if (il < 2) {
-                                    fr0.template select<16, 1>(16 * (2 * il)) = vl;
-                                    fr0.template select<16, 1>(16 * (2 * il + 1)) = vh;
-                                } else {
-                                    fr1.template select<16, 1>(16 * (2 * il)) = vl;
-                                    fr1.template select<16, 1>(16 * (2 * il + 1)) = vh;
+                            for (int i = 0; i < MT; ++i) {
+                                if (i < nvalid) {
+                                    simd<int, 64> av = 0x01010101;
+                                    simd<float, 8> dxv = 1.f;
+                                    if (!(a.dbg & 2)) {
+                                        av = slm_block_load<int, 64>(stage_off + i * 1024 + ib4 * 256, kAl16);
+                                        dxv = slm_block_load<float, 8>(stage_off + L::ASZ + i * 128 + ib4 * 32, kAl16);
+                                    }
+                                    simd<float, 128> tf = dpas_s8(fb.template select<128, 1>(64 * hf), av);
+#pragma unroll
+                                    for (int r = 0; r < 8; ++r) {
+                                        const float dxr = dxv[r];
+                                        acc.template select<16, 1>(128 * i + 16 * r) += tf.template select<16, 1>(16 * r) * (sw * dxr);
+                                    }
                                 }
-                            }
-                            fr0.template select<64, 1>(64) = 0u;
-                            fr1.template select<64, 1>(0) = 0u;
-                        } else if constexpr (F == T_IQ2XXS) {
-                            simd<uint32_t, 16> q0 = ld32(We, ro + (P + 2 + 8 * ib));
-                            simd<uint32_t, 16> aux = ld32(We, ro + (P + 6 + 8 * ib));
-                            sw0 = d * simd<float, 16>(simd<int, 16>((aux >> 28) * 2u + 1u)) * 0.125f;
-#pragma unroll
-                            for (int il = 0; il < 4; ++il) {
-                                simd<uint32_t, 16> idx = (q0 >> (8 * il)) & 0xffu;
-                                simd<uint32_t, 16> gl = gather<uint32_t, 16>(T + O_IQ2XXS, idx << 3);
-                                simd<uint32_t, 16> gh = gather<uint32_t, 16>(T + O_IQ2XXS, (idx << 3) + 4u);
-                                simd<uint32_t, 16> sbyte = gather<uint32_t, 16>(T + O_KSIGNS, ((aux >> (7 * il)) & 127u) << 2);
-                                fr0.template select<16, 1>(16 * (2 * il)) = apply_signs(gl, sbyte & 0xfu);
-                                fr0.template select<16, 1>(16 * (2 * il + 1)) = apply_signs(gh, sbyte >> 4);
-                            }
-                        } else if constexpr (F == T_IQ4XS) {
-                            simd<uint32_t, 16> ls = ((w1 >> (4 * ib)) & 0xfu) | (((w0 >> (2 * ib)) & 3u) << 4);
-                            sw0 = d * simd<float, 16>(simd<int, 16>(ls) - 32);
-#pragma unroll
-                            for (int j = 0; j < 4; ++j) {
-                                simd<uint32_t, 16> qd = ld32(We, ro + (P + 8 + 16 * ib + 4 * j));
-                                simd<uint32_t, 16> t0 = slm_gather<uint32_t, 16>((qd & 0xffu) << 2);
-                                simd<uint32_t, 16> t1 = slm_gather<uint32_t, 16>(((qd >> 8) & 0xffu) << 2);
-                                simd<uint32_t, 16> t2 = slm_gather<uint32_t, 16>(((qd >> 16) & 0xffu) << 2);
-                                simd<uint32_t, 16> t3 = slm_gather<uint32_t, 16>((qd >> 24) << 2);
-                                fr0.template select<16, 1>(16 * j) = (t0 & 0xffu) | ((t1 & 0xffu) << 8) | ((t2 & 0xffu) << 16) | (t3 << 24);
-                                fr0.template select<16, 1>(16 * (j + 4)) =
-                                    ((t0 >> 8) & 0xffu) | (t1 & 0xff00u) | ((t2 & 0xff00u) << 8) | ((t3 & 0xff00u) << 16);
                             }
                         }
-                    }
+                    } else {
+                        simd<uint32_t, 128> fr0 = 0x01010101u;
+                        simd<float, 16> sw0 = 1.f;
+                        if (!(a.dbg & 1)) {
+                            if constexpr (F == T_IQ3S) {
+                                simd<uint32_t, 16> q0 = ld32(We, ro + (P + 2 + 8 * ib));
+                                simd<uint32_t, 16> q1 = ld32(We, ro + (P + 6 + 8 * ib));
+                                simd<uint32_t, 16> sg = ld32(We, ro + (P + 74 + 4 * ib));
+                                simd<uint32_t, 16> qhv = (((ib < 4) ? w1 : w2) >> (8 * (ib & 3))) & 0xffu;
+                                simd<uint32_t, 16> scn = ((w0 >> (8 * (ib >> 1))) >> (4 * (ib & 1))) & 0xfu;
+                                sw0 = d * simd<float, 16>(simd<int, 16>(scn * 2u + 1u));
 #pragma unroll
-                    for (int i = 0; i < MT; ++i) {
-                        if (i < nvalid) {
-                            simd<int, 64> av = 0x01010101;
-                            simd<float, 8> dxv = 1.f;
-                            if (!(a.dbg & 2)) {
-                                av = slm_block_load<int, 64>(stage_off + i * 1024 + ib4 * 256, kAl16);
-                                dxv = slm_block_load<float, 8>(stage_off + L::ASZ + i * 128 + ib4 * 32, kAl16);
-                            }
-                            simd<float, 128> tf = dpas_s8(fr0, av);
+                                for (int r = 0; r < 8; ++r) {
+                                    simd<uint32_t, 16> qsw = r < 4 ? q0 : q1;
+                                    simd<uint32_t, 16> idx = ((qsw >> (8 * (r & 3))) & 0xffu) | (((qhv >> r) & 1u) << 8);
+                                    simd<uint32_t, 16> g = slm_gather<uint32_t, 16>(idx << 2);
+                                    simd<uint32_t, 16> nib = ((sg >> (8 * (r >> 1))) >> (4 * (r & 1))) & 0xfu;
+                                    fr0.template select<16, 1>(16 * r) = apply_signs(g, nib);
+                                }
+                            } else if constexpr (F == T_IQ3XXS) {
+                                simd<uint32_t, 16> q0 = ld32(We, ro + (P + 2 + 8 * ib));
+                                simd<uint32_t, 16> q1 = ld32(We, ro + (P + 6 + 8 * ib));
+                                simd<uint32_t, 16> aux = ld32(We, ro + (P + 66 + 4 * ib));
+                                sw0 = d * simd<float, 16>(simd<int, 16>((aux >> 28) * 2u + 1u)) * 0.25f;
 #pragma unroll
-                            for (int r = 0; r < 8; ++r) {
-                                const float dxr = dxv[r];
-                                acc.template select<16, 1>(128 * i + 16 * r) += tf.template select<16, 1>(16 * r) * (sw0 * dxr);
+                                for (int il = 0; il < 4; ++il) {
+                                    simd<uint32_t, 16> sbyte = slm_gather<uint32_t, 16>(1024u + (((aux >> (7 * il)) & 127u) << 2));
+#pragma unroll
+                                    for (int hh = 0; hh < 2; ++hh) {
+                                        const int r = 2 * il + hh;
+                                        simd<uint32_t, 16> qsw = r < 4 ? q0 : q1;
+                                        simd<uint32_t, 16> idx = (qsw >> (8 * (r & 3))) & 0xffu;
+                                        simd<uint32_t, 16> g = slm_gather<uint32_t, 16>(idx << 2);
+                                        fr0.template select<16, 1>(16 * r) = apply_signs(g, (sbyte >> (4 * hh)) & 0xfu);
+                                    }
+                                }
+                            } else if constexpr (F == T_IQ2XXS) {
+                                simd<uint32_t, 16> q0 = ld32(We, ro + (P + 2 + 8 * ib));
+                                simd<uint32_t, 16> aux = ld32(We, ro + (P + 6 + 8 * ib));
+                                sw0 = d * simd<float, 16>(simd<int, 16>((aux >> 28) * 2u + 1u)) * 0.125f;
+#pragma unroll
+                                for (int il = 0; il < 4; ++il) {
+                                    simd<uint32_t, 16> idx = (q0 >> (8 * il)) & 0xffu;
+                                    simd<uint32_t, 16> gl = gather<uint32_t, 16>(T + O_IQ2XXS, idx << 3);
+                                    simd<uint32_t, 16> gh = gather<uint32_t, 16>(T + O_IQ2XXS, (idx << 3) + 4u);
+                                    simd<uint32_t, 16> sbyte = gather<uint32_t, 16>(T + O_KSIGNS, ((aux >> (7 * il)) & 127u) << 2);
+                                    fr0.template select<16, 1>(16 * (2 * il)) = apply_signs(gl, sbyte & 0xfu);
+                                    fr0.template select<16, 1>(16 * (2 * il + 1)) = apply_signs(gh, sbyte >> 4);
+                                }
+                            } else if constexpr (F == T_IQ4XS) {
+                                simd<uint32_t, 16> ls = ((w1 >> (4 * ib)) & 0xfu) | (((w0 >> (2 * ib)) & 3u) << 4);
+                                sw0 = d * simd<float, 16>(simd<int, 16>(ls) - 32);
+#pragma unroll
+                                for (int j = 0; j < 4; ++j) {
+                                    simd<uint32_t, 16> qd = ld32(We, ro + (P + 8 + 16 * ib + 4 * j));
+                                    simd<uint32_t, 16> t0 = slm_gather<uint32_t, 16>((qd & 0xffu) << 2);
+                                    simd<uint32_t, 16> t1 = slm_gather<uint32_t, 16>(((qd >> 8) & 0xffu) << 2);
+                                    simd<uint32_t, 16> t2 = slm_gather<uint32_t, 16>(((qd >> 16) & 0xffu) << 2);
+                                    simd<uint32_t, 16> t3 = slm_gather<uint32_t, 16>((qd >> 24) << 2);
+                                    fr0.template select<16, 1>(16 * j) = (t0 & 0xffu) | ((t1 & 0xffu) << 8) | ((t2 & 0xffu) << 16) | (t3 << 24);
+                                    fr0.template select<16, 1>(16 * (j + 4)) =
+                                        ((t0 >> 8) & 0xffu) | (t1 & 0xff00u) | ((t2 & 0xff00u) << 8) | ((t3 & 0xff00u) << 16);
+                                }
                             }
-                            if constexpr (NS == 2) {
-                                simd<float, 128> tg = dpas_s8(fr1, av);
+                        }
+#pragma unroll
+                        for (int i = 0; i < MT; ++i) {
+                            if (i < nvalid) {
+                                simd<int, 64> av = 0x01010101;
+                                simd<float, 8> dxv = 1.f;
+                                if (!(a.dbg & 2)) {
+                                    av = slm_block_load<int, 64>(stage_off + i * 1024 + ib4 * 256, kAl16);
+                                    dxv = slm_block_load<float, 8>(stage_off + L::ASZ + i * 128 + ib4 * 32, kAl16);
+                                }
+                                simd<float, 128> tf = dpas_s8(fr0, av);
 #pragma unroll
                                 for (int r = 0; r < 8; ++r) {
                                     const float dxr = dxv[r];
-                                    acc.template select<16, 1>(128 * i + 16 * r) += tg.template select<16, 1>(16 * r) * (sw1 * dxr);
+                                    acc.template select<16, 1>(128 * i + 16 * r) += tf.template select<16, 1>(16 * r) * (sw0 * dxr);
                                 }
                             }
                         }
