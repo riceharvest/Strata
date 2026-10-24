@@ -108,6 +108,9 @@ void native_gr_rms_norm_weighted_multi(const float* input, const float* gamma, f
     check_pointer(output);
     const auto cuda_stream = strata::q_of(stream);
     const dpct::dim3 grid{unsigned(n_rows), unsigned(n_tok), 1u};
+    // 1024 threads from 1024 columns on: the reduction order is part of the result, and the prompt path's PLE
+    // (rms_rep_kernel in native_ple_postops.dp.cpp, BlockSize 1024 for 2560 columns) must give the same bits.
+    if (n_cols < 1024)
     {
         auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
@@ -118,6 +121,18 @@ void native_gr_rms_norm_weighted_multi(const float* input, const float* gamma, f
             exp_props,
             [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
                 weighted_rms_norm<256>(input, gamma, output, n_cols, epsilon);
+            });
+    } else
+    {
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
+
+        cuda_stream->parallel_for<dpct_kernel_name<
+            class weighted_rms_norm_9382c8, dpct_kernel_scalar<1024>>>(
+            sycl::nd_range<3>(grid * sycl::range(1, 1, 1024),
+                              sycl::range(1, 1, 1024)),
+            exp_props,
+            [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
+                weighted_rms_norm<1024>(input, gamma, output, n_cols, epsilon);
             });
     }
     /*
