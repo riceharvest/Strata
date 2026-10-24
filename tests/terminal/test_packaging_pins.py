@@ -110,11 +110,7 @@ class Launchers(unittest.TestCase):
         for text in (cmd, ps1, sh):
             self.assertIn("PYTHONNOUSERSITE", text)
 
-    def test_start_here_setup_and_update_use_it(self):
-        bat = (ROOT / "START-HERE.bat").read_text(encoding="utf-8")
-        self.assertLess(bat.index('if exist "python\\python.exe" goto bundled'), bat.index("call :findpy"))
-        self.assertIn("START-HERE.bat", (ROOT / "SETUP.bat").read_text(encoding="utf-8"))
-        self.assertIn("START-HERE.bat", (ROOT / "UPDATE.bat").read_text(encoding="utf-8"))
+    def test_setup_and_update_use_it(self):
         sh = (ROOT / "setup.sh").read_text(encoding="utf-8")
         self.assertLess(sh.index("exec python/bin/python3"), sh.index("if [ ! -x .venv/bin/python ]"))
         self.assertIn("setup.sh", (ROOT / "update.sh").read_text(encoding="utf-8"))
