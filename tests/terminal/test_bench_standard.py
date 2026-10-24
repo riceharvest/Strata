@@ -185,7 +185,7 @@ class StandardBase(unittest.TestCase):
         self.model.write_bytes(b"model bytes")
         self.server = MockStrata(self.model)
         self.addCleanup(self.server.close)
-        for name, value in (("nvidia_gpus", ([], None, None)), ("other_gpus", ([], None)), ("cpu_name", lambda: "Mock CPU"),
+        for name, value in (("cpu_name", lambda: "Mock CPU"),
                             ("ram_bytes", lambda: 64 * 2 ** 30), ("storage_of", lambda path: [{"kind": "nvme", "model": "Mock SSD", "bus": "nvme"}]),
                             ("git_commit", lambda folder=None: COMMIT)):
             patcher = mock.patch.object(bench_facts, name, **({"return_value": value} if isinstance(value, tuple) else {"side_effect": value}))
@@ -435,14 +435,10 @@ class RunTests(StandardBase):
         self.assertIsNone(record["token_accounting_note"])
 
     def test_the_run_names_its_default_folder_after_the_gpu(self):
-        self.server.gpu_name = "NVIDIA GeForce RTX 3060"
-        with mock.patch.object(bench_facts, "nvidia_gpus", return_value=([{
-                "device_index": 0, "name": "NVIDIA GeForce RTX 3060", "memory_bytes": 12 * 2 ** 30, "memory_kind": "dedicated",
-                "power_limit_w": 170.0, "driver": "560.1"}], "560.1", "12.6")):
-            doc, out = bs.run(self.target, None, out_root=self.root / "results", hash_model=True)
-        self.assertRegex(out.name, r"^\d{4}-\d\d-\d\d-standard-rtx-3060-[0-9a-f]{8}$")
-        self.assertEqual(doc["hardware"]["gpus"][0]["power_limit_w"], 170.0)
-        self.assertEqual(doc["software"]["runtime"], [{"name": "cuda", "version": "12.6"}])
+        self.server.gpu_name = "Intel Arc Pro B70"
+        doc, out = bs.run(self.target, None, out_root=self.root / "results", hash_model=True)
+        self.assertRegex(out.name, r"^\d{4}-\d\d-\d\d-standard-[a-z0-9-]*b70-[0-9a-f]{8}$")
+        self.assertEqual(doc["hardware"]["gpus"][0]["name"], "Intel Arc Pro B70")
 
     def test_early_eos_and_a_reached_cap_stay_in_the_speed_summaries(self):
         self.server.script["performance-short-r1"] = {"completion_tokens": 5, "predicted_n": 5, "rate": 10.0}
@@ -830,13 +826,13 @@ class CommandLineTests(StandardBase):
         code, _, errors = self.invoke("--url", self.server.url, "--out", str(out), "--track", "default", "--track-notes",
                                       "0.2.0 release, setup choices", "--model-revision", "r1", "--source-revision", "r2",
                                       "--tokenizer-revision", "r3", "--custom-pack", "none", "--background", "browser open",
-                                      "--build-options", "cuda,sm86", "--optional-concurrency")
+                                      "--build-options", "sycl,bmg-g31", "--optional-concurrency")
         self.assertEqual(code, 0, errors)
         doc = bs.load(out)
         self.assertEqual((doc["configuration"]["track"], doc["configuration"]["track_notes"]), ("default", "0.2.0 release, setup choices"))
         self.assertEqual((doc["model"]["revision"], doc["model"]["source_revision"], doc["model"]["tokenizer_revision"]), ("r1", "r2", "r3"))
         self.assertEqual(doc["hardware"]["background_workloads"], ["browser open"])
-        self.assertEqual(doc["software"]["build_options"], ["cuda", "sm86"])
+        self.assertEqual(doc["software"]["build_options"], ["sycl", "bmg-g31"])
         self.assertTrue(doc["run"]["optional_concurrency"])
         self.assertIn("--track default", doc["run"]["command"])
         self.assertTrue(doc["run"]["command"].startswith("strata bench run"))
@@ -1099,14 +1095,12 @@ class RealRunFindingsTests(StandardBase):
         exe = engine / "strata"
         exe.write_bytes(b"")
         self.assertIsNone(bench_facts.engine_build_runtime(str(exe)))
-        (engine / "engine-component.json").write_text(json.dumps({"build_id": "a7bdbfdabc9a+cuda12.9"}), encoding="utf-8")
-        self.assertEqual(bench_facts.engine_build_runtime(str(exe)), {"name": "cuda", "version": "12.9"})
-        (engine / "engine-component.json").write_text(json.dumps({"build_id": "abc+hip6.4"}), encoding="utf-8")
-        self.assertEqual(bench_facts.engine_build_runtime(str(exe)), {"name": "rocm", "version": "6.4"})
+        (engine / "engine-component.json").write_text(json.dumps({"build_id": "a7bdbfdabc9a+sycl2025.3"}), encoding="utf-8")
+        self.assertEqual(bench_facts.engine_build_runtime(str(exe)), {"name": "sycl", "version": "2025.3"})
         why = bench_facts.Why()
-        block = bench_facts.software(why, {"driver": "580.1", "cuda": "13.0"}, engine_version="0.1.46", build_options=None,
-                                     engine_build={"name": "cuda", "version": "12.9"})
-        self.assertEqual(block["runtime"], [{"name": "cuda", "version": "12.9"}, {"name": "cuda-driver-supports", "version": "13.0"}])
+        block = bench_facts.software(why, {"driver": None}, engine_version="0.1.46", build_options=None,
+                                     engine_build={"name": "sycl", "version": "2025.3"})
+        self.assertEqual(block["runtime"], [{"name": "sycl", "version": "2025.3"}])
 
     def test_the_engine_log_comes_from_the_run_configs_log_file(self):
         console = self.root / "engine.log"
@@ -1131,18 +1125,6 @@ class RealRunFindingsTests(StandardBase):
         self.assertIn("could not tell", bs.report_markdown(doc))
         doc["extensions"]["server_requests_before_run"] = 3
         self.assertIn("answered 3 request(s)", bs.report_markdown(doc))
-
-
-class NvidiaBannerTests(unittest.TestCase):
-    def test_the_cuda_version_is_read_from_old_and_new_driver_banners(self):
-        query = "0, NVIDIA GeForce RTX 3060, 12288, 170.00, 615.71.09"
-        for banner, version in (("| NVIDIA-SMI 580.1  Driver Version: 580.1     CUDA Version: 13.0 |", "13.0"),
-                                ("| NVIDIA-SMI 615.71  KMD Version: 615.71.09     CUDA UMD Version: 13.4 |", "13.4")):
-            def fake(cmd, banner=banner):
-                return query if any(a.startswith("--query-gpu") for a in cmd) else banner
-            with mock.patch.object(bench_facts, "run_cmd", side_effect=fake):
-                cards, driver, cuda = bench_facts.nvidia_gpus()
-            self.assertEqual((driver, cuda), ("615.71.09", version))
 
 
 class ArchiveCommitTests(unittest.TestCase):

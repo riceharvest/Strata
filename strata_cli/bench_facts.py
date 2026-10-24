@@ -1,6 +1,6 @@
 """What a standard benchmark report says about the machine, the build, the model and the settings (docs/BENCHMARK_PROTOCOL.md).
 
-Every probe is best effort and local: it reads the inference host's own tools (nvidia-smi, rocm-smi, PowerShell, /proc, sysctl) and the
+Every probe is best effort and local: it reads the inference host's own tools (PowerShell, /proc, sysctl, lsblk) and the
 server's answers. A fact that cannot be read becomes `None` with a reason in `Why`, never a guess. Nothing here changes the machine.
 """
 
@@ -145,62 +145,6 @@ def cpu_name() -> str | None:
     return platform.processor() or None
 
 
-def nvidia_gpus() -> tuple[list[dict], str | None, str | None]:
-    """-> (cards, driver version, CUDA version) from nvidia-smi."""
-    out = run_cmd(["nvidia-smi", "--query-gpu=index,name,memory.total,power.limit,driver_version",
-                   "--format=csv,noheader,nounits"])
-    cards = []
-    for line in out.splitlines():
-        part = [x.strip() for x in line.split(",")]
-        if len(part) < 5 or not part[0].isdigit():
-            continue
-
-        def number(text):
-            try:
-                return float(text)
-            except ValueError:
-                return None
-        mib, watts = number(part[2]), number(part[3])
-        cards.append({"device_index": int(part[0]), "name": part[1],
-                      "memory_bytes": int(mib * 1024 * 1024) if mib else None,
-                      "memory_kind": "dedicated", "power_limit_w": watts, "driver": part[4]})
-    cuda = None
-    if cards:
-        # driver 615 prints "CUDA UMD Version: 13.4" where older drivers print "CUDA Version: 13.0"
-        match = re.search(r"CUDA (?:UMD )?Version:\s*([\d.]+)", run_cmd(["nvidia-smi"]))
-        cuda = match.group(1) if match else None
-    return cards, (cards[0]["driver"] if cards else None), cuda
-
-
-def other_gpus() -> tuple[list[dict], str | None]:
-    """AMD (rocm-smi, or the Windows registry), Apple silicon: -> (cards, driver version)."""
-    cards, driver = [], None
-    rocm = run_cmd(["rocm-smi", "--showproductname"])
-    names = re.findall(r"Card [Ss]eries:\s*(.+)", rocm) or re.findall(r"Card [Mm]odel:\s*(.+)", rocm)
-    if names:
-        match = re.search(r"Driver version:\s*(\S+)", run_cmd(["rocm-smi", "--showdriverversion"]))
-        driver = match.group(1) if match else None
-        cards = [{"device_index": i, "name": n.strip(), "memory_bytes": None, "memory_kind": "dedicated",
-                  "power_limit_w": None} for i, n in enumerate(names)]
-    elif os.name == "nt":
-        try:
-            if str(ROOT) not in sys.path:
-                sys.path.insert(0, str(ROOT))
-            from serve.telemetry import windows_amd_cards
-            found = windows_amd_cards()
-            cards = [{"device_index": i, "name": c["name"], "memory_bytes": c.get("vram_bytes") or None,
-                      "memory_kind": "dedicated", "power_limit_w": None} for i, c in enumerate(found)]
-            driver = next((c.get("driver") for c in found if c.get("driver")), None)
-        except Exception:                               # noqa: BLE001 - a report without the card's name is still a report
-            pass
-    elif sys.platform == "darwin":
-        chip = cpu_name()
-        if chip:
-            cards = [{"device_index": 0, "name": chip, "memory_bytes": ram_bytes(), "memory_kind": "shared",
-                      "power_limit_w": None}]
-    return cards, driver
-
-
 def lsblk_disk(data: dict) -> list[dict] | None:
     """The first physical disk in `lsblk -J -s` output. `-s` lists the parents of a device as nested children: an LVM volume
     is lvm -> partition -> disk, two levels down, so the walk goes all the way down."""
@@ -267,24 +211,12 @@ def gpu_selection(config: dict | None, argv: list[str] | None) -> list[int]:
 
 def hardware(why: Why, *, selected: list[int], served_gpu: str | None, model_dir: Path | None,
              declared_background: list[str]) -> tuple[dict, dict]:
-    """-> (the report's `hardware`, the driver and runtime facts the `software` block uses)."""
-    cards, driver, cuda = nvidia_gpus()
-    if not cards:
-        cards, driver = other_gpus()
-    if selected:
-        cards = [c for c in cards if c["device_index"] in selected] or cards
-    elif len(cards) > 1 and served_gpu:
-        named = [c for c in cards if c["name"] == served_gpu]
-        cards = named[:1] or cards[:1]
+    """-> (the report's `hardware`, the driver facts the `software` block uses).  The cards are the ones the server reads
+    (the Intel Arc's name comes from sycl/serve/xe_telemetry.py); no local GPU tool is asked."""
+    driver = None
     served = [n for n in (served_gpu or "").split(" + ") if n and n != "?"]
-    if served and cards and not all(n in {c["name"] for c in cards} for n in served):
-        # the server reads cards the local tools do not list (another vendor's, or a different numbering)
-        cards = [{"device_index": i, "name": n, "memory_bytes": None, "memory_kind": "dedicated", "power_limit_w": None}
-                 for i, n in enumerate(served)]
-        driver = cuda = None
-    if not cards and served:
-        cards = [{"device_index": i, "name": n, "memory_bytes": None, "memory_kind": "dedicated", "power_limit_w": None}
-                 for i, n in enumerate(served)]
+    cards = [{"device_index": i, "name": n, "memory_bytes": None, "memory_kind": "dedicated", "power_limit_w": None}
+             for i, n in enumerate(served)]
     gpus = []
     for i, card in enumerate(cards):
         gpus.append({k: card.get(k) for k in ("device_index", "name", "memory_bytes", "memory_kind", "power_limit_w")})
@@ -308,15 +240,13 @@ def hardware(why: Why, *, selected: list[int], served_gpu: str | None, model_dir
     if not declared_background:
         why.add(pointer("hardware", "background_workloads"),
                 "the runner does not inspect other programs; none were declared with --background")
-    return block, {"driver": driver, "cuda": cuda}
+    return block, {"driver": driver}
 
 
 # ------------------------------------------------------------------------------------------------------------ software
 def os_info() -> dict:
     if os.name == "nt":
         return {"name": "Windows", "version": platform.version()}
-    if sys.platform == "darwin":
-        return {"name": "macOS", "version": platform.mac_ver()[0] or platform.release()}
     name = None
     try:
         for line in Path("/etc/os-release").read_text().splitlines():
@@ -341,16 +271,16 @@ def git_commit(folder: Path = ROOT) -> str | None:
 
 
 def engine_build_runtime(exe: str | None) -> dict | None:
-    """The GPU runtime a release engine was built with, from its engine-component.json (build_id "a7bdbfdabc9a+cuda12.9"):
-    {"name": "cuda", "version": "12.9"}. None for a source build or an engine without that file."""
+    """The GPU runtime a release engine was built with, from its engine-component.json (build_id "a7bdbfdabc9a+sycl2025.3"):
+    {"name": "sycl", "version": "2025.3"}. None for a source build or an engine without that file."""
     if not exe:
         return None
     try:
         record = json.loads((Path(exe).parent / "engine-component.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
-    match = re.search(r"\+(cuda|rocm|hip|sycl)([\d.]+)\Z", str(record.get("build_id") or "")) if isinstance(record, dict) else None
-    return {"name": "rocm" if match.group(1) == "hip" else match.group(1), "version": match.group(2)} if match else None
+    match = re.search(r"\+(sycl)([\d.]+)\Z", str(record.get("build_id") or "")) if isinstance(record, dict) else None
+    return {"name": match.group(1), "version": match.group(2)} if match else None
 
 
 def software(why: Why, machine: dict, *, engine_version: str | None, build_options: list[str] | None,
@@ -358,14 +288,7 @@ def software(why: Why, machine: dict, *, engine_version: str | None, build_optio
     commit = git_commit()
     runtime = []
     if engine_build:
-        # the library the engine runs on; nvidia-smi's "CUDA Version" is only the newest one the driver supports
-        runtime.append(engine_build)
-        if machine.get("cuda") and engine_build["name"] == "cuda":
-            runtime.append({"name": "cuda-driver-supports", "version": machine["cuda"]})
-    elif machine.get("cuda"):
-        runtime.append({"name": "cuda", "version": machine["cuda"]})
-    if sys.platform == "darwin":
-        runtime.append({"name": "metal", "version": platform.mac_ver()[0] or platform.release()})
+        runtime.append(engine_build)                   # the library the engine runs on
     drivers = [{"name": "gpu-driver", "version": machine["driver"]}] if machine.get("driver") else []
     block = {"os": os_info(), "drivers": drivers or None, "runtime": runtime or None,
              "strata_commit": commit, "engine_version": engine_version,
@@ -374,7 +297,7 @@ def software(why: Why, machine: dict, *, engine_version: str | None, build_optio
     if not drivers:
         why.add("/software/drivers", "no GPU driver version was reported by the local tools")
     if not runtime:
-        why.add("/software/runtime", "no CUDA, ROCm or Metal runtime version was reported by the local tools")
+        why.add("/software/runtime", "no SYCL runtime version was reported by the engine package")
     if commit is None:
         for field in ("strata_commit", "runner_commit"):
             why.add(f"/software/{field}", "not a git checkout and no COMMIT file in this install; a release must carry its commit")
@@ -386,7 +309,7 @@ def software(why: Why, machine: dict, *, engine_version: str | None, build_optio
 
 
 # ------------------------------------------------------------------------------------------------------------ model
-QUANT = re.compile(r"(?i)(?:^|[-_.])((?:UD-)?(?:IQ\d_[A-Z]+|Q\d_[A-Z0-9_]+|Q\d_K(?:_[A-Z]+)?|IQ\d_?[A-Z]*|BF16|F16|NVFP4|Q\d))(?=[-_.]|$)")
+QUANT = re.compile(r"(?i)(?:^|[-_.])((?:UD-)?(?:IQ\d_[A-Z]+|Q\d_[A-Z0-9_]+|Q\d_K(?:_[A-Z]+)?|IQ\d_?[A-Z]*|BF16|F16|Q\d))(?=[-_.]|$)")
 SHARD = re.compile(r"^(.*)-(\d{5})-of-(\d{5})(\.gguf)$")
 
 
