@@ -334,89 +334,27 @@ class OperatorProfileTests(unittest.TestCase):
         self.assertEqual(code, 0)  # an optional version does not stop serving
         self.assertIn("interactive monitor was qualified with Textual 8.2.8", output.getvalue())
 
-    def test_live_doctor_checks_four_selected_nvidia_cards_without_starting_engine(self):
-        config = json.loads(self.config.read_text(encoding="utf-8"))
-        config["gpu"] = [0, 1, 2, 3]
-        config["backend"] = "cuda"
-        self.config.write_text(json.dumps(config), encoding="utf-8")
-        profiles.create("four-gpu", str(self.config))
-        cards = "\n".join(f"{i}, RTX 6000 test {i}, GPU-test-{i}, 49140, 580.95" for i in range(4))
-        with mock.patch("strata_control.doctor.shutil.which", return_value="/fake/nvidia-smi"), \
-                mock.patch("strata_control.doctor.subprocess.run",
-                           return_value=mock.Mock(returncode=0, stdout=cards)) as probe:
-            code, result = self.command("doctor", "--profile", "four-gpu", "--live", "--output", "json")
-        self.assertEqual(code, 0)
-        self.assertEqual(result["report"]["live_gpu_probe"]["status"], "ok")
-        self.assertEqual(result["report"]["live_gpu_probe"]["selected_indices"], [0, 1, 2, 3])
-        self.assertEqual(len(result["report"]["live_gpu_probe"]["cards"]), 4)
-        self.assertEqual(probe.call_args.kwargs["timeout"], 5)
-        self.assertFalse(probe.call_args.kwargs.get("shell", False))
-
-        with mock.patch("strata_control.doctor.shutil.which", return_value="/fake/nvidia-smi"), \
-                mock.patch("strata_control.doctor.subprocess.run",
-                           return_value=mock.Mock(returncode=0, stdout=cards.rsplit("\n", 1)[0])):
-            code, result = self.command("components", "verify", "--profile", "four-gpu", "--live",
-                                        "--output", "json")
-        self.assertEqual(code, 5)
-        self.assertEqual(result["report"]["live_gpu_probe"]["status"], "missing_selected")
-        self.assertTrue(any(i["code"] == "GPU_NOT_VISIBLE" for i in result["report"]["issues"]))
-
-    def test_live_probe_failure_and_unsupported_hip_are_explicit(self):
+    def test_live_probe_on_sycl_is_explicitly_unverified(self):
         config = json.loads(self.config.read_text(encoding="utf-8"))
         config["gpu"] = [0, 1]
-        config["backend"] = "cuda"
+        config["backend"] = "sycl"
         self.config.write_text(json.dumps(config), encoding="utf-8")
         profiles.create("local", str(self.config))
-        with mock.patch("strata_control.doctor.shutil.which", return_value=None):
-            code, result = self.command("doctor", "--profile", "local", "--live", "--output", "json")
-        self.assertEqual(code, 5)
-        self.assertEqual(result["report"]["live_gpu_probe"]["status"], "unavailable")
-        self.assertTrue(any(i["code"] == "LIVE_GPU_PROBE_UNAVAILABLE" for i in result["report"]["issues"]))
-
-        config["backend"] = "hip"
-        self.config.write_text(json.dumps(config), encoding="utf-8")
-        with mock.patch("strata_control.doctor.subprocess.run",
-                        side_effect=AssertionError("NVIDIA probe must not run for HIP")):
-            code, result = self.command("doctor", "--profile", "local", "--live", "--output", "json")
+        code, result = self.command("doctor", "--profile", "local", "--live", "--output", "json")
         self.assertEqual(code, 5)
         self.assertEqual(result["report"]["live_gpu_probe"]["status"], "unverified")
+        self.assertEqual(result["report"]["live_gpu_probe"]["selected_indices"], [0, 1])
+        self.assertTrue(any(i["code"] == "LIVE_GPU_PROBE_UNAVAILABLE" for i in result["report"]["issues"]))
 
     def test_doctor_default_does_not_run_host_probe(self):
         profiles.create("local", str(self.config))
-        with mock.patch("strata_control.doctor.subprocess.run",
-                        side_effect=AssertionError("default doctor must be offline")):
-            code, result = self.command("doctor", "--profile", "local", "--output", "json")
+        code, result = self.command("doctor", "--profile", "local", "--output", "json")
         self.assertEqual(code, 0)
         self.assertIsNone(result["report"]["live_gpu_probe"])
-        with mock.patch("strata_control.doctor.subprocess.run",
-                        side_effect=AssertionError("a profile is required for live probes")):
-            code, missing = self.command("doctor", "--live", "--output", "json")
+        code, missing = self.command("doctor", "--live", "--output", "json")
         self.assertEqual(code, 5)
         self.assertTrue(any(i["code"] == "PROFILE_NOT_SELECTED_FOR_LIVE_PROBE"
                             for i in missing["report"]["issues"]))
-
-    def test_live_probe_rejects_untrusted_card_output_and_timeouts(self):
-        config = json.loads(self.config.read_text(encoding="utf-8"))
-        config["gpu"] = 0
-        config["backend"] = "cuda"
-        self.config.write_text(json.dumps(config), encoding="utf-8")
-        profiles.create("local", str(self.config))
-        for output in ("0, GPU\x1b[31m, GPU-0, 1000, 580.95",
-                       "0, GPU, GPU-0, 1000, 580.95\n0, GPU, GPU-0, 1000, 580.95",
-                       "0, GPU, GPU-0, not-a-number, 580.95"):
-            with self.subTest(output=output), \
-                    mock.patch("strata_control.doctor.shutil.which", return_value="/fake/nvidia-smi"), \
-                    mock.patch("strata_control.doctor.subprocess.run",
-                               return_value=mock.Mock(returncode=0, stdout=output)):
-                code, result = self.command("doctor", "--profile", "local", "--live", "--output", "json")
-            self.assertEqual(code, 5)
-            self.assertEqual(result["report"]["live_gpu_probe"]["status"], "unavailable")
-        with mock.patch("strata_control.doctor.shutil.which", return_value="/fake/nvidia-smi"), \
-                mock.patch("strata_control.doctor.subprocess.run",
-                           side_effect=subprocess.TimeoutExpired("nvidia-smi", 5)):
-            code, result = self.command("doctor", "--profile", "local", "--live", "--output", "json")
-        self.assertEqual(code, 5)
-        self.assertEqual(result["report"]["live_gpu_probe"]["status"], "unavailable")
 
     def test_calibration_preview_has_no_engine_or_config_side_effects(self):
         profiles.create("local", str(self.config))

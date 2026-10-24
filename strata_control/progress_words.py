@@ -81,7 +81,7 @@ def describe(step: int | None, lines: list[str], download: dict | None = None) -
         return Words("download", "Getting the model files")
     if step == 6:
         marker = _last_matching(recent, "mtp_rt.py", "mtp_pack.py", "mtp_fetch.py", "mtp draft layer:", "strata_pack.py", "pack_index.py",
-                                "strata_tokenizer.py", "iq_pack.py", "nvfp4_local_pack.py", "converting the q2_0 experts",
+                                "strata_tokenizer.py", "iq_pack.py", "converting the q2_0 experts",
                                 "writing the experts into one file", "of mtp tensors", "[ok] model prepared")
         low = (marker or "").lower()
         if not marker and dl_file.startswith("mtp draft"):
@@ -102,8 +102,6 @@ def describe(step: int | None, lines: list[str], download: dict | None = None) -
             return Words("pack", "Packing the experts into one file for low-memory mode (one time)")
         if "iq_pack.py" in low:
             return Words("pack", "Preparing the model data for the engine (one time)")
-        if "nvfp4_local_pack.py" in low:
-            return Words("pack", "Converting NVIDIA's FP4 checkpoint on this PC (20 to 40 minutes, one time)")
         return Words("pack", "Preparing your model for Strata (one time)")
     return Words("settings", "Saving the model's settings")
 

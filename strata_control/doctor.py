@@ -2,13 +2,10 @@
 
 from __future__ import annotations
 
-import csv
-import io
 import json
 import os
 import re
 import shutil
-import subprocess
 import sys
 from importlib import metadata, util
 from pathlib import Path
@@ -77,44 +74,6 @@ def _selected_indices(value: object) -> list[int] | None:
     return result
 
 
-def _nvidia_cards() -> tuple[list[dict] | None, str | None]:
-    """One bounded, read-only host query. It does not establish engine compatibility."""
-    tool = shutil.which("nvidia-smi")
-    if tool is None:
-        return None, "nvidia-smi is not installed or is not on PATH"
-    try:
-        result = subprocess.run(
-            [tool, "--query-gpu=index,name,uuid,memory.total,driver_version",
-             "--format=csv,noheader,nounits"], capture_output=True, text=True, timeout=5, check=False,
-        )
-    except (OSError, UnicodeError, subprocess.TimeoutExpired):
-        return None, "nvidia-smi could not complete within five seconds"
-    if result.returncode != 0:
-        return None, "nvidia-smi returned an error"
-    if len(result.stdout) > 65536:
-        return None, "nvidia-smi output exceeded the size limit"
-    cards = []
-    try:
-        for row in csv.reader(io.StringIO(result.stdout)):
-            if len(row) != 5 or len(cards) >= 64:
-                raise ValueError("invalid field count")
-            index_raw, name, uuid, memory_raw, driver = [part.strip() for part in row]
-            if not (re.fullmatch(r"[0-9]{1,4}", index_raw)
-                    and re.fullmatch(r"[0-9]{1,9}", memory_raw)
-                    and 0 <= int(index_raw) <= 1023 and int(memory_raw) > 0
-                    and 1 <= len(name) <= 128 and 1 <= len(uuid) <= 128
-                    and 1 <= len(driver) <= 64
-                    and all(part.isprintable() for part in (name, uuid, driver))):
-                raise ValueError("invalid card fields")
-            cards.append({"index": int(index_raw), "name": name, "uuid": uuid,
-                          "memory_mib": int(memory_raw), "driver_version": driver})
-    except (csv.Error, ValueError):
-        return None, "nvidia-smi returned an unrecognized card list"
-    if not cards or len({card["index"] for card in cards}) != len(cards):
-        return None, "nvidia-smi returned no cards or duplicate device indices"
-    return cards, None
-
-
 def _live_probe(cfg: dict, backend: str) -> tuple[dict, list[dict]]:
     try:
         selected = _selected_indices(cfg.get("gpu"))
@@ -123,24 +82,10 @@ def _live_probe(cfg: dict, backend: str) -> tuple[dict, list[dict]]:
                 [{"code": "GPU_SELECTION_INVALID", "severity": "error", "message": str(exc)}])
     if backend == "cpu" and selected is None:
         return {"status": "not_applicable", "selected_indices": None, "cards": []}, []
-    if backend not in ("cuda", "cuda_or_cpu_unverified", "cpu"):
-        return ({"status": "unverified", "selected_indices": selected, "cards": [],
-                 "reason": f"{backend} device numbering needs a qualified live probe"},
-                [{"code": "LIVE_GPU_PROBE_UNAVAILABLE", "severity": "error", "message":
-                  f"{backend} device/driver verification is not implemented for this command"}])
-    cards, reason = _nvidia_cards()
-    if cards is None:
-        severity = "error" if selected is not None or backend == "cuda" else "warning"
-        return ({"status": "unavailable", "selected_indices": selected, "cards": [], "reason": reason},
-                [{"code": "LIVE_GPU_PROBE_UNAVAILABLE", "severity": severity, "message": reason}])
-    available = {card["index"] for card in cards}
-    missing = [index for index in selected or [] if index not in available]
-    issues = ([{"code": "GPU_NOT_VISIBLE", "severity": "error", "message":
-                "selected NVIDIA device indices are not visible: " + ", ".join(map(str, missing))}]
-              if missing else [])
-    return ({"status": "missing_selected" if missing else ("ok" if selected is not None else "selection_unverified"),
-             "selected_indices": selected, "cards": cards,
-             "scope": "host card inventory only; engine execution, CUDA compatibility and topology unverified"}, issues)
+    return ({"status": "unverified", "selected_indices": selected, "cards": [],
+             "reason": f"{backend} device numbering needs a qualified live probe"},
+            [{"code": "LIVE_GPU_PROBE_UNAVAILABLE", "severity": "error", "message":
+              f"{backend} device/driver verification is not implemented for this command"}])
 
 
 def inspect(config_path: Path | None, *, profile_id: str | None = None, live: bool = False) -> dict:
@@ -160,7 +105,7 @@ def inspect(config_path: Path | None, *, profile_id: str | None = None, live: bo
         return report
 
     cfg = read_run_config(config_path)
-    report["backend"] = cfg.get("backend") or "cuda_or_cpu_unverified"
+    report["backend"] = cfg.get("backend") or "sycl"
     report["devices_selected"] = cfg.get("gpu")
     exe = _location(cfg["exe"], cfg, config_path)
     components.append(_item("engine", exe, "file"))
@@ -216,9 +161,8 @@ def inspect(config_path: Path | None, *, profile_id: str | None = None, live: bo
                                    "required": True, "reason": "missing path"})
 
     components.append(_monitor_component())
-    driver_name = "rocminfo" if cfg.get("backend") == "hip" else "nvidia-smi"
     components.append({"name": "gpu_driver_probe", "status": "unverified", "kind": "external_tool",
-                       "required": False, "tool": shutil.which(driver_name),
+                       "required": False, "tool": shutil.which("sycl-ls"),
                        "reason": "device/driver compatibility needs a live probe on the target host"})
     for item in components:
         if item["status"] in ("missing", "invalid") and item["required"]:
@@ -236,14 +180,12 @@ def inspect(config_path: Path | None, *, profile_id: str | None = None, live: bo
 
 
 def _device_access_issue(backend: str | None, dev_root: str = "/dev") -> dict | None:
-    """Linux Intel (SYCL) and AMD (HIP) open the card through /dev/dri/renderD* (and /dev/kfd): a user outside the `render`
+    """Linux Intel (SYCL) opens the card through /dev/dri/renderD*: a user outside the `render`
     group gets "No device of requested type available" from the engine, which names nothing to fix. None when it is fine,
     cannot apply (other OS, other backend) or there is no such device node at all."""
-    if backend not in ("sycl", "hip") or not sys.platform.startswith("linux"):
+    if backend != "sycl" or not sys.platform.startswith("linux"):
         return None
     nodes = sorted(Path(dev_root, "dri").glob("renderD*"))
-    if backend == "hip" and Path(dev_root, "kfd").exists():
-        nodes.append(Path(dev_root, "kfd"))
     if not nodes or any(os.access(node, os.R_OK | os.W_OK) for node in nodes):
         return None
     return {"code": "GPU_DEVICE_ACCESS", "severity": "warning",

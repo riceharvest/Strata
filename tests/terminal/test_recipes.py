@@ -141,7 +141,7 @@ class RecipeTests(unittest.TestCase):
     def test_component_recipe_can_enable_a_typed_live_card_check(self):
         cfg = json.loads(self.config.read_text(encoding="utf-8"))
         cfg["gpu"] = [0, 1, 2, 3]
-        cfg["backend"] = "cuda"
+        cfg["backend"] = "sycl"
         self.config.write_text(json.dumps(cfg), encoding="utf-8")
         recipes.initialize("local")
         code, proposed = self._cli("set", "check", "live=true", "--plan")
@@ -149,18 +149,13 @@ class RecipeTests(unittest.TestCase):
         self.assertTrue(proposed["would_save"])
         self.assertEqual(recipes.load("local", "check")[0]["params"], {})
         self.assertEqual(self._cli("set", "check", "live=true")[0], 0)
-        cards = "\n".join(f"{i}, RTX 6000 test, GPU-test-{i}, 49140, 580.95" for i in range(4))
-        with mock.patch("strata_control.doctor.shutil.which", return_value="/fake/nvidia-smi"), \
-                mock.patch("strata_control.doctor.subprocess.run",
-                           return_value=mock.Mock(returncode=0, stdout=cards)) as probe:
-            code, preview = self._cli("plan", "check")
-            self.assertEqual(code, 0)
-            self.assertTrue(preview["plan"]["operation"]["run_effects"]["query_host_gpus"])
-            self.assertEqual(preview["plan"]["operation"]["preflight"]["live_gpu_probe"]["status"], "ok")
-            code, executed = self._cli("run", "check", "--if-revision", preview["plan"]["recipe_revision"])
-        self.assertEqual(code, 0)
-        self.assertEqual(executed["operation"]["result"]["report"]["live_gpu_probe"]["status"], "ok")
-        self.assertEqual(probe.call_count, 2)
+        code, preview = self._cli("plan", "check")
+        self.assertEqual(code, 5)                  # the SYCL card check is not implemented: said, not passed
+        self.assertTrue(preview["plan"]["operation"]["run_effects"]["query_host_gpus"])
+        self.assertEqual(preview["plan"]["operation"]["preflight"]["live_gpu_probe"]["status"], "unverified")
+        code, executed = self._cli("run", "check", "--if-revision", preview["plan"]["recipe_revision"])
+        self.assertEqual(code, 5)
+        self.assertEqual(executed["operation"]["result"]["report"]["live_gpu_probe"]["status"], "unverified")
         record = journal.load("local", executed["operation"]["operation_id"])
         self.assertEqual(record["intent"], {"live": True})
         with self.assertRaisesRegex(profiles.ProfileError, "parameter is not supported"):
