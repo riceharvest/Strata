@@ -2468,23 +2468,14 @@ struct Model::Impl {
             //  gave +4.5% on a 4K prompt but no decode gain in every pair: DS4_ENGRAM_THREADS=64 turns them on)
 #endif
             const unsigned hw = std::max(1u, std::thread::hardware_concurrency());
-            int nth = o.engram_threads > 0 ? o.engram_threads :
-#if defined(_WIN32)
-                (int) std::min(16u, std::max(4u, hw / 2));
-#else
-                (int) std::min(64u, std::max(16u, hw * 2));
-#endif
-            if (const char* e = std::getenv("DS4_ENGRAM_THREADS")) nth = std::max(1, std::atoi(e));
+            // (--engram-threads / --engram-cache-mb, else DS4_ENGRAM_THREADS / DS4_ENGRAM_CACHE_MB, else upstream's defaults)
+            int nth = (int) std::min(16u, std::max(4u, hw / 2));
+            if (o.engram_threads > 0) nth = o.engram_threads;
+            else if (const char* e = std::getenv("DS4_ENGRAM_THREADS")) nth = std::max(1, std::atoi(e));
             const uint64_t avail = ram_avail();
-            uint64_t mb = 64;
-            if (o.engram_cache_mb >= 0) {
-                mb = (uint64_t) o.engram_cache_mb;
-            } else if (const char* e = std::getenv("DS4_ENGRAM_CACHE_MB")) {
-                mb = std::strtoull(e, nullptr, 10);
-            } else if (avail != ~uint64_t{0}) {
-                // Dynamically scale Engram cache up to 10% of available RAM, capped at 4096 MB
-                mb = std::min<uint64_t>(4096, std::max<uint64_t>(64, (avail >> 20) / 10));
-            }
+            uint64_t mb = avail == ~uint64_t{0} ? 64 : std::min<uint64_t>(256, std::max<uint64_t>(16, (avail >> 20) / 64));
+            if (o.engram_cache_mb >= 0) mb = (uint64_t) o.engram_cache_mb;
+            else if (const char* e = std::getenv("DS4_ENGRAM_CACHE_MB")) mb = std::strtoull(e, nullptr, 10);
             eg_cache.init((size_t) ((mb << 20) / row), row);
             std::vector<std::string> paths;
             for (const std::string& fn : pk.files) paths.push_back(pk.model_dir + "/" + fn);
