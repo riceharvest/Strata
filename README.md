@@ -54,6 +54,19 @@ That's +12% (4K) and +17% (16K) prompt speed over upstream Strata on the same ca
 - 64 GB of RAM (what it's measured on)
 - Disk: about 80 GB for Qwen3.8-Flash-Next IQ2_XS, about 260 GB for a DeepSeek V4.1-Flash set
 
+### The rest of your PC matters too
+
+Every number in this repo comes from one older desktop: a Ryzen 9 5950X (Zen 3, AVX2, no AVX-512) with dual-channel DDR4 on a
+PCIe 4.0 x16 slot. Treat them as a floor; on a newer platform expect more, but nobody has measured that here yet.
+
+- **Qwen** keeps the experts that don't fit in VRAM in RAM and reads them over PCIe on every token; that link is the
+  biggest cost in decode. The B70 is a PCIe 5.0 card, so a PCIe 5.0 x16 slot can carry up to twice what this box does.
+  Faster RAM on its own changes little here: dual-channel DDR4 already outruns a PCIe 4.0 link.
+- **DeepSeek V4.1 pruned** runs the experts that aren't in VRAM on the CPU. That is bound by memory bandwidth and by the
+  CPU's vector units, so DDR5 and a CPU with AVX-512 (Zen 4/5, recent Xeons) should help it directly.
+- Run the card in an x16 slot wired to the CPU. An x8 or chipset slot halves the link or worse
+  (`cat /sys/bus/pci/devices/*/current_link_width` and `current_link_speed` show what you got).
+
 ## Install
 
 1. Docker, once:
