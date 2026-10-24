@@ -142,16 +142,52 @@ class Fit(unittest.TestCase):
             self.assertEqual(r[-1][1], 39)
             self.assertTrue(all(a[1] + 1 == b[0] for a, b in zip(r, r[1:])))
 
-    def test_b70_pruned_plan_fits_in_ram(self):
-        b70 = {"name": "Intel Arc Pro B70", "vendor": "intel", "vram_gb": 32.0, "index": 0}
-        p = dsv41_fit.plan([b70], 64.0, 500.0, vendor="intel", model="IST-DAS-1.75bpw", prune_experts=160)
-        self.assertEqual(p["verdict"], "fits")
-        self.assertEqual(p["spill_gb"], 0.0)
-        self.assertIn("--prune-experts", p["args"])
-        self.assertIn("160", p["args"])
-        self.assertNotIn("--ssd-cache", p["args"])
-        opts = dsv41_fit.options([b70], 64.0, vendor="intel", model="IST-DAS-1.75bpw")
-        self.assertTrue(any(o["key"] == "pruned160" for o in opts["options"]))
+    B70 = {"name": "Intel Arc Pro B70", "vendor": "intel", "vram_gb": 32.0, "index": 0}
+
+    def test_intel_plan_without_ram_reading(self):
+        # plan(ram_gb=None) on an Intel card raised TypeError (float(None)) before the RAM check
+        for model in (None, "IST-DAS-1.75bpw", "IST-DAS-2.00bpw"):
+            p = dsv41_fit.plan([self.B70], None, None, vendor="intel", model=model)
+            self.assertEqual(p["verdict"], "unknown", model)
+            self.assertNotIn("--prune-experts", p["args"])
+
+    def test_plan_never_reads_prune_from_the_environment(self):
+        with mock.patch.dict(os.environ, {"STRATA_DS4_PRUNE_EXPERTS": "160"}):
+            for model in (None, "IST-DAS-1.75bpw"):
+                p = dsv41_fit.plan([self.B70], 64.0, 500.0, vendor="intel", model=model)
+                self.assertNotIn("--prune-experts", p["args"], model)
+                self.assertFalse(p["changes_outputs"], model)
+                self.assertEqual(p["experts_total"], dsv41_fit.EXPERTS, model)
+
+    def test_intel_plans_never_emit_answer_changing_flags(self):
+        for ram in (None, 24.0, 32.0, 48.0, 64.0, 96.0, 128.0, 256.0):
+            for model in (None, "IST-DAS-1.75bpw", "IST-DAS-2.00bpw", "IST-DAS-2.25bpw"):
+                p = dsv41_fit.plan([self.B70], ram, 500.0, vendor="intel", model=model)
+                for flag in ("--disk-skip-w", "--prune-experts", "--engram-cache-mb"):
+                    self.assertNotIn(flag, p["args"], (ram, model))
+                self.assertFalse(p["changes_outputs"], (ram, model))
+                self.assertNotIn("--disk-skip-w", p["words"], (ram, model))
+
+    def test_a_pruned_plan_is_labelled_and_never_fits(self):
+        for model in (None, "IST-DAS-1.75bpw"):
+            p = dsv41_fit.plan([self.B70], 512.0, 500.0, vendor="intel", model=model, prune_experts=160)
+            self.assertNotEqual(p["verdict"], "fits", model)
+            self.assertEqual(p["verdict"], "pruned", model)
+            self.assertTrue(p["changes_outputs"], model)
+            a = p["args"]
+            self.assertIn("--prune-experts", a, model)
+            self.assertEqual(a[a.index("--prune-experts") + 1], "160", model)
+            self.assertTrue(any("changes the answers" in w for w in p["warnings"]), model)
+            self.assertIn("changes the answers", p["words"], model)
+
+    def test_options_never_offer_a_pruned_plan(self):
+        for ram in (32.0, 64.0, 128.0, 512.0):
+            for model in (None, "IST-DAS-1.75bpw"):
+                opts = dsv41_fit.options([self.B70], ram, vendor="intel", model=model)
+                for o in opts["options"]:
+                    self.assertNotIn("prune", o["key"], (ram, model))
+                    self.assertNotIn("--prune-experts", o["plan"]["args"], (ram, model))
+                    self.assertFalse(o["plan"]["changes_outputs"], (ram, model))
 
     def test_options_like_gpu_fit(self):
         o = dsv41_fit.options(FOUR, 251.0, "amd")

@@ -72,6 +72,8 @@ ISTA_SETS = {
                         "quality": "about 7.3% above the original model's perplexity (code and agent work about 2-3% above), "
                                    "the better of the two, 17 GB more disk"},
 }
+PRUNED_WORDS = ("--prune-experts changes the answers: the router's coldest experts are masked out and their picks go to others. "
+                "Its quality cost has not been measured.")
 ISTA_DENSE_GB = 6.16                  # the dense weights in the shards (attention, router, shared experts, the head; the embedding stays on the CPU)
 ISTA_DENSE_ON_GPU_GB = 4.5            # what a card holds of them with a 12 GB card (measured on the 5070 / 3060: the engine places the rest itself)
 ISTA_MEASURED = ("an RTX 5070 (12 GB) with 64 GB of RAM and a 3.6 GB/s NVMe drive: answers about 4.7 tokens a second, a 4,000-token prompt "
@@ -162,13 +164,8 @@ def _plan_ista(model: str, cards: list[dict] | None, ram_gb: float | None, disk_
                vendor: str | None, prune_experts: int | None = None) -> dict[str, Any]:
     """plan() for an official IST-DAS set (ISTA_SETS): the same keys, the measured speeds in plain words.  RAM classes: with RAM for every
     expert the CPU lane keeps ("fits"), with 40 GB or more the engine's RAM store keeps the hot experts and reads the rest from the SSD
-    ("tight": measured 4.7 tokens a second on 64 GB, 7.2 on 46 GB), under 40 GB it is untested and slower ("spills").  Never a refusal."""
-    import os
-    if prune_experts is None and "STRATA_DS4_PRUNE_EXPERTS" in os.environ:
-        try:
-            prune_experts = int(os.environ["STRATA_DS4_PRUNE_EXPERTS"])
-        except ValueError:
-            prune_experts = None
+    ("tight": measured 4.7 tokens a second on 64 GB, 7.2 on 46 GB), under 40 GB it is untested and slower ("spills").  Never a refusal.
+    `prune_experts`: only when the caller asks for it (see plan())."""
     v = variant(model)
     keep, ignored = gpu_fit.usable_cards(gpu_fit.for_vendor(list(cards or []), vendor)[0]) if vendor else gpu_fit.usable_cards(list(cards or []))
     keep = [c for c in keep if float(c.get("vram_gb") or 0) >= SMALLEST_CARD_GB]
@@ -189,10 +186,13 @@ def _plan_ista(model: str, cards: list[dict] | None, ram_gb: float | None, disk_
     out["disk_need_gb"] = _round1(need_disk)
     out["disk_ok"] = None if disk_free_gb is None else disk_free_gb >= need_disk
     lines, warns = out["lines"], out["warnings"]
-    if prune_experts and prune_experts > 0 and prune_experts < EXPERTS_PER_LAYER:
+    pruned = bool(prune_experts and 0 < prune_experts < EXPERTS_PER_LAYER)
+    out["changes_outputs"] = pruned
+    if pruned:
         out["args"] += ["--prune-experts", str(prune_experts)]
-        lines.append(f"DeepSeek-V4.1-Flash, {v['title']} (Layer-Adaptive Pruning: avg {active_per_layer} of 384 experts/layer): {active_experts:,} active experts "
-                     f"({active_exp_gb:.1f} GB of experts, {ISTA_ENGRAM_BYTES / GB:.0f} GB n-gram table). Fits in memory without SSD offload.")
+        lines.append(f"DeepSeek-V4.1-Flash, {v['title']}, pruned to about {active_per_layer} of 384 experts a layer ({active_experts:,} experts, "
+                     f"{active_exp_gb:.1f} GB): {PRUNED_WORDS}")
+        warns.append(PRUNED_WORDS)
     else:
         lines.append(f"DeepSeek-V4.1-Flash, {v['title']}: a {download:.0f} GB download ({set_gb:.0f} GB of model, {ISTA_ENGRAM_BYTES / GB:.0f} GB "
                      f"n-gram table, {ISTA_DSPARK_BYTES / GB:.0f} GB drafter). Quality: {v['quality']}.")
@@ -221,36 +221,32 @@ def _plan_ista(model: str, cards: list[dict] | None, ram_gb: float | None, disk_
         out["cpu_experts_gb"] = _round1(max(0.0, active_exp_gb - in_vram * expert_gb))
         out["tp"] = tp_for(n, keep)
         out["args"] += _tp_args(n, out["tp"])
+        # Intel: no --disk-skip-w (it changes the answers: opt-in only) and no Engram cache above the engine's own default
         if is_intel:
             out["args"] += ["--reserve-mib", "1024"]
-            eg_mb = 4096 if float(ram_gb) >= 60.0 else (2048 if float(ram_gb) >= 40.0 else 1024)
             if ram_gb and float(ram_gb) >= 40.0 and float(ram_gb) < out["cpu_experts_gb"] + REST_RAM_GB:
                 ssd_cache_gb = max(16, int(float(ram_gb) - 18.0))
-                out["args"] += ["--ssd-cache", str(ssd_cache_gb), "--ssd-policy", "lfulru",
-                                "--disk-skip-w", "0.025", "--engram-cache-mb", str(eg_mb)]
+                out["args"] += ["--ssd-cache", str(ssd_cache_gb), "--ssd-policy", "lfulru"]
             elif ram_gb and float(ram_gb) < 40.0:
-                out["args"] += ["--ssd-policy", "lfulru", "--disk-skip-w", "0.035", "--engram-cache-mb", "1024"]
-            elif ram_gb and float(ram_gb) >= out["cpu_experts_gb"] + REST_RAM_GB:
-                out["args"] += ["--engram-cache-mb", str(eg_mb)]
+                out["args"] += ["--ssd-policy", "lfulru"]
         names = " + ".join(f"{c['name'] or 'card ' + str(c['index'])} ({c['vram_gb']:.0f} GB)" for c in out["cards"])
         lines.append(f"Graphics memory: {names}. About {in_vram:,} of the {active_experts:,} experts ({out['vram_experts_gb']:.0f} GB) stay on "
                      f"the card{'s' if n > 1 else ''}; the other {active_experts - in_vram:,} ({out['cpu_experts_gb']:.0f} GB) are computed on the "
                      "CPU from RAM, and the ones RAM cannot hold are read from the SSD when a word needs them.")
         all_cached = out["cpu_experts_gb"] + REST_RAM_GB
         if is_intel and ram_gb and float(ram_gb) < all_cached:
-            eg_mb = 4096 if float(ram_gb) >= 60.0 else (2048 if float(ram_gb) >= 40.0 else 1024)
-            lines.append(f"Intel B70 SSD latency optimizations active: --disk-skip-w skips blocking disk reads for tail experts (<2.5% weight), "
-                         f"--engram-cache-mb {eg_mb} caches hot n-grams in RAM, and LFU/LRU replacement keeps frequently hit experts resident.")
-        elif is_intel and prune_experts and prune_experts > 0 and prune_experts < EXPERTS_PER_LAYER:
-            lines.append(f"Intel B70 zero-SSD execution active: --prune-experts {active_per_layer} uses layer-adaptive water-filling to equalize coverage (~71% across all layers) and fits all active CPU experts in host RAM "
-                         f"({out['cpu_experts_gb']:.1f} GB), eliminating SSD latency on the decode path.")
+            lines.append("On this Intel card the engine's RAM store keeps the experts hit most often (--ssd-policy lfulru) and reads the "
+                         "rest from the SSD.")
         if n >= 2 and out["tp"] == 2:
             lines.append("Two cards share each layer's matrices (--tp 2): measured about twice as fast at reading prompts.")
         if ram_gb:
             out["ram_needed_gb"] = _round1(all_cached)
             out["spill_gb"] = _round1(max(0.0, all_cached - float(ram_gb)))
             out["spare_ram_gb"] = _round1(max(0.0, float(ram_gb) - all_cached))
-            if float(ram_gb) >= all_cached:
+            if float(ram_gb) >= all_cached and pruned:
+                out["verdict"] = "pruned"
+                lines.append(f"With the pruning, {ram_gb:.0f} GB of RAM holds the {out['cpu_experts_gb']:.0f} GB of experts left for the CPU.")
+            elif float(ram_gb) >= all_cached:
                 out["verdict"] = "fits"
                 lines.append(f"That fits this computer: {ram_gb:.0f} GB of RAM keeps all {out['cpu_experts_gb']:.0f} GB of the CPU's experts cached.")
             elif float(ram_gb) >= v["ram_ok_gb"]:
@@ -286,20 +282,19 @@ def plan(cards: list[dict] | None, ram_gb: float | None, disk_free_gb: float | N
     (ISTA_SETS: "IST-DAS-2.00bpw" / "IST-DAS-2.25bpw" / "IST-DAS-1.75bpw") gets its own numbers; None or "UD-Q8_K_XL" is Unsloth's 508 GB set.
 
     Keys: cards (per card: index, name, vram_gb, layers, dense_gb, experts_gb, experts), experts_in_vram, experts_total, vram_experts_gb,
-    cpu_experts_gb, ram_needed_gb, spill_gb, spare_ram_gb, verdict (fits / tight / spills / unknown / no_card), tp, args,
-    download_gb, engram_gb, disk_need_gb, disk_ok, lines (plain words, one idea each), warnings (the risks, plainly), measured."""
+    cpu_experts_gb, ram_needed_gb, spill_gb, spare_ram_gb, verdict (fits / tight / spills / unknown / no_card, or pruned), tp, args,
+    download_gb, engram_gb, disk_need_gb, disk_ok, lines (plain words, one idea each), warnings (the risks, plainly), measured,
+    changes_outputs.
+
+    `prune_experts` (only when the caller asks; never read from the environment, never offered by options()): the engine's
+    --prune-experts, which masks the coldest experts out of the router and so CHANGES THE ANSWERS.  Such a plan is never "fits":
+    where the memory would fit, its verdict is "pruned"."""
     if variant(model):
         return _plan_ista(variant_key(model), cards, ram_gb, disk_free_gb, context, vendor, prune_experts=prune_experts)
     keep, ignored = gpu_fit.usable_cards(gpu_fit.for_vendor(list(cards or []), vendor)[0]) if vendor else gpu_fit.usable_cards(list(cards or []))
     keep = [c for c in keep if float(c.get("vram_gb") or 0) >= SMALLEST_CARD_GB]
     keep.sort(key=lambda c: c.get("index", 0))                 # the engine takes the layers in card order
     n = len(keep)
-    import os
-    if prune_experts is None and "STRATA_DS4_PRUNE_EXPERTS" in os.environ:
-        try:
-            prune_experts = int(os.environ["STRATA_DS4_PRUNE_EXPERTS"])
-        except ValueError:
-            prune_experts = None
     active_per_layer = min(EXPERTS_PER_LAYER, max(1, prune_experts)) if prune_experts and prune_experts > 0 else EXPERTS_PER_LAYER
     active_experts = LAYERS * active_per_layer
     active_exp_gb = EXPERTS_GB * (active_per_layer / EXPERTS_PER_LAYER)
@@ -313,10 +308,12 @@ def plan(cards: list[dict] | None, ram_gb: float | None, disk_free_gb: float | N
     out["disk_need_gb"] = _round1(need_disk)
     out["disk_ok"] = None if disk_free_gb is None else disk_free_gb >= need_disk
     lines, warns = out["lines"], out["warnings"]
-    if prune_experts and prune_experts > 0 and prune_experts < EXPERTS_PER_LAYER:
-        out["args"] += ["--prune-experts", str(prune_experts)]
-        lines.append(f"DeepSeek-V4.1-Flash (UD-Q8_K_XL, Pruned: top {active_per_layer} of 384 experts/layer): a {DOWNLOAD_GB:.0f} GB download. "
-                     f"Active experts: {active_experts:,} ({active_exp_gb:.1f} GB) and {DENSE_GB:.0f} GB dense weights.")
+    pruned = bool(prune_experts and 0 < prune_experts < EXPERTS_PER_LAYER)
+    out["changes_outputs"] = pruned
+    if pruned:
+        lines.append(f"DeepSeek-V4.1-Flash (UD-Q8_K_XL), pruned to about {active_per_layer} of 384 experts a layer: a {DOWNLOAD_GB:.0f} GB download, "
+                     f"{active_experts:,} experts ({active_exp_gb:.1f} GB) and {DENSE_GB:.0f} GB of dense weights. {PRUNED_WORDS}")
+        warns.append(PRUNED_WORDS)
     else:
         lines.append(f"DeepSeek-V4.1-Flash (UD-Q8_K_XL): a {DOWNLOAD_GB:.0f} GB download. In memory it needs {WEIGHTS_GB:.0f} GB: "
                      f"{EXPERTS_GB:.0f} GB of experts ({EXPERTS:,} of {EXPERT_GB * 1000:.1f} MB) and {DENSE_GB:.0f} GB of attention "
@@ -350,14 +347,14 @@ def plan(cards: list[dict] | None, ram_gb: float | None, disk_free_gb: float | N
         out["vram_experts_gb"] = _round1(in_vram * EXPERT_GB)
         out["cpu_experts_gb"] = _round1(max(0.0, active_exp_gb - in_vram * EXPERT_GB))
         out["tp"] = tp_for(n)
-        out["args"] = ["--tp", str(out["tp"])] if out["tp"] > 1 else []
+        out["args"] = (["--tp", str(out["tp"])] if out["tp"] > 1 else []) + (["--prune-experts", str(prune_experts)] if pruned else [])
         if ram_gb:
             needed = out["cpu_experts_gb"] + REST_RAM_GB
             spare = float(ram_gb) - needed
             out["ram_needed_gb"] = _round1(needed)
             out["spare_ram_gb"] = _round1(max(0.0, spare))
             out["spill_gb"] = _round1(max(0.0, -spare))
-            out["verdict"] = "spills" if spare < 0 else "tight" if spare < SPARE_FITS_GB else "fits"
+            out["verdict"] = "spills" if spare < 0 else "tight" if spare < SPARE_FITS_GB else "pruned" if pruned else "fits"
         else:
             out["verdict"] = "unknown"
         # the placement, in words
@@ -408,12 +405,13 @@ def _option(key: str, cards: list[dict], ram_gb: float | None, ctx: int, vendor:
             prune_experts: int | None = None) -> dict[str, Any]:
     p = plan(cards, ram_gb, None, ctx, vendor, model, prune_experts=prune_experts)
     names = " + ".join(gpu_fit._name(c) for c in cards)
-    prune_tag = f" (pruned {prune_experts}/layer: zero SSD spill)" if prune_experts and prune_experts < EXPERTS_PER_LAYER else ""
+    prune_tag = f" (pruned to {prune_experts} experts a layer: changes the answers)" if p.get("changes_outputs") else ""
     label = f"{names} + RAM{prune_tag}" if len(cards) == 1 else f"{names} + RAM (layers shared, --tp {p['tp']}){prune_tag}"
     words = {"fits": f"fits: {p['experts_in_vram']:,} of {p['experts_total']:,} experts in graphics memory, the rest computed on the CPU "
                      f"({p.get('ram_needed_gb', 0):.0f} GB of RAM)",
              "tight": f"fits, but tight: RAM left over is under {SPARE_FITS_GB:.0f} GB",
              "spills": f"does not fit in memory: about {p.get('spill_gb', 0):.0f} GB of the experts are read from the SSD while answering (slow)",
+             "pruned": f"pruned: {PRUNED_WORDS}",
              "unknown": "memory of this computer unknown", "no_card": "no usable card"}[p["verdict"]]
     return {"key": key, "cards": [c.get("index") for c in cards], "label": label, "verdict": p["verdict"], "summary": f"{label}: {words}",
             "words": words, "vram_gb": _round1(sum(float(c.get("vram_gb") or 0) for c in cards)), "spill_gb": p.get("spill_gb", 0.0),
@@ -435,8 +433,6 @@ def options(cards: list[dict], ram_gb: float | None, vendor: str | None = None, 
     opts = [_option("all", sorted(keep, key=lambda c: c.get("index", 0)), ram_gb, context, vendor, model)]
     if len(keep) > 1:
         opts.append(_option("single", [keep[0]], ram_gb, context, vendor, model))
-    if ram_gb and opts[0]["verdict"] in ("tight", "spills"):
-        opts.append(_option("pruned160", sorted(keep, key=lambda c: c.get("index", 0)), ram_gb, context, vendor, model, prune_experts=160))
     opts[0]["recommended"] = True
     out["options"], out["recommended"] = opts, "all"
     return out
