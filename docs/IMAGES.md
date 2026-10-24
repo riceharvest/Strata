@@ -3,7 +3,8 @@
 Strata's server can also make images: `POST /v1/images/generations`, OpenAI's images API. The model is
 [Qwen-Image-2.1-Turbo](https://huggingface.co/Qwen/Qwen-Image-2.1-Turbo) (8 steps, CFG 1) in
 [Unsloth's GGUF quants](https://huggingface.co/unsloth/Qwen-Image-2.1-Turbo-GGUF), run by
-[stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp) (`sd-cli`), which setup compiles for your GPU.
+[stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp) (`sd-cli`), which setup compiles for your Intel Arc card
+(Vulkan).
 It is optional and off unless you ask for it.
 
 The model is under the **Qwen Research License**, not Apache 2.0: read
@@ -30,15 +31,14 @@ into the model's run config.
 | VAE | `qwen_image_2.1_vae_bf16.safetensors` | 0.7 GB |
 
 Options: `--image-quant Q4_K_M|Q6_K|Q8_0` (a bigger one than recommended is kept, with a warning),
-`--image-backend cuda|hip|vulkan|cpu`, `--image-gpu-policy auto|keep|shrink|unload`, `--images no` (takes the section
+`--image-backend vulkan|cpu`, `--image-gpu-policy auto|keep|shrink|unload`, `--images no` (takes the section
 out of the config).
 
-Backends: CUDA on NVIDIA (needs the CUDA Toolkit), HIP on AMD cards with their own memory (Linux, the same ROCm as the
-engine), Vulkan on AMD APUs/iGPUs (Radeon 780M, Strix Point/Halo), Intel Arc and AMD under Windows. A Linux PC without
-the Vulkan development files gets the LunarG Vulkan SDK unpacked into `third_party/` (no sudo); on Windows install the
-Vulkan SDK first. On Vulkan setup adds `--vae-tiling --vae-tile-overlap 0.25`: an untiled 1024x1024 VAE decode on a Radeon 780M is one
-GPU job long enough to trip the kernel driver's job timeout (no image), and a quarter's overlap decodes in half the
-time of sd.cpp's default half overlap.
+Backends: Vulkan on the Intel Arc card, the CPU without a card (`--image-backend cpu`). A Linux PC without the Vulkan
+development files gets the LunarG Vulkan SDK unpacked into `third_party/` (no sudo). On Vulkan setup adds
+`--vae-tiling --vae-tile-overlap 0.25`: an untiled 1024x1024 VAE decode is one long GPU job (on a Radeon 780M, where this
+was measured, long enough to trip the kernel driver's job timeout), and a quarter's overlap decoded in half the time of
+sd.cpp's default half overlap there.
 
 ## Use it
 
@@ -76,13 +76,5 @@ files takes a few seconds per image from the page cache.
 
 ## Speed
 
-Seconds per image through the API, Q8_0, 8 steps (one `sd-cli` process per image, loading included):
-
-| GPU | backend | 1024x1024 | 512x512 |
-|---|---|---|---|
-| RTX A4000 16 GB | CUDA | 27 | 8.8 |
-| Radeon 780M (iGPU) | HIP | 131 | 29 |
-| Radeon 780M (iGPU) | Vulkan | 179 | 43 |
-
-On the 780M HIP is faster but runs through the ROCm path whose queue evictions reset this GPU on current firmware
-(a driver/firmware defect, not this feature; no reset was seen in these image runs); Vulkan is setup's default there, `--image-backend hip` picks HIP.
+Not measured on the Arc Pro B70 yet. The earlier numbers in this file were from NVIDIA and AMD cards this fork does not
+support, so they were taken out.

@@ -57,30 +57,27 @@ class Choices(unittest.TestCase):
 
     def test_backend(self):
         self.assertEqual(QI.pick_backend(None, False), "cpu")
-        self.assertEqual(QI.pick_backend({"vendor": "nvidia"}, True), "cuda")
-        self.assertEqual(QI.pick_backend({"vendor": "amd"}, False), "hip")
-        self.assertEqual(QI.pick_backend({"vendor": "amd", "uma": True}, False), "vulkan")    # the 780M, Strix Halo
-        self.assertEqual(QI.pick_backend({"vendor": "amd"}, True), "vulkan")                  # AMD on Windows
-        self.assertEqual(QI.pick_backend({"vendor": "intel"}, False), "vulkan")
-        self.assertEqual(QI.pick_backend({"vendor": "amd", "arch": "gfx1103"}, False), "vulkan")   # no uma mark
-        self.assertEqual(QI.pick_backend({"vendor": "amd", "arch": "gfx1100"}, False), "hip")
-        self.assertTrue(QI.is_apu({"arch": "gfx1151:xnack-"}))
+        self.assertEqual(QI.pick_backend({"vendor": "intel", "name": "Intel Arc Pro B70", "vram_gb": 32.0}, False), "vulkan")
+        self.assertEqual(QI.BACKENDS, ("vulkan", "cpu"))
+        self.assertTrue(QI.is_apu({"uma": True}))
+        self.assertFalse(QI.is_apu({"vendor": "intel", "vram_gb": 32.0}))
+        self.assertFalse(QI.is_apu(None))
 
     def test_default_args(self):
-        self.assertEqual(QI.default_args("cuda"), ["--diffusion-fa"])
+        self.assertEqual(QI.default_args("cpu"), ["--diffusion-fa"])
         self.assertEqual(QI.default_args("vulkan"), ["--diffusion-fa", "--vae-tiling", "--vae-tile-overlap", "0.25"])
 
     def test_setup_recommends_never_forces(self):
         ns = argparse.Namespace(image_backend=None, image_quant=None)
-        self.assertEqual(quiet(setup.image_backend_choice, ns, {"vram_gb": 12.0, "arch": 86}, False)[:2],
-                         ("cuda", "Q6_K"))
-        self.assertEqual(quiet(setup.image_backend_choice, ns, {"vram_gb": 32.3, "uma": True, "arch": "gfx1103"},
-                               True)[:2], ("vulkan", "Q8_0"))
+        b70 = {"vendor": "intel", "name": "Intel Arc Pro B70", "vram_gb": 32.0}
+        self.assertEqual(quiet(setup.image_backend_choice, ns, b70, False)[:2], ("vulkan", "Q8_0"))
+        self.assertEqual(quiet(setup.image_backend_choice, ns, {**b70, "vram_gb": 12.0}, False)[:2], ("vulkan", "Q6_K"))
+        self.assertEqual(quiet(setup.image_backend_choice, ns, None, False)[:2], ("cpu", "Q4_K_M"))
         ns.image_quant = "Q8_0"                      # more than recommended: kept, with a warning
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            r = setup.image_backend_choice(ns, {"vram_gb": 8.0, "arch": 86}, False)
-        self.assertEqual(r[:2], ("cuda", "Q8_0"))
+            r = setup.image_backend_choice(ns, {**b70, "vram_gb": 8.0}, False)
+        self.assertEqual(r[:2], ("vulkan", "Q8_0"))
         self.assertIn("recommends Q4_K_M", out.getvalue())
         ns.image_quant, ns.image_backend = None, "cpu"
         self.assertEqual(quiet(setup.image_backend_choice, ns, {"vram_gb": 24.0}, False)[:2], ("cpu", "Q4_K_M"))
@@ -88,21 +85,13 @@ class Choices(unittest.TestCase):
 
 class Build(unittest.TestCase):
     def test_cmake_defs(self):
-        d = QI.cmake_defs("cuda", arch=86, cuda_root=Path("/usr/local/cuda"))
-        self.assertIn("-DSD_CUDA=ON", d)
-        self.assertIn("-DCMAKE_CUDA_ARCHITECTURES=86", d)
+        d = QI.cmake_defs("vulkan")
+        self.assertIn("-DSD_VULKAN=ON", d)
         self.assertIn("-DSD_WEBP=OFF", d)
-        self.assertIn("-DSD_VULKAN=ON", QI.cmake_defs("vulkan"))
-        with tempfile.TemporaryDirectory() as r:
-            rocm = Path(r)
-            (rocm / "lib" / "llvm" / "bin").mkdir(parents=True)
-            d = QI.cmake_defs("hip", arch="gfx1103:sramecc-:xnack-", rocm=rocm)
-            self.assertIn("-DGPU_TARGETS=gfx1103", d)
-            self.assertIn(f"-DCMAKE_HIP_COMPILER={rocm / 'lib' / 'llvm' / 'bin' / 'clang++'}", d)
-        with self.assertRaises(ValueError):
-            QI.cmake_defs("hip", arch="gfx1103")
-        with self.assertRaises(ValueError):
-            QI.cmake_defs("metal")
+        self.assertNotIn("-DSD_VULKAN=ON", QI.cmake_defs("cpu"))
+        for other in ("cuda", "hip", "metal"):
+            with self.assertRaises(ValueError):
+                QI.cmake_defs(other)
 
     def test_unpack_puts_ggml_in_place(self):
         with tempfile.TemporaryDirectory() as d:
@@ -120,18 +109,24 @@ class Build(unittest.TestCase):
             self.assertFalse(QI.source_ok(src))          # another pin: unpacked again
 
     def test_build_is_skipped_when_the_stamp_matches(self):
-        with tempfile.TemporaryDirectory() as d, mock.patch.object(setup, "IMAGE_ENGINE", Path(d)):
+        b70 = {"vendor": "intel", "name": "Intel Arc Pro B70", "vram_gb": 32.0}
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(setup, "IMAGE_ENGINE", Path(d)), \
+                mock.patch.object(setup, "ROOT", Path(d)):
             (Path(d) / QI.SD_EXE).write_bytes(b"x")
-            (Path(d) / "BUILD.json").write_text(json.dumps({**QI.build_stamp("cuda", 86), "lib_dirs": [d]}))
+            (Path(d) / "BUILD.json").write_text(json.dumps({**QI.build_stamp("vulkan", None), "lib_dirs": [d]}))
             with mock.patch.object(setup, "cmake_build") as cb:
-                exe, libs = quiet(setup.build_image_engine, "cuda", {"arch": 86})
+                exe, libs = quiet(setup.build_image_engine, "vulkan", b70)
             cb.assert_not_called()
             self.assertEqual((exe, libs), (Path(d) / QI.SD_EXE, [d]))
-            with mock.patch.object(setup, "cmake_build") as cb, mock.patch.object(setup, "get_sd_cpp"), \
-                    mock.patch.object(setup, "apply_native_runner"), \
-                    mock.patch.object(setup, "find_nvcc", return_value=(None, None)):
-                with self.assertRaises(SystemExit):     # another arch: compiled again (here: no nvcc, so it stops)
-                    quiet(setup.build_image_engine, "cuda", {"arch": 89})
+            # another pin: compiled again (nothing downloaded or built here: the source, the SDK and the build are stand-ins, and
+            # the build leaves no sd-cli, so setup stops)
+            (Path(d) / "BUILD.json").write_text(json.dumps({**QI.build_stamp("vulkan", None), "sd_cpp": "0" * 40}))
+            with mock.patch.object(setup, "cmake_build") as cb, mock.patch.object(setup, "get_sd_cpp", return_value=Path(d) / "src"), \
+                    mock.patch.object(setup, "vulkan_sdk", return_value=None) as sdk:
+                with self.assertRaises(SystemExit):
+                    quiet(setup.build_image_engine, "vulkan", b70)
+            sdk.assert_called_once()
+            self.assertIn("-DSD_VULKAN=ON", cb.call_args[0][3])
 
 
 class Config(unittest.TestCase):
@@ -161,41 +156,6 @@ class Config(unittest.TestCase):
         src = (ROOT / "setup.py").read_text(encoding="utf-8")
         for flag in ("--images", "--image-quant", "--image-backend", "--image-gpu-policy"):
             self.assertRegex(src, re.escape(f'ap.add_argument("{flag}"'))
-
-
-class Native(unittest.TestCase):
-    """I2: the native DiT runner's patch for the pinned stable-diffusion.cpp, and its config switch."""
-
-    def test_stamp_and_config(self):
-        self.assertIn("native", QI.build_stamp("cuda", 86))
-        self.assertIn("native", QI.build_stamp("hip", "gfx1103"))
-        self.assertNotIn("native", QI.build_stamp("vulkan", None))
-        c = QI.image_config("hip", "Q8_0", Path("/e/sd-cli"), Path("/m"), native=True)
-        self.assertIs(c["native"], True)
-        self.assertNotIn("native", QI.image_config("vulkan", "Q8_0", Path("/e/sd-cli"), Path("/m")))
-
-    def test_apply_is_idempotent(self):
-        sys.path.insert(0, str(QI.NATIVE_DIR))
-        import apply as A
-        with tempfile.TemporaryDirectory() as d:
-            sd = Path(d)
-            (sd / "ggml" / "src" / "ggml-cuda").mkdir(parents=True)
-            (sd / "src" / "model" / "diffusion").mkdir(parents=True)
-            (sd / "src" / "pipeline").mkdir(parents=True)
-            (sd / "src" / "pipeline" / "model_builders.cpp").write_text(
-                "#include <x>\n" + A.INCLUDE_OLD + "int a;\n" + A.BUILDER_OLD + "            }\n", encoding="utf-8")
-            (sd / "CMakeLists.txt").write_text("x\n" + A.CMAKE_OLD + "y\n", encoding="utf-8")
-            A.apply(sd)
-            first = [(sd / f).read_text(encoding="utf-8") for f in ("src/pipeline/model_builders.cpp", "CMakeLists.txt")]
-            A.apply(sd)
-            again = [(sd / f).read_text(encoding="utf-8") for f in ("src/pipeline/model_builders.cpp", "CMakeLists.txt")]
-            self.assertEqual(first, again)
-            self.assertIn("QwenImage21NativeRunner", first[0])
-            self.assertEqual(first[1].count("SD_QI_NATIVE"), 1)
-            self.assertTrue((sd / "ggml/src/ggml-cuda/qi21-native.cu").is_file())
-            (sd / "CMakeLists.txt").write_text("something else\n", encoding="utf-8")
-            with self.assertRaises(SystemExit):        # another sd.cpp: refused, not half-patched
-                A.apply(sd)
 
 
 if __name__ == "__main__":
