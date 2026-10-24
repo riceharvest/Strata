@@ -312,8 +312,7 @@ void quantize_q8_0(const float* x, uint8_t* blocks, int64_t n, void* stream) {
     const int threads = 128;
     const unsigned grid = (unsigned) ((nb + threads - 1) / threads);
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
         dpct::has_capability_or_fail(
             strata::q_of(stream)->get_device(),
             {sycl::aspect::fp64});
@@ -358,8 +357,7 @@ void quantize_q8_0_scaled(const float* x, uint8_t* blocks, float* scales, int64_
     const unsigned grid = (unsigned) ((nb + threads / 32 - 1) / (threads / 32));   // a warp a block
 #endif
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         strata::q_of(stream)
             ->parallel_for<
@@ -389,8 +387,7 @@ void dequant_q8_0(const uint8_t* blocks, float* x, int64_t n, void* stream) {
     const int threads = 128;
     const unsigned grid = (unsigned) ((nb + threads - 1) / threads);
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         strata::q_of(stream)
             ->parallel_for<dpct_kernel_name<class dequant_q8_0_kernel_154e61>>(
@@ -421,8 +418,7 @@ void quantize_q8_K(const float* x, uint8_t* blocks, int64_t n, void* stream) {
     const int threads = 64;                       // one block per thread, and a block is 256 elements
     const unsigned grid = (unsigned) ((nb + threads - 1) / threads);
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         strata::q_of(stream)
             ->parallel_for<dpct_kernel_name<class quantize_q8_K_kernel_7aadb2>>(
@@ -449,8 +445,7 @@ void dequant_q8_K(const uint8_t* blocks, float* x, int64_t n, void* stream) {
     const int threads = 64;
     const unsigned grid = (unsigned) ((nb + threads - 1) / threads);
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         strata::q_of(stream)
             ->parallel_for<dpct_kernel_name<class dequant_q8_K_kernel_e03426>>(

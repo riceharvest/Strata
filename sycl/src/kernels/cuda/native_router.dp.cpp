@@ -35,30 +35,15 @@ namespace strata::kernels {
 namespace {
 std::atomic<bool> enabled{false};
 __dpct_inline__ float warp_sum(float value) {
+    auto sg = sycl::ext::oneapi::this_work_item::get_sub_group();
 #pragma unroll
-    /*
-    DPCT1108: '__shfl_xor_sync' was migrated with the experimental feature
-    masked sub_group function which may not be supported by all compilers or
-    runtimes. You may need to adjust the code.
-    */
-    for (int mask = 16; mask; mask >>= 1) value +=
-        dpct::experimental::permute_sub_group_by_xor(
-            0xffffffffu, sycl::ext::oneapi::this_work_item::get_sub_group(),
-            value, mask);
+    for (int mask = 16; mask; mask >>= 1) value += sycl::permute_group_by_xor(sg, value, mask);
     return value;
 }
 __dpct_inline__ float warp_max(float value) {
+    auto sg = sycl::ext::oneapi::this_work_item::get_sub_group();
 #pragma unroll
-    /*
-    DPCT1108: '__shfl_xor_sync' was migrated with the experimental feature
-    masked sub_group function which may not be supported by all compilers or
-    runtimes. You may need to adjust the code.
-    */
-    for (int mask = 16; mask; mask >>= 1) value = sycl::fmax(
-        value,
-        dpct::experimental::permute_sub_group_by_xor(
-            0xffffffffu, sycl::ext::oneapi::this_work_item::get_sub_group(),
-            value, mask));
+    for (int mask = 16; mask; mask >>= 1) value = sycl::fmax(value, sycl::permute_group_by_xor(sg, value, mask));
     return value;
 }
 /*
@@ -111,22 +96,9 @@ __dpct_inline__ void route(const float *__restrict__ logits,
         }
 #pragma unroll
         for (int mask = 16; mask; mask >>= 1) {
-            /*
-            DPCT1108: '__shfl_xor_sync' was migrated with the experimental
-            feature masked sub_group function which may not be supported by all
-            compilers or runtimes. You may need to adjust the code.
-            */
-            const float other = dpct::experimental::permute_sub_group_by_xor(
-                0xffffffffu, sycl::ext::oneapi::this_work_item::get_sub_group(),
-                best, mask);
-            /*
-            DPCT1108: '__shfl_xor_sync' was migrated with the experimental
-            feature masked sub_group function which may not be supported by all
-            compilers or runtimes. You may need to adjust the code.
-            */
-            const int other_id = dpct::experimental::permute_sub_group_by_xor(
-                0xffffffffu, sycl::ext::oneapi::this_work_item::get_sub_group(),
-                expert, mask);
+            auto sg = sycl::ext::oneapi::this_work_item::get_sub_group();
+            const float other = sycl::permute_group_by_xor(sg, best, mask);
+            const int other_id = sycl::permute_group_by_xor(sg, expert, mask);
             if (other > best || (other == best && other_id < expert)) { best = other; expert = other_id; }
         }
         if ((expert & 31) == lane) {
@@ -187,22 +159,9 @@ __dpct_inline__ void route_multi(const float *__restrict__ logits,
         }
 #pragma unroll
         for (int mask = 16; mask; mask >>= 1) {
-            /*
-            DPCT1108: '__shfl_xor_sync' was migrated with the experimental
-            feature masked sub_group function which may not be supported by all
-            compilers or runtimes. You may need to adjust the code.
-            */
-            const float other = dpct::experimental::permute_sub_group_by_xor(
-                0xffffffffu, sycl::ext::oneapi::this_work_item::get_sub_group(),
-                best, mask);
-            /*
-            DPCT1108: '__shfl_xor_sync' was migrated with the experimental
-            feature masked sub_group function which may not be supported by all
-            compilers or runtimes. You may need to adjust the code.
-            */
-            const int other_id = dpct::experimental::permute_sub_group_by_xor(
-                0xffffffffu, sycl::ext::oneapi::this_work_item::get_sub_group(),
-                expert, mask);
+            auto sg = sycl::ext::oneapi::this_work_item::get_sub_group();
+            const float other = sycl::permute_group_by_xor(sg, best, mask);
+            const int other_id = sycl::permute_group_by_xor(sg, expert, mask);
             if (other > best || (other == best && other_id < expert)) { best = other; expert = other_id; }
         }
         if ((expert & 31) == lane) {
@@ -232,71 +191,23 @@ void native_router_top10(const float* logits, int32_t* ids, float* weights, void
         || overlap(logits, 512 * 4, ids, 10 * 4) || overlap(logits, 512 * 4, weights, 10 * 4)
         || overlap(ids, 10 * 4, weights, 10 * 4))
         throw std::invalid_argument("native router requires a stream, aligned spans, and disjoint outputs");
-    {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
-
-        ((sycl::queue *)(strata::q_of(stream)))
-            ->parallel_for<dpct_kernel_name<class route_96e6fb>>(
-                sycl::nd_range<3>(sycl::range(1, 8, 32), sycl::range(1, 8, 32)),
-                exp_props,
-                [=](sycl::nd_item<3> item_ct1)
-                    [[sycl::reqd_sub_group_size(32)]] {
-                        route<512>(logits, ids, weights);
-                    });
-    }
-    /*
-    DPCT1010: SYCL uses exceptions to report errors and does not use the
-    error codes. The cudaGetLastError function call was replaced with 0. You
-    need to rewrite this code.
-    */
-    const auto error = 0;
-    /*
-    DPCT1009: SYCL reports errors using exceptions and does not use error
-    codes. Please replace the "get_error_string_dummy(...)" with a real
-    error-handling function.
-    */
-    /*
-    DPCT1001: The statement could not be removed.
-    */
-    /*
-    DPCT1000: Error handling if-stmt was detected but could not be
-    rewritten.
-    */
-    if (error !=
-        0) throw std::runtime_error(dpct::get_error_string_dummy(error));
+    ((sycl::queue *)(strata::q_of(stream)))
+        ->parallel_for<dpct_kernel_name<class route_96e6fb>>(
+            sycl::nd_range<3>(sycl::range(1, 1, 32), sycl::range(1, 1, 32)),
+            [=](sycl::nd_item<3> item_ct1)
+                [[sycl::reqd_sub_group_size(32)]] {
+                    route<512>(logits, ids, weights);
+                });
 }
 void native_router_top10_multi(const float* logits, int32_t* ids, float* weights, int n_tok, void* stream) {
     if (!stream || n_tok < 1 || !valid(logits, (size_t) n_tok * 512 * 4) || !valid(ids, (size_t) n_tok * 10 * 4) ||
         !valid(weights, (size_t) n_tok * 10 * 4))
         throw std::invalid_argument("native router (multi) requires a stream and aligned [n,512]/[n,10] buffers");
-    // SYCL port: one block per token running the single-token route<512> (the same kernel as the 256-expert multi
-    // launch below).  Upstream's one-warp-per-token route_multi gives the same bits (native_multi_parity checks
-    // that) but hung an Arc A750 (Alchemist) on its first launch.
+    // SYCL port: one 32-lane block per token running route<512>.
     ((sycl::queue *)(strata::q_of(stream)))
         ->parallel_for<dpct_kernel_name<class route_512_multi>>(
-            sycl::nd_range<3>(sycl::range(1, 1, (unsigned) n_tok) * sycl::range(1, 8, 32), sycl::range(1, 8, 32)),
+            sycl::nd_range<3>(sycl::range(1, 1, (unsigned) n_tok) * sycl::range(1, 1, 32), sycl::range(1, 1, 32)),
             [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] { route<512>(logits, ids, weights); });
-    /*
-    DPCT1010: SYCL uses exceptions to report errors and does not use the
-    error codes. The cudaGetLastError function call was replaced with 0. You
-    need to rewrite this code.
-    */
-    const auto error = 0;
-    /*
-    DPCT1009: SYCL reports errors using exceptions and does not use error
-    codes. Please replace the "get_error_string_dummy(...)" with a real
-    error-handling function.
-    */
-    /*
-    DPCT1001: The statement could not be removed.
-    */
-    /*
-    DPCT1000: Error handling if-stmt was detected but could not be
-    rewritten.
-    */
-    if (error !=
-        0) throw std::runtime_error(dpct::get_error_string_dummy(error));
 }
 
 void native_router_top10_multi_ne(const float* logits, int32_t* ids, float* weights, int n_tok, int n_expert, void* stream) {
@@ -306,7 +217,7 @@ void native_router_top10_multi_ne(const float* logits, int32_t* ids, float* weig
         throw std::invalid_argument("native router (multi, 256): a stream, 256 experts and aligned [n,256]/[n,10] buffers");
     ((sycl::queue *)(strata::q_of(stream)))
         ->parallel_for<dpct_kernel_name<class route_256_multi>>(
-            sycl::nd_range<3>(sycl::range(1, 1, (unsigned) n_tok) * sycl::range(1, 8, 32), sycl::range(1, 8, 32)),
+            sycl::nd_range<3>(sycl::range(1, 1, (unsigned) n_tok) * sycl::range(1, 1, 32), sycl::range(1, 1, 32)),
             [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] { route<256>(logits, ids, weights); });
 }
 }

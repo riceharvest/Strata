@@ -2147,8 +2147,7 @@ void launch_multi_n(const void *weights, const void *x_q8_1, float *y, int n_in,
                     int n_out, dpct::queue_ptr s) {
     const auto* w = static_cast<const typename F::Block*>(weights);
     const auto* x = static_cast<const Q81Block*>(x_q8_1);
-    auto exp_props = sycl::ext::oneapi::experimental::properties{
-        sycl::ext::oneapi::experimental::use_root_sync};
+    auto exp_props = sycl::ext::oneapi::experimental::properties{};
     dpct::has_capability_or_fail(s->get_device(), {sycl::aspect::fp16});
     if (!g_multi_exact) {
         constexpr int NW = NCOLS <= 4 ? 4 : 2;
@@ -2396,8 +2395,7 @@ void small_mmvq(const void* weights, const void* x_q8_1, float* y,
         {
             iq4nl_values.init(*s);
 
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
             s->submit([&](sycl::handler &cgh) {
                 auto iq4nl_values_ptr_ct1 = iq4nl_values.get_ptr();
@@ -2423,8 +2421,7 @@ void small_mmvq(const void* weights, const void* x_q8_1, float* y,
         */
         iq4nl_values.init(*s);
 
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         s->submit([&](sycl::handler &cgh) {
             auto iq4nl_values_ptr_ct1 = iq4nl_values.get_ptr();
@@ -2592,8 +2589,7 @@ void q8_packed_launch(const Q8Packed &w, const Q81Block *x, float *y,
     const int grid = persist ? (std::min)(w.n_out, Q8P_PERSIST_GRID) : w.n_out;
     if (s26_tsum_on())
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
         dpct::has_capability_or_fail(s->get_device(), {sycl::aspect::fp16});
 
         s->parallel_for<dpct_kernel_name<class native_q8_0_packed_kernel_851f07,
@@ -2608,8 +2604,7 @@ void q8_packed_launch(const Q8Packed &w, const Q81Block *x, float *y,
                     w.qs, w.d, x, y, w.n_in, w.n_out, persist ? grid : w.n_out);
             });
     } else {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
         dpct::has_capability_or_fail(s->get_device(), {sycl::aspect::fp16});
 
         s->/*
@@ -2796,8 +2791,7 @@ void q6_packed_launch(const Q6Packed &w, const Q81Block *x, float *y,
     const int grid = (std::min)(w.n_out, q6p_grid());
     if (s26_tsum_on())
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
         dpct::has_capability_or_fail(s->get_device(), {sycl::aspect::fp16});
 
         s->parallel_for<dpct_kernel_name<class native_q6_k_packed_kernel_ee650b,
@@ -2812,8 +2806,7 @@ void q6_packed_launch(const Q6Packed &w, const Q81Block *x, float *y,
                     w.ql, w.qh, w.sc, w.d, x, y, w.n_in, w.n_out, grid);
             });
     } else {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
         dpct::has_capability_or_fail(s->get_device(), {sycl::aspect::fp16});
 
         s->/*
@@ -3365,8 +3358,7 @@ void native_quantize_q8_1(const float* x, void* x_q8_1, int n_in, int ncols, voi
     const int n_total = n_in * ncols;
     const unsigned blocks = unsigned((std::size_t(n_total) + QUANT_THREADS - 1) / QUANT_THREADS);
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         ((sycl::queue *)(strata::q_of(stream)))
             ->parallel_for<
@@ -3394,8 +3386,7 @@ void native_swiglu_quantize_q8_1(const float* gate, const float* up, void* x_q8_
     const int n_total = n_in * ncols;
     const unsigned blocks = unsigned((std::size_t(n_total) + QUANT_THREADS - 1) / QUANT_THREADS);
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
         dpct::has_capability_or_fail(
             ((sycl::queue *)(strata::q_of(stream)))
                 ->get_device(),
@@ -3444,8 +3435,7 @@ void native_q5_k_mmvq(const void* weights, const void* x_q8_1, float* y,
         info::device::max_work_group_size. Adjust the work-group size if needed.
         */
         {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};
             dpct::has_capability_or_fail(s->get_device(), {sycl::aspect::fp16});
 
             s->parallel_for<
@@ -3464,8 +3454,7 @@ void native_q5_k_mmvq(const void* weights, const void* x_q8_1, float* y,
         the limit. To get the device limit, query
         info::device::max_work_group_size. Adjust the work-group size if needed.
         */
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
         dpct::has_capability_or_fail(s->get_device(), {sycl::aspect::fp16});
 
         s->parallel_for<dpct_kernel_name<class native_q5_k_mmvq_kernel_938b09,
@@ -3520,8 +3509,7 @@ void native_q2_0_mmvq(const void* weights, const void* x_q8_1, float* y,
         info::device::max_work_group_size. Adjust the work-group size if needed.
         */
         {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
             s->parallel_for<
                 dpct_kernel_name<class native_q2_0_mmvq_kernel_dec305,
@@ -3539,8 +3527,7 @@ void native_q2_0_mmvq(const void* weights, const void* x_q8_1, float* y,
         the limit. To get the device limit, query
         info::device::max_work_group_size. Adjust the work-group size if needed.
         */
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         s->parallel_for<dpct_kernel_name<class native_q2_0_mmvq_kernel_ef5f5c,
                                          dpct_kernel_scalar<false>>>(
@@ -3593,8 +3580,7 @@ void native_q3_k_mmvq(const void* weights, const void* x_q8_1, float* y,
         info::device::max_work_group_size. Adjust the work-group size if needed.
         */
         {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
             s->parallel_for<
                 dpct_kernel_name<class native_q3_k_mmvq_kernel_208be9,
@@ -3612,8 +3598,7 @@ void native_q3_k_mmvq(const void* weights, const void* x_q8_1, float* y,
         the limit. To get the device limit, query
         info::device::max_work_group_size. Adjust the work-group size if needed.
         */
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         s->parallel_for<dpct_kernel_name<class native_q3_k_mmvq_kernel_926817,
                                          dpct_kernel_scalar<false>>>(
@@ -3669,8 +3654,7 @@ void native_iq4_xs_mmvq(const void* weights, const void* x_q8_1, float* y,
         {
             iq4nl_values.init(*s);
 
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
             s->submit([&](sycl::handler &cgh) {
                 auto iq4nl_values_ptr_ct1 = iq4nl_values.get_ptr();
@@ -3696,8 +3680,7 @@ void native_iq4_xs_mmvq(const void* weights, const void* x_q8_1, float* y,
         */
         iq4nl_values.init(*s);
 
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         s->submit([&](sycl::handler &cgh) {
             auto iq4nl_values_ptr_ct1 = iq4nl_values.get_ptr();
@@ -3758,8 +3741,7 @@ void native_q4_k_mmvq(const void* weights, const void* x_q8_1, float* y,
         info::device::max_work_group_size. Adjust the work-group size if needed.
         */
         {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};
             dpct::has_capability_or_fail(s->get_device(), {sycl::aspect::fp16});
 
             s->parallel_for<
@@ -3778,8 +3760,7 @@ void native_q4_k_mmvq(const void* weights, const void* x_q8_1, float* y,
         the limit. To get the device limit, query
         info::device::max_work_group_size. Adjust the work-group size if needed.
         */
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
         dpct::has_capability_or_fail(s->get_device(), {sycl::aspect::fp16});
 
         s->parallel_for<dpct_kernel_name<class native_q4_k_mmvq_kernel_b29f4f,
@@ -3864,8 +3845,7 @@ void native_q6_k_mmvq(const void* weights, const void* x_q8_1, float* y,
         info::device::max_work_group_size. Adjust the work-group size if needed.
         */
         {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
             s->parallel_for<
                 dpct_kernel_name<class native_q6_k_mmvq_kernel_4d887f,
@@ -3883,8 +3863,7 @@ void native_q6_k_mmvq(const void* weights, const void* x_q8_1, float* y,
         the limit. To get the device limit, query
         info::device::max_work_group_size. Adjust the work-group size if needed.
         */
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         s->parallel_for<dpct_kernel_name<class native_q6_k_mmvq_kernel_19484e,
                                          dpct_kernel_scalar<false>>>(
@@ -3944,8 +3923,7 @@ void q8_0_pair_launch(const Q80Block *w1, const Q80Block *w2, const Q81Block *x,
         info::device::max_work_group_size. Adjust the work-group size if needed.
         */
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
         dpct::has_capability_or_fail(s->get_device(), {sycl::aspect::fp16});
 
         s->parallel_for<dpct_kernel_name<
@@ -3966,8 +3944,7 @@ void q8_0_pair_launch(const Q80Block *w1, const Q80Block *w2, const Q81Block *x,
     info::device::max_work_group_size. Adjust the work-group size if needed.
     */
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
         dpct::has_capability_or_fail(s->get_device(), {sycl::aspect::fp16});
 
         s->parallel_for<dpct_kernel_name<

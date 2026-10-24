@@ -332,7 +332,12 @@ private:
     // (kIdle, kWaitParked, kWaitDone, or its job), printed by the serve watchdog through `diag`
     static constexpr int32_t kParked = -1, kSleeping = -2, kBetween = -3, kIdle = -10, kWaitParked = -11,
                              kWaitDone = -12;
-    std::unique_ptr<std::atomic<int32_t>[]> wstate_;
+    struct alignas(64) WorkerState {
+        std::atomic<int32_t> v{kParked};
+        void store(int32_t x, std::memory_order m = std::memory_order_seq_cst) noexcept { v.store(x, m); }
+        int32_t load(std::memory_order m = std::memory_order_seq_cst) const noexcept { return v.load(m); }
+    };
+    std::unique_ptr<WorkerState[]> wstate_;
     std::atomic<int32_t> hstate_{kIdle};
     std::atomic<int64_t> hstate_ms_{0};
     alignas(64) std::atomic<uint64_t> head_{0};   // epoch << 32 | njobs << 16 | next index (issue #29)

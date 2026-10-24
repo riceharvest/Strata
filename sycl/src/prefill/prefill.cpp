@@ -945,9 +945,10 @@ I8Cross i8_calibrate(M& m, const strata::kernels::cpu::NativeFmt& f) {
         uint32_t s = 12345;
         auto rnd = [&] { s = s * 1664525u + 1013904223u; return s >> 8; };
         for (size_t i = 0; i < hb.size(); ++i) hb[i] = (uint8_t) rnd();
-        const int gb = f.gu_type == 21 ? 110 : f.gu_type == 18 ? 98 : 82;
+        const int gb = f.gu_type == 23 ? 136 : f.gu_type == 21 ? 110 : f.gu_type == 18 ? 98 : f.gu_type == 22 ? 82 : f.gu_type == 17 ? 74 : 66;
+        const int db = f.d_type == 8 ? 34 : 18;
         for (size_t o = 0; o + 2 <= f.up_off * 2 && o < hb.size(); o += gb) { hb[o] = 0x00; hb[o + 1] = 0x2C; }
-        for (size_t o = f.down_off; o + 2 <= f.bytes; o += 18) { hb[o] = 0x00; hb[o + 1] = 0x2C; }
+        for (size_t o = f.down_off; o + 2 <= f.bytes; o += db) { hb[o] = 0x00; hb[o + 1] = 0x2C; }
         for (int i = 0; i < E; ++i) q.memcpy(blobs[i], hb.data(), f.bytes);
         std::vector<uint16_t> hx(rmax * N);
         for (auto& x : hx) x = (uint16_t) (0x3400 + (rnd() & 0x3ff));   // ~0.25..0.5, no zeros
@@ -4229,8 +4230,11 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                         // held group of staged experts as above
                         const int i8m = i8_mode(m.cs);
                         const bool i8on = !xmx2_only && i8m != 0 && !use_mmq && lay.native && !had_gu && !had_d &&
-                                          (lay.fmt[(size_t) l].gu_type == 21 || lay.fmt[(size_t) l].gu_type == 18 || lay.fmt[(size_t) l].gu_type == 22) &&
-                                          (lay.fmt[(size_t) l].d_type == 20 || lay.fmt[(size_t) l].d_type == 42) &&
+                                          (lay.fmt[(size_t) l].gu_type == 21 || lay.fmt[(size_t) l].gu_type == 18 ||
+                                           lay.fmt[(size_t) l].gu_type == 22 || lay.fmt[(size_t) l].gu_type == 23 ||
+                                           lay.fmt[(size_t) l].gu_type == 17 || lay.fmt[(size_t) l].gu_type == 16) &&
+                                          (lay.fmt[(size_t) l].d_type == 20 || lay.fmt[(size_t) l].d_type == 42 ||
+                                           lay.fmt[(size_t) l].d_type == 8) &&
                                           lay.fmt[(size_t) l].n_ff == 640 && lay.fmt[(size_t) l].n_embd == 2560 &&
                                           strata::prefill::i8::available(m.cs);
                         const bool xmx2 = xmx2_only || i8on;
@@ -4260,6 +4264,10 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                         int64_t xg_r0 = 0;
                         auto xflush = [&]() {
                             if (xg_n == 0) return;
+                            if (xg_ns > 0) {   // the copies land in order on m.copy: waiting on the last slot covers the group
+                                pt.mark(kPfWaitCopy, cs);
+                                (m.cs)->ext_oneapi_submit_barrier({*m.copied[xg_slots[xg_ns - 1]]});
+                            }
                             const auto& f = lay.fmt[(size_t) l];
                             int64_t nr = 0;
                             for (int i = 0; i < xg_n; ++i) nr += xg_c[i];
@@ -4540,9 +4548,11 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                                     ++stats_.experts_resident;
                                     if (!compute(j, m.cache->device_slot(m.host_res[(size_t) l * m.g->n_expert + e]), -1)) return false;
                                 } else {
-                                    pt.mark(kPfWaitCopy, cs);
-                                    (m.cs)->ext_oneapi_submit_barrier(
-                                        {*m.copied[stage_of[j]]});
+                                    if (!xmx2) {
+                                        pt.mark(kPfWaitCopy, cs);
+                                        (m.cs)->ext_oneapi_submit_barrier(
+                                            {*m.copied[stage_of[j]]});
+                                    }
                                     if (!compute(j, m.stage_dev[stage_of[j]], stage_of[j])) return false;
                                 }
                             }
@@ -4577,7 +4587,7 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                                 if (k < kend && seq[k].e == e) {
                                     const int sl = (int) (k % (size_t) m.ring);
                                     wait_issued(k);
-                                    if (!group_gather) {
+                                    if (!group_gather && !xmx2) {
                                         pt.mark(kPfWaitCopy, cs);
                                         (m.cs)->ext_oneapi_submit_barrier(
                                             {*m.copied[sl]});

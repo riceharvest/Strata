@@ -94,23 +94,11 @@ auto &sk = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[S]>(
         sq_part = oc * oc;
     }
     // RMS over the head's 128 outputs: warps of row group 0 are threads 0..127.
-    /*
-DPCT1108: '__shfl_xor_sync' was migrated with the experimental feature masked
-sub_group function which may not be supported by all compilers or runtimes. You
-may need to adjust the code.
-*/
+    auto sg = sycl::ext::oneapi::this_work_item::get_sub_group();
 #pragma unroll
-    for (int o2 = 16; o2 > 0; o2 >>= 1) sq_part +=
-        dpct::experimental::permute_sub_group_by_xor(
-            0xffffffffu, sycl::ext::oneapi::this_work_item::get_sub_group(),
-            sq_part, o2);
+    for (int o2 = 16; o2 > 0; o2 >>= 1) sq_part += sycl::permute_group_by_xor(sg, sq_part, o2);
     if ((tid & 31) == 0) wsum[tid >> 5] = sq_part;
-    /*
-    DPCT1065: Consider replacing sycl::nd_item::barrier() with
-    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
-    performance if there is no access to global memory.
-    */
-    item_ct1.barrier();
+    item_ct1.barrier(sycl::access::fence_space::local_space);
     if (rg == 0) {
         const float ss = wsum[0] + wsum[1] + wsum[2] + wsum[3];
         const float scale = sycl::rsqrt(ss / (float)S + eps);
@@ -237,8 +225,7 @@ void fused_gdn_conv_l2(float* history, const float* qkv, const float* conv_w, fl
         std::exit(1);
     }
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         strata::q_of(stream)
             ->parallel_for<dpct_kernel_name<class gdn_conv_l2_kernel_44cd0c>>(
@@ -272,8 +259,7 @@ void fused_gdn_ab(const float* x, const uint16_t* w_alpha, const uint16_t* w_bet
         std::exit(1);
     }
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         strata::q_of(stream)
             ->parallel_for<dpct_kernel_name<class gdn_ab_kernel_c211b9>>(
@@ -314,8 +300,7 @@ void fused_gdn_step_norm(float* state, const float* q, const float* k, const flo
     Adjust the work-group size if needed.
     */
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         strata::q_of(stream)
             ->parallel_for<dpct_kernel_name<class gdn_step_norm_kernel_51bed3>>(

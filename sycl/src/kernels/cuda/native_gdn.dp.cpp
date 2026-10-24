@@ -130,8 +130,7 @@ void native_gdn_step(float* state, const float* q, const float* k, const float* 
     }
     const float scale = 1.0f / sqrtf(float(S));
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         ((sycl::queue *)(strata::q_of(stream)))
             ->parallel_for<dpct_kernel_name<class step_134598>>(

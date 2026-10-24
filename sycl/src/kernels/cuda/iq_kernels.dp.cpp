@@ -609,8 +609,13 @@ __dpct_inline__ float vec_dot_q5_0_q8_1(const void *__restrict__ vbq,
     int sumi = 0;
 #pragma unroll
     for (int i = 0; i < VDR_Q5_0; ++i) {
+#if STRATA_IQ4NL_FAST
+        const int vl = load4_a2(bq5_0->qs + 4 * (iqs + i));
+        const int vh = load4_a2(bq5_0->qh) >> (4 * (iqs + i));
+#else
         const int vl = get_int_b2(bq5_0->qs, iqs + i);
         const int vh = get_int_b2(bq5_0->qh, 0) >> (4 * (iqs + i));
+#endif
         const int u0 = get_int_b4(bq8_1->qs, iqs + i), u1 = get_int_b4(bq8_1->qs, iqs + i + QI5_0);
         int vi0 = (vl >> 0) & 0x0F0F0F0F;
         vi0 |= (vh << 4) & 0x00000010;
@@ -650,7 +655,11 @@ __dpct_inline__ float vec_dot_q4_0_q8_1(const void *__restrict__ vbq,
     int sumi = 0;
 #pragma unroll
     for (int i = 0; i < VDR_Q4_0; ++i) {
+#if STRATA_IQ4NL_FAST
+        const int v = load4_a2(bq4->qs + 4 * (iqs + i));
+#else
         const int v = get_int_b2(bq4->qs, iqs + i);
+#endif
         sumi = ggml_cuda_dp4a(q4_0_centred((v >> 0) & 0x0F0F0F0F), get_int_b4(bq8_1->qs, iqs + i), sumi);
         sumi = ggml_cuda_dp4a(q4_0_centred((v >> 4) & 0x0F0F0F0F), get_int_b4(bq8_1->qs, iqs + i + QI4_0), sumi);
     }
@@ -710,6 +719,14 @@ __dpct_inline__ float vec_dot_q5_1_q8_1(const void *__restrict__ vbq,
 // Q6_K: llama.cpp's integer chain verbatim (vecdotq.cuh vec_dot_q6_K_q8_1_impl_mmvq / vec_dot_q6_K_q8_1) -- signed
 // per-16-element scales, the -32 offset folded into the per-byte value, the q8_1 block's ds.low for the scales,
 // upstream exactly as pulled (no min-term choice exists: Q6_K has no learned min).
+__dpct_inline__ int q6_k_centred(const int v) {
+#if STRATA_SWAR
+    const uint32_t b = (uint32_t) v ^ 0x20202020u;   // per byte: 0..63 -> (q - 32) as a 6-bit two's complement value
+    return (int) (b | ((b & 0x20202020u) * 6u));     // sign-extend bit 5 into bits 6..7 (0x20 * 6 = 0xC0)
+#else
+    return dpct::vectorized_binary<sycl::char4>(v, 0x20202020, dpct::sub_sat());
+#endif
+}
 __dpct_inline__ float
 vec_dot_q6_K_q8_1_impl_mmvq(const int vl, const int vh,
                             const int *__restrict__ u,
@@ -721,8 +738,7 @@ vec_dot_q6_K_q8_1_impl_mmvq(const int vl, const int vh,
         const int sc = scales[4 * i];
         const int vil = (vl >> (4 * i)) & 0x0F0F0F0F;
         const int vih = ((vh >> (4 * i)) << 4) & 0x30303030;
-        const int vi = dpct::vectorized_binary<sycl::char4>(
-            vil | vih, 0x20202020, dpct::sub_sat()); // vi = (vil | vih) - 32
+        const int vi = q6_k_centred(vil | vih); // vi = (vil | vih) - 32
         sumf += d8[i] * (STRATA_DP4A(vi, u[i], 0) * sc);
     }
     return d * sumf;
@@ -734,8 +750,13 @@ __dpct_inline__ float vec_dot_q6_K_q8_1(const void *__restrict__ vbq,
     const int bq8_offset = 2 * QR6_K * (iqs / (QI6_K / 2)) + (iqs % (QI6_K / 2)) / (QI6_K / 4);
     const int scale_offset = (QI6_K / 4) * (iqs / (QI6_K / 2)) + (iqs % (QI6_K / 2)) / (QI6_K / 8);
     const int vh_shift = 2 * ((iqs % (QI6_K / 2)) / (QI6_K / 4));
+#if STRATA_IQ4NL_FAST
+    const int vl = load4_a2(bq6_K->ql + 4 * iqs);
+    const int vh = load4_a2(bq6_K->qh + 4 * ((QI6_K / 4) * (iqs / (QI6_K / 2)) + iqs % (QI6_K / 4))) >> vh_shift;
+#else
     const int vl = get_int_b2(bq6_K->ql, iqs);
     const int vh = get_int_b2(bq6_K->qh, (QI6_K / 4) * (iqs / (QI6_K / 2)) + iqs % (QI6_K / 4)) >> vh_shift;
+#endif
     const int8_t* scales = bq6_K->scales + scale_offset;
     int u[QR6_K];
     float d8[QR6_K];
@@ -755,9 +776,15 @@ __dpct_inline__ float vec_dot_q8_0_q8_1(const void *__restrict__ vbq,
                                         const int &kbx, const int &iqs) {
     const block_q8_0* bq8_0 = (const block_q8_0*) vbq + kbx;
     int sumi = 0;
+#if STRATA_IQ4NL_FAST
+    const sycl::int2 q8 = load8_a2((const uint8_t*) bq8_0->qs + 4 * iqs);
+    sumi = ggml_cuda_dp4a(q8.x(), get_int_b4(bq8_1->qs, iqs + 0), sumi);
+    sumi = ggml_cuda_dp4a(q8.y(), get_int_b4(bq8_1->qs, iqs + 1), sumi);
+#else
 #pragma unroll
     for (int i = 0; i < VDR_Q8_0; ++i)
         sumi = ggml_cuda_dp4a(get_int_b2(bq8_0->qs, iqs + i), get_int_b4(bq8_1->qs, iqs + i), sumi);
+#endif
     const float d8_0 = sycl::vec<sycl::half, 1>(bq8_0->d)
                            .convert<float, sycl::rounding_mode::automatic>()[0],
                 d8_1 = bq8_1->ds[0];
@@ -900,16 +927,9 @@ template<> struct Fmt<146> { static constexpr int qk = 128, ipb = 8, step = 4;
 #define STRATA_MMVQ_FMTS(X) X(16) X(17) X(18) X(20) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(7) X(6) X(2) X(3) X(8) X(144) X(145) X(146)
 
 __dpct_inline__ float warp_sum(float v) {
+    auto sg = sycl::ext::oneapi::this_work_item::get_sub_group();
 #pragma unroll
-    /*
-    DPCT1108: '__shfl_xor_sync' was migrated with the experimental feature
-    masked sub_group function which may not be supported by all compilers or
-    runtimes. You may need to adjust the code.
-    */
-    for (int o = 16; o > 0; o >>= 1) v +=
-        dpct::experimental::permute_sub_group_by_xor(
-            0xffffffffu, sycl::ext::oneapi::this_work_item::get_sub_group(), v,
-            o);
+    for (int o = 16; o > 0; o >>= 1) v += sycl::permute_group_by_xor(sg, v, o);
     return v;
 }
 
@@ -923,9 +943,10 @@ constexpr int kExpertLanes = STRATA_EXPERT_LANES;
 constexpr int kExpertRows = 256 / kExpertLanes;
 template <int LANES>
 __dpct_inline__ float lanes_sum(float v) {
+    auto sg = sycl::ext::oneapi::this_work_item::get_sub_group();
 #pragma unroll
     for (int o = LANES / 2; o > 0; o >>= 1)
-        v += dpct::experimental::permute_sub_group_by_xor(0xffffffffu, sycl::ext::oneapi::this_work_item::get_sub_group(), v, o);
+        v += sycl::permute_group_by_xor(sg, v, o);
     return v;
 }
 template <int TY, int LANES>
@@ -1464,17 +1485,9 @@ __dpct_inline__ void row_dot_40_sub8(const uint8_t *row, const block_q8_1 *x,
 #pragma unroll
     for (int c = 0; c < NC; ++c) {
         if (EXACT_N || c < n) {
+            auto sg = sycl::ext::oneapi::this_work_item::get_sub_group();
 #pragma unroll
-            /*
-            DPCT1108: '__shfl_xor_sync' was migrated with the experimental
-            feature masked sub_group function which may not be supported by all
-            compilers or runtimes. You may need to adjust the code.
-            */
-            for (int o = 4; o > 0; o >>= 1) s[c] +=
-                dpct::experimental::permute_sub_group_by_xor(
-                    0xffffffffu,
-                    sycl::ext::oneapi::this_work_item::get_sub_group(), s[c],
-                    o);
+            for (int o = 4; o > 0; o >>= 1) s[c] += sycl::permute_group_by_xor(sg, s[c], o);
         }
     }
 }
@@ -1515,24 +1528,10 @@ __dpct_inline__ void row_dot_20_sub16(const uint8_t *row, const block_q8_1 *x,
 #pragma unroll
     for (int c = 0; c < NC; ++c) {
         if (EXACT_N || c < n) {
-            /*
-            DPCT1013: The rounding mode could not be specified and the
-            generated code may have different accuracy than the original code.
-            Verify the correctness. SYCL math built-in function rounding mode is
-            aligned with OpenCL C 1.2 standard.
-            */
             s[c] = s[c] + s16[c];
+            auto sg = sycl::ext::oneapi::this_work_item::get_sub_group();
 #pragma unroll
-            /*
-            DPCT1108: '__shfl_xor_sync' was migrated with the experimental
-            feature masked sub_group function which may not be supported by all
-            compilers or runtimes. You may need to adjust the code.
-            */
-            for (int o = 8; o > 0; o >>= 1) s[c] +=
-                dpct::experimental::permute_sub_group_by_xor(
-                    0xffffffffu,
-                    sycl::ext::oneapi::this_work_item::get_sub_group(), s[c],
-                    o);
+            for (int o = 8; o > 0; o >>= 1) s[c] += sycl::permute_group_by_xor(sg, s[c], o);
         }
     }
 }
@@ -1586,24 +1585,10 @@ row_dot_80_sub16(const uint8_t *row, const block_q8_1 *x, const int (&off)[NC],
 #pragma unroll
     for (int c = 0; c < NC; ++c) {
         if (EXACT_N || c < n) {
-            /*
-            DPCT1013: The rounding mode could not be specified and the
-            generated code may have different accuracy than the original code.
-            Verify the correctness. SYCL math built-in function rounding mode is
-            aligned with OpenCL C 1.2 standard.
-            */
             s[c] = s[c] + s16[c];
+            auto sg = sycl::ext::oneapi::this_work_item::get_sub_group();
 #pragma unroll
-            /*
-            DPCT1108: '__shfl_xor_sync' was migrated with the experimental
-            feature masked sub_group function which may not be supported by all
-            compilers or runtimes. You may need to adjust the code.
-            */
-            for (int o = 8; o > 0; o >>= 1) s[c] +=
-                dpct::experimental::permute_sub_group_by_xor(
-                    0xffffffffu,
-                    sycl::ext::oneapi::this_work_item::get_sub_group(), s[c],
-                    o);
+            for (int o = 8; o > 0; o >>= 1) s[c] += sycl::permute_group_by_xor(sg, s[c], o);
         }
     }
 }
@@ -2095,8 +2080,13 @@ template <> struct KqSplit<14> {   // Q6_K (vec_dot_q6_K_q8_1)
         const int scale_offset = (QI6_K / 4) * (iqs / (QI6_K / 2)) + (iqs % (QI6_K / 2)) / (QI6_K / 8);
         const int vh_shift = 2 * ((iqs % (QI6_K / 2)) / (QI6_K / 4));
         W r;
+#if STRATA_IQ4NL_FAST
+        r.vl = load4_a2(bq6_K->ql + 4 * iqs);
+        r.vh = load4_a2(bq6_K->qh + 4 * ((QI6_K / 4) * (iqs / (QI6_K / 2)) + iqs % (QI6_K / 4))) >> vh_shift;
+#else
         r.vl = get_int_b2(bq6_K->ql, iqs);
         r.vh = get_int_b2(bq6_K->qh, (QI6_K / 4) * (iqs / (QI6_K / 2)) + iqs % (QI6_K / 4)) >> vh_shift;
+#endif
         const int8_t* scales = bq6_K->scales + scale_offset;
         r.sc[0] = scales[0];
         r.sc[4] = scales[4];   // the impl reads scales[4 * i], i < QR6_K = 2
@@ -2159,8 +2149,14 @@ template <> struct KqSplit<8> {   // Q8_0 (vec_dot_q8_0_q8_1)
     __dpct_inline__ static W load(const void* __restrict__ vbq, int kbx, int iqs) {
         const block_q8_0* b = (const block_q8_0*) vbq + kbx;
         W r;
+#if STRATA_IQ4NL_FAST
+        const sycl::int2 q8 = load8_a2((const uint8_t*) b->qs + 4 * iqs);
+        r.q[0] = q8.x();
+        r.q[1] = q8.y();
+#else
 #pragma unroll
         for (int i = 0; i < VDR_Q8_0; ++i) r.q[i] = get_int_b2(b->qs, iqs + i);
+#endif
         r.d = sycl::vec<sycl::half, 1>(b->d).convert<float, sycl::rounding_mode::automatic>()[0];
         return r;
     }
@@ -3075,11 +3071,14 @@ inline void dq_q4_k(const void *vx, int64_t ibs, dst_t *yy, int tid) {
     const float d1 = dall * sc, m1 = dmin * m;
     get_scale_min_k4((int) is + 1, x[ibs].scales, sc, m);
     const float d2 = dall * sc, m2 = dmin * m;
+    float v0[4], v1[4];
 #pragma unroll
     for (int l = 0; l < n; ++l) {
-        y[l + 0] = cvt<dst_t>(d1 * (q[l] & 0xF) - m1);
-        y[l + 32] = cvt<dst_t>(d2 * (q[l] >> 4) - m2);
+        v0[l] = d1 * (q[l] & 0xF) - m1;
+        v1[l] = d2 * (q[l] >> 4) - m2;
     }
+    store_run<dst_t, 4>(y, v0);
+    store_run<dst_t, 4>(y + 32, v1);
 }
 template <typename dst_t>
 inline void dq_q5_k(const void *vx, int64_t ibs, dst_t *yy, int tid) {
@@ -3378,8 +3377,7 @@ void launch_mmvq_multi_nc(dpct::dim3 grid, dpct::dim3 block, dpct::queue_ptr s,
         */
     case 1: {
 
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         s->submit([&](sycl::handler &cgh) {
 
@@ -3402,8 +3400,7 @@ void launch_mmvq_multi_nc(dpct::dim3 grid, dpct::dim3 block, dpct::queue_ptr s,
         */
     case 2: {
 
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         s->submit([&](sycl::handler &cgh) {
 
@@ -3426,8 +3423,7 @@ void launch_mmvq_multi_nc(dpct::dim3 grid, dpct::dim3 block, dpct::queue_ptr s,
         */
     case 3: {
 
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         s->submit([&](sycl::handler &cgh) {
 
@@ -3450,8 +3446,7 @@ void launch_mmvq_multi_nc(dpct::dim3 grid, dpct::dim3 block, dpct::queue_ptr s,
         */
     case 4: {
 
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         s->submit([&](sycl::handler &cgh) {
 
@@ -3474,8 +3469,7 @@ void launch_mmvq_multi_nc(dpct::dim3 grid, dpct::dim3 block, dpct::queue_ptr s,
         */
     case 5: {
 
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         s->submit([&](sycl::handler &cgh) {
 
@@ -3498,8 +3492,7 @@ void launch_mmvq_multi_nc(dpct::dim3 grid, dpct::dim3 block, dpct::queue_ptr s,
         */
     case 6: {
 
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         s->submit([&](sycl::handler &cgh) {
 
@@ -3524,8 +3517,7 @@ void launch_mmvq_multi_nc(dpct::dim3 grid, dpct::dim3 block, dpct::queue_ptr s,
             */
         if (ncols <= 1) {
 
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
             s->submit([&](sycl::handler &cgh) {
 
@@ -3549,8 +3541,7 @@ void launch_mmvq_multi_nc(dpct::dim3 grid, dpct::dim3 block, dpct::queue_ptr s,
         */
         else {
 
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
             s->submit([&](sycl::handler &cgh) {
 
@@ -3581,8 +3572,7 @@ void launch_mmvq(const uint8_t *W, size_t rb, const block_q8_1 *X, float *y,
     */
     if constexpr (!kSplit<TY>) {
 
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         s->submit([&](sycl::handler &cgh) {
 
@@ -3602,8 +3592,7 @@ void launch_mmvq(const uint8_t *W, size_t rb, const block_q8_1 *X, float *y,
     */
     else if (g_old_kernels) {
 
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         s->submit([&](sycl::handler &cgh) {
 
@@ -4105,8 +4094,7 @@ void s26_launch_l(const NativeExpertLayout &L, int64_t cap_groups,
                          (unsigned)cap_groups);
     {
 
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
         dpct::has_capability_or_fail(s->get_device(), {sycl::aspect::fp16});
 
         s->submit([&](sycl::handler &cgh) {
@@ -4127,8 +4115,7 @@ void s26_launch_l(const NativeExpertLayout &L, int64_t cap_groups,
         });
     }
     if (FQ) {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         s->parallel_for<dpct_kernel_name<class s26_swiglu_q8_1_kernel_a7b554>>(
             sycl::nd_range<3>(sycl::range(1, 1, (unsigned)((nh + 255) / 256)) *
@@ -4140,8 +4127,7 @@ void s26_launch_l(const NativeExpertLayout &L, int64_t cap_groups,
             });
     } else {
         {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
             s->parallel_for<
                 dpct_kernel_name<class swiglu_entries_kernel_a4959c>>(
@@ -4154,8 +4140,7 @@ void s26_launch_l(const NativeExpertLayout &L, int64_t cap_groups,
                 });
         }
         {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};
             dpct::has_capability_or_fail(s->get_device(), {sycl::aspect::fp16});
 
             s->parallel_for<
@@ -4174,8 +4159,7 @@ void s26_launch_l(const NativeExpertLayout &L, int64_t cap_groups,
     const dpct::dim3 gd((unsigned)(L.n_embd / (8 * RD)), (unsigned)cap_groups);
     {
 
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
         dpct::has_capability_or_fail(s->get_device(), {sycl::aspect::fp16});
 
         s->submit([&](sycl::handler &cgh) {
@@ -4568,8 +4552,7 @@ void s27_launch(const NativeExpertLayout &L, int64_t cap_groups,
     const dpct::dim3 ggu((unsigned)(2 * L.n_ff / (GU_ROWS * RG)),
                          (unsigned)cap_groups);
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
         dpct::has_capability_or_fail(s->get_device(), {sycl::aspect::fp16});
 
         s->parallel_for<
@@ -4585,8 +4568,7 @@ void s27_launch(const NativeExpertLayout &L, int64_t cap_groups,
             });
     }
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         s->parallel_for<dpct_kernel_name<class s26_swiglu_q8_1_kernel_a7f255>>(
             sycl::nd_range<3>(sycl::range(1, 1, (unsigned)((nh + 255) / 256)) *
@@ -4599,8 +4581,7 @@ void s27_launch(const NativeExpertLayout &L, int64_t cap_groups,
     }
     const dpct::dim3 gd((unsigned)(L.n_embd / (8 * RD)), (unsigned)cap_groups);
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         s->parallel_for<
             dpct_kernel_name<class s27_down_kernel_d38356,
@@ -4648,7 +4629,7 @@ void launch_gu_port(unsigned groups, dpct::queue_ptr s, const unsigned long long
                     const NativeExpertLayout &L, float *gate, float *up) {
     constexpr int ROWS = 256 / LN;
     const unsigned gx = (unsigned) ((2 * L.n_ff + ROWS - 1) / ROWS);
-    auto exp_props = sycl::ext::oneapi::experimental::properties{sycl::ext::oneapi::experimental::use_root_sync};
+    auto exp_props = sycl::ext::oneapi::experimental::properties{};
     s->parallel_for<dpct_kernel_name<class native_gu_port, dpct_kernel_scalar<TG>, dpct_kernel_scalar<LN>, dpct_kernel_scalar<KM>>>(
         sycl::nd_range<3>(sycl::range<3>(1, groups, (size_t) gx * 256), sycl::range<3>(1, 1, 256)), exp_props,
         [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] {
@@ -4684,7 +4665,7 @@ void launch_down_port(unsigned groups, dpct::queue_ptr s, const unsigned long lo
                       const NativeExpertLayout &L, float *out) {
     constexpr int ROWS = 256 / LN;
     const unsigned gx = (unsigned) ((L.n_embd + ROWS - 1) / ROWS);
-    auto exp_props = sycl::ext::oneapi::experimental::properties{sycl::ext::oneapi::experimental::use_root_sync};
+    auto exp_props = sycl::ext::oneapi::experimental::properties{};
     s->parallel_for<dpct_kernel_name<class native_down_port, dpct_kernel_scalar<TD>, dpct_kernel_scalar<LN>, dpct_kernel_scalar<KM>>>(
         sycl::nd_range<3>(sycl::range<3>(1, groups, (size_t) gx * 256), sycl::range<3>(1, 1, 256)), exp_props,
         [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] {
@@ -4719,7 +4700,7 @@ template <int TG, bool STAGE_GRID>
 void launch_gu_multi(dpct::dim3 grid, dpct::queue_ptr s, const unsigned long long *grp_ptr, const int32_t *grp_start,
                      const int32_t *n_groups, const int32_t *ent_tok, const block_q8_1 *X,
                      const NativeExpertLayout &L, float *gate, float *up) {
-    auto exp_props = sycl::ext::oneapi::experimental::properties{sycl::ext::oneapi::experimental::use_root_sync};
+    auto exp_props = sycl::ext::oneapi::experimental::properties{};
     const sycl::range<3> g(1, grid.y, (size_t) ((2 * L.n_ff + GU_ROWS - 1) / GU_ROWS));
     s->parallel_for<dpct_kernel_name<class native_gu_multi_split, dpct_kernel_scalar<TG>,
                                      dpct_kernel_scalar<STAGE_GRID>>>(
@@ -4754,7 +4735,7 @@ template <int TD>
 void launch_down_multi(dpct::dim3 grid, dpct::queue_ptr s, const unsigned long long *grp_ptr,
                        const int32_t *grp_start, const int32_t *n_groups, const int32_t *ent_dst,
                        const block_q8_1 *hq, const NativeExpertLayout &L, float *out) {
-    auto exp_props = sycl::ext::oneapi::experimental::properties{sycl::ext::oneapi::experimental::use_root_sync};
+    auto exp_props = sycl::ext::oneapi::experimental::properties{};
     const size_t gx = (size_t) ((L.n_embd + GU_ROWS - 1) / GU_ROWS);
     s->parallel_for<dpct_kernel_name<class native_down_multi_split, dpct_kernel_scalar<TD>>>(
         sycl::nd_range<3>(sycl::range<3>(1, grid.y, gx * 256), sycl::range<3>(1, 1, 256)), exp_props,
@@ -4871,8 +4852,7 @@ void quantize_q8_1_rows(const float* x, int64_t n_rows, int64_t n_cols, void* y,
     const long long n = (long long) n_rows * n_cols;
     if (n <= 0) return;
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         strata::q_of(stream)
             ->parallel_for<dpct_kernel_name<class quantize_q8_1_kernel_422964>>(
@@ -4994,8 +4974,7 @@ void iq_dequant_f16(int t, const void* src, int64_t n, uint16_t* dst, void* stre
     if (n % 256 != 0 || !is_iq(t) || scale != nullptr) { std::fprintf(stderr, "iq_dequant_f16: bad arguments\n"); std::exit(1); }
     {
 
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
         dpct::has_capability_or_fail(
             strata::q_of(stream)->get_device(),
             {sycl::aspect::fp16});
@@ -5036,8 +5015,7 @@ void iq_embed_rows(int t, const void* table, size_t row_bytes, const int32_t* to
     if (n_embd % 256 != 0 || !embed_type_supported(t)) { std::fprintf(stderr, "iq_embed_rows: bad arguments\n"); std::exit(1); }
     {
 
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
         dpct::has_capability_or_fail(
             strata::q_of(stream)->get_device(),
             {sycl::aspect::fp16});
@@ -5065,8 +5043,7 @@ void iq_dequant_f32(int t, const void* src, int64_t n, float* dst, void* stream)
     if (n % 256 != 0 || !embed_type_supported(t)) { std::fprintf(stderr, "iq_dequant_f32: bad arguments\n"); std::exit(1); }
     {
 
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
         dpct::has_capability_or_fail(
             strata::q_of(stream)->get_device(),
             {sycl::aspect::fp16});
@@ -5096,8 +5073,7 @@ void iq_dequant_gu_f16(int t, const void* gate, const void* up, int64_t n_ff, in
     const int64_t per_row = n_embd / 256;
     {
 
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
         dpct::has_capability_or_fail(
             strata::q_of(stream)->get_device(),
             {sycl::aspect::fp16});
@@ -5149,8 +5125,7 @@ void iq_dequant_expert_f16(int gt, int dt, const void* gate, const void* up, con
     }
     const int64_t per_row = n_embd / 256, gu_wgs = 2 * n_ff * per_row, d_wgs = n_ff * n_embd / 256;
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
         dpct::has_capability_or_fail(strata::q_of(stream)->get_device(), {sycl::aspect::fp16});
         strata::q_of(stream)->submit([&](sycl::handler &cgh) {
             cgh.parallel_for<dpct_kernel_name<class dequant_expert_kernel_7d2c41>>(
@@ -5850,8 +5825,7 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     // APR: Hadamard-folded down weights take the rotated h, so h exists as floats first (the separate passes)
     if (sw_v1 || L.had_block > 0) {
             {
-                auto exp_props = sycl::ext::oneapi::experimental::properties{
-                    sycl::ext::oneapi::experimental::use_root_sync};
+                auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
                 s->parallel_for<
                     dpct_kernel_name<class swiglu_entries_kernel_a4959c>>(
@@ -5866,8 +5840,7 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
             if (L.had_block > 0)   // APR: the down weights are Hadamard-folded, so is their input (in place, every entry row)
                 hadamard_rows(h, h, cap_entries, L.n_ff, L.had_block, L.d_signs, stream);
             {
-                auto exp_props = sycl::ext::oneapi::experimental::properties{
-                    sycl::ext::oneapi::experimental::use_root_sync};
+                auto exp_props = sycl::ext::oneapi::experimental::properties{};
                 dpct::has_capability_or_fail(s->get_device(),
                                              {sycl::aspect::fp16});
 
@@ -5884,8 +5857,7 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
                         });
             }
     } else {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
             s->parallel_for<
                 dpct_kernel_name<class swiglu_q8_1_entries_kernel_115291>>(

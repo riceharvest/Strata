@@ -561,8 +561,7 @@ void bf16_to_f16(const uint16_t *in, uint16_t *out, int64_t n,
                  dpct::queue_ptr st) {
     if (n <= 0) return;
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
         dpct::has_capability_or_fail(st->get_device(), {sycl::aspect::fp16});
 
         st->parallel_for<dpct_kernel_name<class bf16_to_f16_kernel_a0031a>>(

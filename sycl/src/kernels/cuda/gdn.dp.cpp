@@ -229,8 +229,7 @@ void gdn_step(float *state, const float *q, const float *k, const float *v,
     const dpct::dim3 grid((unsigned)((s.S + JTHREADS - 1) / JTHREADS),
                           (unsigned)((s.h_v + MAX_H - 1) / MAX_H));
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         strata::q_of(stream)
             ->parallel_for<dpct_kernel_name<class gdn_step_kernel_34b62e>>(
@@ -258,8 +257,7 @@ void gdn_conv_step(float *conv_state, const float *x, const float *kW,
     if (channels <= 0 || d_conv < 1) return;
     const int blocks = (int) ((channels + 255) / 256);
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         strata::q_of(stream)
             ->parallel_for<dpct_kernel_name<class gdn_conv_kernel_b12e73>>(
@@ -290,8 +288,7 @@ void gdn_l2_norm(float *x, int64_t rows, int64_t cols, float eps,
         std::exit(1);
     }
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
         dpct::has_capability_or_fail(
             strata::q_of(stream)->get_device(),
             {sycl::aspect::fp64});
@@ -341,8 +338,7 @@ void gdn_beta_gate(float *beta, int64_t h_v, void *stream) try {
     if (beta == nullptr || h_v <= 0) return;
     const int n = (int) h_v;
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         strata::q_of(stream)
             ->parallel_for<dpct_kernel_name<class gdn_beta_gate_kernel_e2ab3e>>(
@@ -370,8 +366,7 @@ void gdn_out_norm(const float *o, const float *z, const float *ssm_norm,
                   void *stream) try {
     if (h_v <= 0 || S <= 0) return;
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
         dpct::has_capability_or_fail(
             strata::q_of(stream)->get_device(),
             {sycl::aspect::fp64});

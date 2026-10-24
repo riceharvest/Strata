@@ -146,8 +146,7 @@ void native_moe_combine(const float* parts, const float* weights, const float* s
         (((uintptr_t) parts | (uintptr_t) shared | (uintptr_t) output) & 15u) == 0) {
         const int64_t n4 = n_embd >> 2;
         {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
             ((sycl::queue *)(strata::q_of(stream)))
                 ->parallel_for<dpct_kernel_name<class combine_k10_vec4_503ec2>>(
@@ -164,8 +163,7 @@ void native_moe_combine(const float* parts, const float* weights, const float* s
                     });
         }
     } else {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         ((sycl::queue *)(strata::q_of(stream)))
             ->/*
@@ -214,8 +212,7 @@ void native_moe_combine_multi(const float* parts, const float* weights, const fl
         (((uintptr_t) parts | (uintptr_t) shared | (uintptr_t) output) & 15u) == 0) {
         const int64_t n4 = n_embd >> 2;
         {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
             ((sycl::queue *)(strata::q_of(stream)))
                 ->parallel_for<dpct_kernel_name<class combine_k10_vec4_44a528>>(
@@ -232,8 +229,7 @@ void native_moe_combine_multi(const float* parts, const float* weights, const fl
                     });
         }
     } else {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         ((sycl::queue *)(strata::q_of(stream)))
             ->/*
@@ -280,8 +276,7 @@ void native_moe_combine_multi_hits_gated(const float* hits, const float* weights
     if (!stream || n_embd <= 0 || k < 1 || k > 15 || n_tok < 1 || !shared || !shared_gate)
         throw std::invalid_argument("native MoE combine (hits, gated) requires a stream, width, 1..15 experts, tokens");
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         ((sycl::queue *)(strata::q_of(stream)))
             ->parallel_for<
@@ -322,8 +317,7 @@ void native_moe_combine_multi_hits(const float* hits, const float* weights, cons
     if (!stream || n_embd <= 0 || k < 1 || k > 15 || n_tok < 1)
         throw std::invalid_argument("native MoE combine (hits) requires a stream, width, 1..15 experts, tokens");
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         ((sycl::queue *)(strata::q_of(stream)))
             ->/*

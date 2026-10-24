@@ -207,14 +207,23 @@ def install_logprobs():
         return generate(self, *a, **kw)
     Eng.generate = gen
 
+    tok_cache: dict = {}
+
     def entry(tok, t, line):
         f = line.split()
         if len(f) < 2 or f[1] == "nan":
             return None
+        tid = id(tok)
 
         def item(i, lp):
-            b = tok.token_bytes(i) if hasattr(tok, "token_bytes") else tok.decode([i]).encode()
-            return {"token": b.decode("utf-8", "replace"), "logprob": lp, "bytes": list(b)}
+            key = (tid, i)
+            cached = tok_cache.get(key)
+            if cached is None:
+                b = tok.token_bytes(i) if hasattr(tok, "token_bytes") else tok.decode([i]).encode()
+                cached = (b.decode("utf-8", "replace"), list(b))
+                if len(tok_cache) < 262144:
+                    tok_cache[key] = cached
+            return {"token": cached[0], "logprob": lp, "bytes": cached[1]}
         e = item(t, float(f[1])) if t is not None else {"token": "", "logprob": float(f[1]), "bytes": []}
         e["top_logprobs"] = [item(int(i), float(v)) for i, _, v in (x.partition(":") for x in f[2:])]
         return e

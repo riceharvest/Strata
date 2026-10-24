@@ -782,8 +782,7 @@ void launch_hit_gu(bool fast, const uint8_t *blob_base,
     if (fast) {
         const long long pairs = cap * (long long) FF;
         {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
             cs->parallel_for<dpct_kernel_name<class gu_pair_kernel_787004>>(
                 sycl::nd_range<3>(
@@ -801,8 +800,7 @@ void launch_hit_gu(bool fast, const uint8_t *blob_base,
     } else {
         const long long rows = cap * 2LL * FF;
         {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
             cs->parallel_for<dpct_kernel_name<class gu_kernel_55bc52>>(
                 sycl::nd_range<3>(
@@ -829,8 +827,7 @@ void launch_hit_down(bool fast, const uint8_t *blob_base,
     if (fast) {
         const long long pairs = cap * (long long) (H / 2);
         {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
             cs->parallel_for<dpct_kernel_name<class down_pair_kernel_7d15d9>>(
                 sycl::nd_range<3>(
@@ -848,8 +845,7 @@ void launch_hit_down(bool fast, const uint8_t *blob_base,
     } else {
         const long long rows = cap * (long long) H;
         {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
             cs->parallel_for<dpct_kernel_name<class down_kernel_b3587f>>(
                 sycl::nd_range<3>(
@@ -908,8 +904,7 @@ void moe_hit_grouped_s2(const uint8_t* blob_base, const int32_t* slot_index, con
         const long long pairs = n_hits * (long long) FF;
         const unsigned blocks = (unsigned) ((pairs + THREADS - 1) / THREADS);
         {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
             cs->parallel_for<dpct_kernel_name<class swiglu_kernel_792534>>(
                 sycl::nd_range<3>(sycl::range(1, 1, blocks) *
@@ -1030,8 +1025,7 @@ void moe_hit_select(const int32_t* ids, const int32_t* res_row, int k, int n_exp
                     int32_t* count, void* stream) {
     if (k < 1 || k > 32) { std::fprintf(stderr, "moe_hit_select: k must be 1..32\n"); std::exit(1); }
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         strata::q_of(stream)
             ->parallel_for<dpct_kernel_name<class hit_select_kernel_f87f42>>(
@@ -1065,8 +1059,7 @@ void moe_hit_grouped_s2_dev(const uint8_t* blob_base, const int32_t* slot_index,
     {
         const long long pairs = cap * (long long) FF;
         {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
             cs->parallel_for<dpct_kernel_name<class swiglu_kernel_5aa9a9>>(
                 sycl::nd_range<3>(
@@ -1093,8 +1086,7 @@ void moe_hit_select_multi(const int32_t* ids, const int32_t* res_row, int n, int
                           int32_t* count, void* stream) {
     if (n < 1 || n > 128) { std::fprintf(stderr, "moe_hit_select_multi: n must be 1..128\n"); std::exit(1); }
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         strata::q_of(stream)
             ->parallel_for<
@@ -1130,8 +1122,7 @@ void moe_hit_grouped_s2_multi(const uint8_t* blob_base, const int32_t* slot_inde
     {
         const long long pairs = cap * (long long) FF;
         {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
             cs->parallel_for<dpct_kernel_name<class swiglu_kernel_a0c31a>>(
                 sycl::nd_range<3>(
@@ -1559,8 +1550,7 @@ void moe_group_resident(const int32_t* ids, int n, int k_per_tok, const uint8_t*
                         int32_t* ent_tok, void* stream) {
     if (n < 1 || n > 128) { std::fprintf(stderr, "moe_group_resident: n must be 1..128\n"); std::exit(1); }
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         strata::q_of(stream)
             ->parallel_for<
@@ -1592,8 +1582,7 @@ void moe_grouped_s2(const unsigned long long* grp_ptr, const int32_t* grp_start,
                               (unsigned)cap_groups);
         if (fast)
         {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
             cs->parallel_for<
                 dpct_kernel_name<class gu_grouped_t_kernel_998f94>>(
@@ -1607,8 +1596,7 @@ void moe_grouped_s2(const unsigned long long* grp_ptr, const int32_t* grp_start,
                                             (int)cap_entries);
                     });
         } else {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
             cs->parallel_for<dpct_kernel_name<class gu_grouped_kernel_c9eb4d>>(
                 sycl::nd_range<3>(grid * sycl::range(1, 1, 256),
@@ -1635,8 +1623,7 @@ void moe_grouped_s2(const unsigned long long* grp_ptr, const int32_t* grp_start,
         const long long n_blocks = pairs >> 5;
         const int warps = THREADS / 32;
         {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
             cs->parallel_for<dpct_kernel_name<
                 class swiglu_quantize_q8_0_scaled_kernel_1271ea>>(
@@ -1656,8 +1643,7 @@ void moe_grouped_s2(const unsigned long long* grp_ptr, const int32_t* grp_start,
     } else {
         const long long pairs = cap_entries * (long long) FF;
         {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
             cs->parallel_for<dpct_kernel_name<class swiglu_kernel_90849f>>(
                 sycl::nd_range<3>(
@@ -1678,8 +1664,7 @@ void moe_grouped_s2(const unsigned long long* grp_ptr, const int32_t* grp_start,
         const float* hs = x_scales != nullptr ? h_scales : nullptr;
         if (fast)
         {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
             cs->parallel_for<
                 dpct_kernel_name<class down_grouped_t_kernel_12b16d>>(
@@ -1692,8 +1677,7 @@ void moe_grouped_s2(const unsigned long long* grp_ptr, const int32_t* grp_start,
                                               ent_dst, h_q8_0, hs, out);
                     });
         } else {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
             cs->parallel_for<
                 dpct_kernel_name<class down_grouped_kernel_ea4417>>(
@@ -1717,8 +1701,7 @@ void moe_hit_add(float* parts, const float* hit_out, const int32_t* dst, const i
         (unsigned)((n_embd + 255) / 256 < 8 ? (n_embd + 255) / 256 : 8),
         (unsigned)cap);
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         strata::q_of(stream)
             ->parallel_for<dpct_kernel_name<class add_hits_kernel_50cbcb>>(
@@ -1753,8 +1736,7 @@ void moe_hit_grouped_s2_cpu_order(const uint8_t *blob_base,
     float* hh = (float*) ((uint8_t*) hs + scale_bytes);
     float* xh = (float*) ((uint8_t*) hh + scale_bytes);
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         cs->submit([&](sycl::handler &cgh) {
             auto H_ct3 = H / 32;
@@ -1773,8 +1755,7 @@ void moe_hit_grouped_s2_cpu_order(const uint8_t *blob_base,
     check("cpu_order/input_correction", stream);
     const int rows_per_block = THREADS / 8;
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         cs->parallel_for<
             dpct_kernel_name<class cpu_order_projection_kernel_2fbdd9,
@@ -1806,8 +1787,7 @@ void moe_hit_grouped_s2_cpu_order(const uint8_t *blob_base,
         std::exit(1);
     }
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         cs->submit([&](sycl::handler &cgh) {
             auto int_n_hits_FF_ct1 = (int)n_hits * FF;
@@ -1827,8 +1807,7 @@ void moe_hit_grouped_s2_cpu_order(const uint8_t *blob_base,
     }
     check("cpu_order/swiglu", stream);
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         cs->submit([&](sycl::handler &cgh) {
             auto int_n_hits_FF_ct4 = (int)n_hits * (FF / 32);
@@ -1849,8 +1828,7 @@ void moe_hit_grouped_s2_cpu_order(const uint8_t *blob_base,
     }
     check("cpu_order/intermediate_quantize", stream);
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         cs->parallel_for<
             dpct_kernel_name<class cpu_order_projection_kernel_2e007a,

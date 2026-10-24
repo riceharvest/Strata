@@ -397,8 +397,7 @@ void native_qsa_indexer_append_steps(const float* raw, const int32_t* relative_p
     const RopeTab rt = rope_table_for(scaling);
     if (rt.cos != nullptr)
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         ((sycl::queue *)(strata::q_of(stream)))
             ->submit([&](sycl::handler &cgh) {
@@ -421,8 +420,7 @@ void native_qsa_indexer_append_steps(const float* raw, const int32_t* relative_p
                         });
             });
     } else {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         ((sycl::queue *)(strata::q_of(stream)))
             ->submit([&](sycl::handler &cgh) {
@@ -489,8 +487,7 @@ void native_qsa_indexer_append_batch(const float* raw, int64_t n, int64_t p0, in
     if (p0 == 0) {
         if (rt.cos != nullptr)
         {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
             st->parallel_for<dpct_kernel_name<class append_first_ea2d1f,
                                               dpct_kernel_scalar<true>>>(
@@ -504,8 +501,7 @@ void native_qsa_indexer_append_batch(const float* raw, int64_t n, int64_t p0, in
                                            ef, ms, mtab, rt);
                     });
         } else {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
             st->parallel_for<dpct_kernel_name<class append_first_ea2d1f,
                                               dpct_kernel_scalar<false>>>(
@@ -525,8 +521,7 @@ void native_qsa_indexer_append_batch(const float* raw, int64_t n, int64_t p0, in
     const int64_t hi = p0 + n - 1 >= R - 1 ? (p0 + n - 1 - (R - 1)) / R : -1;   // the largest b with 4b+3 <= p0+n-1
     if (hi >= first && rt.cos != nullptr)
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         st->parallel_for<dpct_kernel_name<class append_blocks_a6c94e,
                                           dpct_kernel_scalar<true>>>(
@@ -542,8 +537,7 @@ void native_qsa_indexer_append_batch(const float* raw, int64_t n, int64_t p0, in
             });
     } else if (hi >= first)
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         st->parallel_for<dpct_kernel_name<class append_blocks_a6c94e,
                                           dpct_kernel_scalar<false>>>(
@@ -559,8 +553,7 @@ void native_qsa_indexer_append_batch(const float* raw, int64_t n, int64_t p0, in
             });
     }
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         st->parallel_for<dpct_kernel_name<class append_tail_e0658e>>(
             sycl::nd_range<3>(sycl::range(1, 1, R - 1) * sycl::range(1, 1, D),

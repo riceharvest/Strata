@@ -972,8 +972,7 @@ void quantize_act(const float* x, int64_t rows, int64_t cols, void* xa, void* st
     if (rows <= 0) return;
     const int64_t nblk = rows * (cols / 64);
         {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
             strata::q_of(stream)
                 ->parallel_for<dpct_kernel_name<class quant_act_kernel_da6c97>>(
@@ -1012,8 +1011,7 @@ void group(const int32_t* ids, int64_t n, int k, int n_expert, void* scratch, in
         info::device::max_work_group_size. Adjust the work-group size if needed.
         */
             {
-                auto exp_props = sycl::ext::oneapi::experimental::properties{
-                    sycl::ext::oneapi::experimental::use_root_sync};
+                auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
                 s->submit([&](sycl::handler &cgh) {
                     sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
@@ -1040,8 +1038,7 @@ void group(const int32_t* ids, int64_t n, int k, int n_expert, void* scratch, in
     Adjust the work-group size if needed.
     */
         {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
             s->parallel_for<dpct_kernel_name<class scan_kernel_7ed98e>>(
                 sycl::nd_range<3>(
@@ -1054,8 +1051,7 @@ void group(const int32_t* ids, int64_t n, int k, int n_expert, void* scratch, in
                     });
         }
         if (n > 0) {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
             s->parallel_for<dpct_kernel_name<class place_kernel_cf784d>>(
                 sycl::nd_range<3>(sycl::range(1, 1, blocks(n, 256)) *
@@ -1095,8 +1091,7 @@ void experts(const Batch& b, int n_expert, int64_t n, const void* scratch, const
     Adjust the work-group size if needed.
     */
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
         dpct::has_capability_or_fail(s->get_device(), {sycl::aspect::fp16});
 
         s->submit([&](sycl::handler &cgh) {
@@ -1126,8 +1121,7 @@ void experts(const Batch& b, int n_expert, int64_t n, const void* scratch, const
     Adjust the work-group size if needed.
     */
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
         dpct::has_capability_or_fail(s->get_device(), {sycl::aspect::fp16});
 
         s->submit([&](sycl::handler &cgh) {

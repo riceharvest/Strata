@@ -32,8 +32,8 @@ namespace i8 = strata::prefill::i8;
 static uint16_t f2h(float f) { return sycl::bit_cast<uint16_t>(sycl::half(f)); }
 static float h2f(uint16_t h) { return (float) sycl::bit_cast<sycl::half>(h); }
 
-static int block_bytes(int t) { return t == 23 ? 136 : t == 21 ? 110 : t == 18 ? 98 : t == 22 ? 82 : 18; }
-static int block_vals(int t) { return (t == 23 || t == 21 || t == 18 || t == 22) ? 256 : t == 42 ? 64 : 32; }
+static int block_bytes(int t) { return t == 23 ? 136 : t == 21 ? 110 : t == 18 ? 98 : t == 22 ? 82 : t == 17 ? 74 : t == 16 ? 66 : t == 8 ? 34 : 18; }
+static int block_vals(int t) { return (t == 23 || t == 21 || t == 18 || t == 22 || t == 17 || t == 16) ? 256 : t == 42 ? 64 : 32; }
 
 // host decode of one row (K values) -> double
 static void dec_row(int t, const uint8_t* row, int K, double* out) {
@@ -89,6 +89,30 @@ static void dec_row(int t, const uint8_t* row, int K, double* out) {
                     const uint8_t sb = sgn[4 * ib + l];
                     for (int j = 0; j < 8; ++j) o[ib * 32 + 8 * l + j] = dd * ((sb >> j & 1) ? -(int) g[j] : (int) g[j]);
                 }
+        } else if (t == 17) {
+            const uint8_t *qs = blk + 2, *scl = blk + 66;
+            for (int ib = 0; ib < 8; ++ib)
+                for (int l = 0; l < 4; ++l) {
+                    uint16_t qv; std::memcpy(&qv, qs + 8 * ib + 2 * l, 2);
+                    const uint8_t* g = (const uint8_t*) &iq2xs_grid[qv & 511];
+                    const double dd = d * (0.5 + ((scl[ib] >> (4 * (l / 2))) & 0xf)) * 0.25;
+                    const uint8_t sb = ksigns_iq2xs[qv >> 9];
+                    for (int j = 0; j < 8; ++j) o[ib * 32 + 8 * l + j] = dd * ((sb >> j & 1) ? -(int) g[j] : (int) g[j]);
+                }
+        } else if (t == 16) {
+            const uint8_t* qs = blk + 2;
+            for (int ib = 0; ib < 8; ++ib) {
+                uint32_t aux; std::memcpy(&aux, qs + 8 * ib + 4, 4);
+                const double dd = d * (0.5 + (aux >> 28)) * 0.25;
+                for (int l = 0; l < 4; ++l) {
+                    const uint8_t* g = (const uint8_t*) &iq2xxs_grid[qs[8 * ib + l]];
+                    const uint8_t sb = ksigns_iq2xs[(aux >> (7 * l)) & 127];
+                    for (int j = 0; j < 8; ++j) o[ib * 32 + 8 * l + j] = dd * ((sb >> j & 1) ? -(int) g[j] : (int) g[j]);
+                }
+            }
+        } else if (t == 8) {
+            const int8_t* qs = (const int8_t*) (blk + 2);
+            for (int j = 0; j < 32; ++j) o[j] = d * qs[j];
         } else if (t == 20) {
             for (int j = 0; j < 16; ++j) {
                 o[j] = d * kvalues_iq4nl[blk[2 + j] & 15];
@@ -283,7 +307,11 @@ int main(int argc, char** argv) {
     if (!i8::available(q)) { std::printf("esimd_moe_parity: SKIP (no ESIMD device with the s8 8x16x32 DPAS)\n"); return 0; }
     dpct::blas::descriptor_ptr hd = new dpct::blas::descriptor();
     hd->set_queue(q);
-    std::vector<std::pair<int, int>> cases = {{21, 20}, {18, 20}, {22, 20}, {23, 20}, {21, 42}, {18, 42}, {22, 42}, {23, 42}};
+    std::vector<std::pair<int, int>> cases = {
+        {21, 20}, {18, 20}, {22, 20}, {23, 20}, {17, 20}, {16, 20},
+        {21, 42}, {18, 42}, {22, 42}, {23, 42}, {17, 42}, {16, 42},
+        {21, 8},  {23, 8},
+    };
     if (argc > 6) cases = {{std::atoi(argv[5]), std::atoi(argv[6])}};
     int fails = 0;
     for (auto [gt, dt] : cases) {

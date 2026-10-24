@@ -190,7 +190,9 @@ def _plan_ista(model: str, cards: list[dict] | None, ram_gb: float | None, disk_
                      "measured with).")
     else:
         per_dense = ISTA_DENSE_ON_GPU_GB / n
-        cap = [max(0.0, _cap_gb(float(c.get("vram_gb") or 0)) - per_dense - RESERVE_GB) for c in keep]
+        is_intel = any(str(c.get("vendor") or "").lower() == "intel" or "arc" in str(c.get("name") or "").lower() for c in keep)
+        reserve_gb = 1.60 if is_intel else RESERVE_GB
+        cap = [max(0.0, _cap_gb(float(c.get("vram_gb") or 0)) - per_dense - reserve_gb) for c in keep]
         vram_exp = min(v["experts_gb"], sum(cap))
         ranges = split_layers([float(c.get("vram_gb") or 0) for c in keep])
         in_vram = 0
@@ -205,6 +207,11 @@ def _plan_ista(model: str, cards: list[dict] | None, ram_gb: float | None, disk_
         out["cpu_experts_gb"] = _round1(v["experts_gb"] - in_vram * expert_gb)
         out["tp"] = tp_for(n, keep)
         out["args"] = _tp_args(n, out["tp"])
+        if is_intel:
+            out["args"] += ["--reserve-mib", "1024"]
+            if ram_gb and float(ram_gb) >= 40.0 and float(ram_gb) < out["cpu_experts_gb"] + REST_RAM_GB:
+                ssd_cache_gb = max(16, int(float(ram_gb) - 18.0))
+                out["args"] += ["--ssd-cache", str(ssd_cache_gb)]
         names = " + ".join(f"{c['name'] or 'card ' + str(c['index'])} ({c['vram_gb']:.0f} GB)" for c in out["cards"])
         lines.append(f"Graphics memory: {names}. About {in_vram:,} of the {EXPERTS:,} experts ({out['vram_experts_gb']:.0f} GB) stay on "
                      f"the card{'s' if n > 1 else ''}; the other {EXPERTS - in_vram:,} ({out['cpu_experts_gb']:.0f} GB) are computed on the "

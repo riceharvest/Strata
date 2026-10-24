@@ -826,11 +826,10 @@ void launch_gr_up_more(dpct::queue_ptr st, const GrMulti& m) {
     auto body = [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] { gr_up_multi_kernel<UPM_COLS_MORE, false, true>(m); };
     if constexpr (BIG)
         st->parallel_for<dpct_kernel_name<class gr_up_multi_more, dpct_kernel_scalar<1>>>(
-            nr, sycl::ext::oneapi::experimental::properties{sycl::ext::oneapi::experimental::use_root_sync,
-                                                            sycl::ext::intel::experimental::grf_size<256>}, body);
+            nr, sycl::ext::oneapi::experimental::properties{sycl::ext::intel::experimental::grf_size<256>}, body);
     else
         st->parallel_for<dpct_kernel_name<class gr_up_multi_more, dpct_kernel_scalar<0>>>(
-            nr, sycl::ext::oneapi::experimental::properties{sycl::ext::oneapi::experimental::use_root_sync}, body);
+            nr, sycl::ext::oneapi::experimental::properties{}, body);
 }
 
 
@@ -848,12 +847,11 @@ inline bool gr_up_ilp() {
 }
 template <int C>
 void launch_gr_up_cols(dpct::queue_ptr st, const GrMulti& m, bool grf) {
-    auto exp_props = sycl::ext::oneapi::experimental::properties{sycl::ext::oneapi::experimental::use_root_sync};
+    auto exp_props = sycl::ext::oneapi::experimental::properties{};
     const sycl::nd_range<3> r(sycl::range(1, 1, N / C) * sycl::range(1, 1, THREADS), sycl::range(1, 1, THREADS));
     if (grf) {   // Arc A-series: large-GRF mode (256 regs/thread); at 128 this kernel spills ~3.4 KB/thread on the A770
         st->parallel_for<dpct_kernel_name<class gr_up_multi_cols_grf256, dpct_kernel_scalar<C>>>(r,
-            sycl::ext::oneapi::experimental::properties{sycl::ext::oneapi::experimental::use_root_sync,
-                                                        sycl::ext::intel::experimental::grf_size<256>},
+            sycl::ext::oneapi::experimental::properties{sycl::ext::intel::experimental::grf_size<256>},
             [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] { gr_up_multi_kernel<C>(m); });
         return;
     }
@@ -1522,8 +1520,7 @@ void launch_multi(const GrMulti &m, int variant, dpct::queue_ptr st,
                   unsigned long long *stamp_buf, int stamp_i0) {
     const int n_tok = m.T;
     if (variant >= kHcSplit) {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         st->parallel_for<dpct_kernel_name<class gr_norm_split_kernel_200589>>(
             sycl::nd_range<3>(sycl::range(1, HC, (unsigned)n_tok) *
@@ -1534,8 +1531,7 @@ void launch_multi(const GrMulti &m, int variant, dpct::queue_ptr st,
                 gr_norm_split_kernel(m);
             });
     } else {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         st->parallel_for<dpct_kernel_name<class gr_norm_multi_kernel_2f4d93>>(
             sycl::nd_range<3>(sycl::range(1, 1, n_tok) *
@@ -1575,8 +1571,7 @@ void launch_multi(const GrMulti &m, int variant, dpct::queue_ptr st,
         const bool max4 = max4_on && ct <= 4;
         if (staged) {
             if (max4) {
-                auto exp_props = sycl::ext::oneapi::experimental::properties{
-                    sycl::ext::oneapi::experimental::use_root_sync};
+                auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
                 st->submit([&](sycl::handler &cgh) {
                     sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
@@ -1599,8 +1594,7 @@ void launch_multi(const GrMulti &m, int variant, dpct::queue_ptr st,
                             });
                 });
             } else {
-                auto exp_props = sycl::ext::oneapi::experimental::properties{
-                    sycl::ext::oneapi::experimental::use_root_sync};
+                auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
                 st->submit([&](sycl::handler &cgh) {
                     sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
@@ -1628,8 +1622,7 @@ void launch_multi(const GrMulti &m, int variant, dpct::queue_ptr st,
             }
         } else if (tv == 1280) {
             if (max4) {
-                auto exp_props = sycl::ext::oneapi::experimental::properties{
-                    sycl::ext::oneapi::experimental::use_root_sync};
+                auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
                 st->submit([&](sycl::handler &cgh) {
                     sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
@@ -1652,8 +1645,7 @@ void launch_multi(const GrMulti &m, int variant, dpct::queue_ptr st,
                             });
                 });
             } else {
-                auto exp_props = sycl::ext::oneapi::experimental::properties{
-                    sycl::ext::oneapi::experimental::use_root_sync};
+                auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
                 st->submit([&](sycl::handler &cgh) {
                     sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
@@ -1682,8 +1674,7 @@ void launch_multi(const GrMulti &m, int variant, dpct::queue_ptr st,
             }
         } else {
             if (max4) {
-                auto exp_props = sycl::ext::oneapi::experimental::properties{
-                    sycl::ext::oneapi::experimental::use_root_sync};
+                auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
                 st->submit([&](sycl::handler &cgh) {
                     sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
@@ -1706,8 +1697,7 @@ void launch_multi(const GrMulti &m, int variant, dpct::queue_ptr st,
                             });
                 });
             } else {
-                auto exp_props = sycl::ext::oneapi::experimental::properties{
-                    sycl::ext::oneapi::experimental::use_root_sync};
+                auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
                 st->submit([&](sycl::handler &cgh) {
                     sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
@@ -1832,8 +1822,7 @@ bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
         const size_t sm = (size_t)n_tok * (N / split) * sizeof(float);
         if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0, stream);
         if (split == 2) {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
             st->submit([&](sycl::handler &cgh) {
                 sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
@@ -1855,8 +1844,7 @@ bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
                     });
             });
         } else {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
             st->submit([&](sycl::handler &cgh) {
                 sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
@@ -1880,8 +1868,7 @@ bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
         }
         if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0 + 1, stream);
         if (split == 2) {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
             st->parallel_for<dpct_kernel_name<class gr_up_v3_kernel_6e945c,
                                               dpct_kernel_scalar<2>>>(
@@ -1894,8 +1881,7 @@ bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
                         gr_up_v3_kernel<2>(m, part, ssg);
                     });
         } else {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
             st->parallel_for<dpct_kernel_name<class gr_up_v3_kernel_716779,
                                               dpct_kernel_scalar<1>>>(
@@ -1919,8 +1905,7 @@ bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
     }
     m.part = down_partials(st);
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         if (gr_norm_split())
             st->parallel_for<dpct_kernel_name<class gr_norm_split_k>>(
@@ -1987,8 +1972,7 @@ bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
                               sycl::range(1, 1, THREADS)),
             [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] { gr_down_multi_direct_kernel(m); });
     } else if (chunk_tok >= n_tok) {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
         st->submit([&](sycl::handler &cgh) {
             sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
                 sycl::range((size_t)n_tok * TILE * sizeof(float)), cgh);
@@ -2014,8 +1998,7 @@ bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
             c.T = ct;
             for (int k = 0; k < ct; ++k) c.a[k] = a[c0 + k];
             c.part = m.part;
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};
             st->submit([&](sycl::handler &cgh) {
                 sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
                     sycl::range((size_t)ct * TILE * sizeof(float)), cgh);
@@ -2084,8 +2067,7 @@ void fused_gr_read(const FusedGrArgs& a, void* stream) {
         return;
     }
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         st->parallel_for<dpct_kernel_name<class gr_down_kernel_a5fa71>>(
             sycl::nd_range<3>(sycl::range(1, 1, DOWN_BLOCKS + 1) *
@@ -2097,8 +2079,7 @@ void fused_gr_read(const FusedGrArgs& a, void* stream) {
             });
     }
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         st->parallel_for<dpct_kernel_name<class gr_up_kernel_fe3258>>(
             sycl::nd_range<3>(sycl::range(1, 1, UP_BLOCKS) *

@@ -269,8 +269,7 @@ void native_rope_apply(const float* x, float* out, int rows, int head_dim,
         info::device::max_work_group_size. Adjust the work-group size if needed.
         */
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         ((sycl::queue *)(strata::q_of(stream)))
             ->submit([&](sycl::handler &cgh) {
@@ -294,8 +293,7 @@ void native_rope_apply(const float* x, float* out, int rows, int head_dim,
     info::device::max_work_group_size. Adjust the work-group size if needed.
     */
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         ((sycl::queue *)(strata::q_of(stream)))
             ->submit([&](sycl::handler &cgh) {
@@ -351,8 +349,7 @@ void native_qsa_rms_norm_rope(const float* x, int in_stride, const float* gamma,
     const RopeTab rt = rope_table_for(scaling);
     if (rt.cos != nullptr)
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         ((sycl::queue *)(strata::q_of(stream)))
             ->submit([&](sycl::handler &cgh) {
@@ -374,8 +371,7 @@ void native_qsa_rms_norm_rope(const float* x, int in_stride, const float* gamma,
                         });
             });
     } else {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         ((sycl::queue *)(strata::q_of(stream)))
             ->submit([&](sycl::handler &cgh) {

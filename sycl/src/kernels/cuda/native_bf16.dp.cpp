@@ -333,8 +333,7 @@ the work-group size if needed.
 */
 #define S26_AUX(TSV)                                                           \
     if (n_tok <= 4) {                                                          \
-        auto exp_props = sycl::ext::oneapi::experimental::properties{          \
-            sycl::ext::oneapi::experimental::use_root_sync};                   \
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};                   \
                                                                                \
         st->submit([&](sycl::handler &cgh) {                                   \
             auto x_ct0 = x;                                                    \
@@ -366,8 +365,7 @@ the work-group size if needed.
                     });                                                        \
         });                                                                    \
     } else {                                                                   \
-        auto exp_props = sycl::ext::oneapi::experimental::properties{          \
-            sycl::ext::oneapi::experimental::use_root_sync};                   \
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};                   \
                                                                                \
         st->submit([&](sycl::handler &cgh) {                                   \
             auto x_ct0 = x;                                                    \
@@ -410,8 +408,7 @@ the work-group size if needed.
         info::device::max_work_group_size. Adjust the work-group size if needed.
         */
         if (n_tok <= 4) {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
             st->/*
   DPCT1050: The template argument of the dpct_kernel_name could not be
@@ -438,8 +435,7 @@ the work-group size if needed.
         info::device::max_work_group_size. Adjust the work-group size if needed.
         */
         else {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
             st->/*
   DPCT1050: The template argument of the dpct_kernel_name could not be
@@ -468,8 +464,7 @@ the work-group size if needed.
     Adjust the work-group size if needed.
     */
     if (n_tok <= 4) {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         st->/*
   DPCT1050: The template argument of the dpct_kernel_name could not be
@@ -495,8 +490,7 @@ the work-group size if needed.
     Adjust the work-group size if needed.
     */
     else {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         st->/*
   DPCT1050: The template argument of the dpct_kernel_name could not be
@@ -626,8 +620,7 @@ void bf16_gemv_fp32_mmvf_multi(const float* x, int64_t ldx, const uint16_t* w, f
     case N:                                                                    \
         switch (n_tok) {                                                       \
         case 1: {                                                              \
-            auto exp_props = sycl::ext::oneapi::experimental::properties{      \
-                sycl::ext::oneapi::experimental::use_root_sync};               \
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};               \
                                                                                \
             st->submit([&](sycl::handler &cgh) {                               \
                 auto x_ct0 = x;                                                \
@@ -655,8 +648,7 @@ void bf16_gemv_fp32_mmvf_multi(const float* x, int64_t ldx, const uint16_t* w, f
             });                                                                \
         } break;                                                               \
         case 2: {                                                              \
-            auto exp_props = sycl::ext::oneapi::experimental::properties{      \
-                sycl::ext::oneapi::experimental::use_root_sync};               \
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};               \
                                                                                \
             st->submit([&](sycl::handler &cgh) {                               \
                 auto x_ct0 = x;                                                \
@@ -684,8 +676,7 @@ void bf16_gemv_fp32_mmvf_multi(const float* x, int64_t ldx, const uint16_t* w, f
             });                                                                \
         } break;                                                               \
         case 3: {                                                              \
-            auto exp_props = sycl::ext::oneapi::experimental::properties{      \
-                sycl::ext::oneapi::experimental::use_root_sync};               \
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};               \
                                                                                \
             st->submit([&](sycl::handler &cgh) {                               \
                 auto x_ct0 = x;                                                \
@@ -713,8 +704,7 @@ void bf16_gemv_fp32_mmvf_multi(const float* x, int64_t ldx, const uint16_t* w, f
             });                                                                \
         } break;                                                               \
         case 4: {                                                              \
-            auto exp_props = sycl::ext::oneapi::experimental::properties{      \
-                sycl::ext::oneapi::experimental::use_root_sync};               \
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};               \
                                                                                \
             st->submit([&](sycl::handler &cgh) {                               \
                 auto x_ct0 = x;                                                \
@@ -742,8 +732,7 @@ void bf16_gemv_fp32_mmvf_multi(const float* x, int64_t ldx, const uint16_t* w, f
             });                                                                \
         } break;                                                               \
         case 5: {                                                              \
-            auto exp_props = sycl::ext::oneapi::experimental::properties{      \
-                sycl::ext::oneapi::experimental::use_root_sync};               \
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};               \
                                                                                \
             st->submit([&](sycl::handler &cgh) {                               \
                 auto x_ct0 = x;                                                \
@@ -771,8 +760,7 @@ void bf16_gemv_fp32_mmvf_multi(const float* x, int64_t ldx, const uint16_t* w, f
             });                                                                \
         } break;                                                               \
         case 6: {                                                              \
-            auto exp_props = sycl::ext::oneapi::experimental::properties{      \
-                sycl::ext::oneapi::experimental::use_root_sync};               \
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};               \
                                                                                \
             st->submit([&](sycl::handler &cgh) {                               \
                 auto x_ct0 = x;                                                \
@@ -800,8 +788,7 @@ void bf16_gemv_fp32_mmvf_multi(const float* x, int64_t ldx, const uint16_t* w, f
             });                                                                \
         } break;                                                               \
         default: {                                                             \
-            auto exp_props = sycl::ext::oneapi::experimental::properties{      \
-                sycl::ext::oneapi::experimental::use_root_sync};               \
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};               \
                                                                                \
             st->submit([&](sycl::handler &cgh) {                               \
                 auto x_ct0 = x;                                                \
@@ -871,8 +858,7 @@ void bf16_gemv_fp32_mmvf(const float* x, const uint16_t* w, float* y,
     const dpct::queue_ptr st = strata::q_of(stream);
 #define STRATA_MMVF_CASE(N)                                                    \
     case N: {                                                                  \
-        auto exp_props = sycl::ext::oneapi::experimental::properties{          \
-            sycl::ext::oneapi::experimental::use_root_sync};                   \
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};                   \
                                                                                \
         st->submit([&](sycl::handler &cgh) {                                   \
             auto x_ct0 = x;                                                    \

@@ -199,8 +199,7 @@ void gather_native(const void* gate, const void* up, size_t gu_half_bytes, const
     if (a16) {
         const int64_t na = (int64_t) gu_half_bytes / 16, nc = (int64_t) d_bytes / 16;
         {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
             s->parallel_for<dpct_kernel_name<class copy16_kernel_b12127>>(
                 sycl::nd_range<3>(sycl::range(1, 1, blocks(2 * na + nc)) *
@@ -216,8 +215,7 @@ void gather_native(const void* gate, const void* up, size_t gu_half_bytes, const
     } else {
         const int64_t na = (int64_t) gu_half_bytes, nc = (int64_t) d_bytes;
         {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
             s->parallel_for<dpct_kernel_name<class copy1_kernel_c557f3>>(
                 sycl::nd_range<3>(sycl::range(1, 1, blocks(2 * na + nc)) *
@@ -240,8 +238,7 @@ void gather_native(const void* gate, const void* up, size_t gu_half_bytes, const
 
 void gather_strata_q2(const uint8_t* blob, void* gu_dst, void* d_dst, void* stream) {
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         strata::q_of(stream)
             ->parallel_for<dpct_kernel_name<class strata_q2_kernel_793a65>>(
@@ -265,8 +262,7 @@ void gather_strata_q2(const uint8_t* blob, void* gu_dst, void* d_dst, void* stre
 void swiglu(const float* gu, float* h, int64_t rows, int64_t n_ff, bool interleaved, void* stream) {
     if (rows <= 0) return;
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         strata::q_of(stream)
             ->parallel_for<dpct_kernel_name<class swiglu_kernel_3f7a6f>>(
@@ -288,8 +284,7 @@ void swiglu(const float* gu, float* h, int64_t rows, int64_t n_ff, bool interlea
 void iota(int32_t* dst, int64_t n, void* stream) {
     if (n <= 0) return;
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         strata::q_of(stream)
             ->parallel_for<dpct_kernel_name<class iota_kernel_9245a0>>(

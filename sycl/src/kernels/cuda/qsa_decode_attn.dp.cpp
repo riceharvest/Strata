@@ -24,29 +24,15 @@ constexpr int THREADS = 256;
 constexpr int WARPS = THREADS / 32;
 
 __dpct_inline__ float warp_sum(float v) {
+    auto sg = sycl::ext::oneapi::this_work_item::get_sub_group();
 #pragma unroll
-    /*
-    DPCT1108: '__shfl_xor_sync' was migrated with the experimental feature
-    masked sub_group function which may not be supported by all compilers or
-    runtimes. You may need to adjust the code.
-    */
-    for (int o = 16; o > 0; o >>= 1) v +=
-        dpct::experimental::permute_sub_group_by_xor(
-            0xffffffffu, sycl::ext::oneapi::this_work_item::get_sub_group(), v,
-            o);
+    for (int o = 16; o > 0; o >>= 1) v += sycl::permute_group_by_xor(sg, v, o);
     return v;
 }
 __dpct_inline__ float warp_max(float v) {
+    auto sg = sycl::ext::oneapi::this_work_item::get_sub_group();
 #pragma unroll
-    /*
-    DPCT1108: '__shfl_xor_sync' was migrated with the experimental feature
-    masked sub_group function which may not be supported by all compilers or
-    runtimes. You may need to adjust the code.
-    */
-    for (int o = 16; o > 0; o >>= 1) v = sycl::fmax(
-        v, dpct::experimental::permute_sub_group_by_xor(
-               0xffffffffu, sycl::ext::oneapi::this_work_item::get_sub_group(),
-               v, o));
+    for (int o = 16; o > 0; o >>= 1) v = sycl::fmax(v, sycl::permute_group_by_xor(sg, v, o));
     return v;
 }
 
@@ -669,8 +655,7 @@ void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int3
     static const bool lane_cell = [] { const char* v = std::getenv("STRATA_ATTN_LANECELL"); return v && v[0] == '1'; }();
 #define STRATA_ATTN_LC(M)                                                      \
     {                                                                          \
-        auto exp_props = sycl::ext::oneapi::experimental::properties{          \
-            sycl::ext::oneapi::experimental::use_root_sync};                   \
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};                   \
         dpct::has_capability_or_fail(st->get_device(), {sycl::aspect::fp16});  \
                                                                                \
         st->submit([&](sycl::handler &cgh) {                                   \
@@ -706,8 +691,7 @@ void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int3
     }
 #define STRATA_ATTN_RSK(M, V)                                                      \
     {                                                                          \
-        auto exp_props = sycl::ext::oneapi::experimental::properties{          \
-            sycl::ext::oneapi::experimental::use_root_sync};                   \
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};                   \
         dpct::has_capability_or_fail(st->get_device(), {sycl::aspect::fp16});  \
                                                                                \
         st->submit([&](sycl::handler &cgh) {                                   \
@@ -766,8 +750,7 @@ void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int3
 #undef STRATA_ATTN_RSK
     if (kv_mode == 3)
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
         dpct::has_capability_or_fail(st->get_device(), {sycl::aspect::fp16});
 
         st->parallel_for<dpct_kernel_name<class attn_chunk_kernel_dfacfc,
@@ -782,8 +765,7 @@ void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int3
             });
     } else if (kv_mode == 2)
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
         dpct::has_capability_or_fail(st->get_device(), {sycl::aspect::fp16});
 
         st->parallel_for<dpct_kernel_name<class attn_chunk_kernel_b0d448,
@@ -798,8 +780,7 @@ void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int3
             });
     } else if (kv_mode == 1)
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
         dpct::has_capability_or_fail(st->get_device(), {sycl::aspect::fp16});
 
         st->parallel_for<dpct_kernel_name<class attn_chunk_kernel_2ad0a4,
@@ -813,8 +794,7 @@ void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int3
                                      part_l, n_chunks, (int)cap, stride);
             });
     } else {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
         dpct::has_capability_or_fail(st->get_device(), {sycl::aspect::fp16});
 
         st->parallel_for<dpct_kernel_name<class attn_chunk_kernel_5c04f7,
@@ -829,8 +809,7 @@ void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int3
             });
     }
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         st->parallel_for<dpct_kernel_name<class attn_merge_kernel_338175>>(
             sycl::nd_range<3>(
@@ -879,8 +858,7 @@ void qsa_decode_attn_step(const float* q, const QsaAttnPools& pools, const int32
     dpct::queue_ptr st = strata::q_of(stream);
     if (kv_mode == 3)
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
         dpct::has_capability_or_fail(st->get_device(), {sycl::aspect::fp16});
 
         st->parallel_for<dpct_kernel_name<class attn_chunk_kernel_f262e6,
@@ -895,8 +873,7 @@ void qsa_decode_attn_step(const float* q, const QsaAttnPools& pools, const int32
             });
     } else if (kv_mode == 2)
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
         dpct::has_capability_or_fail(st->get_device(), {sycl::aspect::fp16});
 
         st->parallel_for<dpct_kernel_name<class attn_chunk_kernel_4fd923,
@@ -911,8 +888,7 @@ void qsa_decode_attn_step(const float* q, const QsaAttnPools& pools, const int32
             });
     } else if (kv_mode == 1)
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
         dpct::has_capability_or_fail(st->get_device(), {sycl::aspect::fp16});
 
         st->parallel_for<dpct_kernel_name<class attn_chunk_kernel_f6855e,
@@ -926,8 +902,7 @@ void qsa_decode_attn_step(const float* q, const QsaAttnPools& pools, const int32
                                      part_l, n_chunks, 0, 0);
             });
     } else {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
         dpct::has_capability_or_fail(st->get_device(), {sycl::aspect::fp16});
 
         st->parallel_for<dpct_kernel_name<class attn_chunk_kernel_7c8e09,
@@ -942,8 +917,7 @@ void qsa_decode_attn_step(const float* q, const QsaAttnPools& pools, const int32
             });
     }
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         st->parallel_for<dpct_kernel_name<class attn_merge_kernel_c055e7>>(
             sycl::nd_range<3>(sycl::range(1, 1, (unsigned)s.n_head) *

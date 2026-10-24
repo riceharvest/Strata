@@ -232,8 +232,7 @@ void launch(int type, const void* blocks, int64_t row0, int64_t rows, int64_t co
     dpct::queue_ptr st = strata::q_of(stream);
 #define STRATA_DQ(TY)                                                          \
     {                                                                          \
-        auto exp_props = sycl::ext::oneapi::experimental::properties{          \
-            sycl::ext::oneapi::experimental::use_root_sync};                   \
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};                   \
                                                                                \
         st->submit([&](sycl::handler &cgh) {                                   \
             auto p_ct0 = p;                                                    \

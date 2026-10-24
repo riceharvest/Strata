@@ -241,8 +241,7 @@ void native_gdn_conv_silu(float* history, const float* input, const float* weigh
         for (auto span : inputs) disjoint(writable[i], span);
     }
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         ((sycl::queue *)(strata::q_of(stream)))
             ->parallel_for<dpct_kernel_name<class conv_silu_1ba4e6>>(
@@ -261,8 +260,7 @@ void native_gdn_l2_norm(float* input, int64_t rows, int64_t cols, float epsilon,
     norm_geometry(rows, cols, epsilon, stream);
     valid({input, size_t(rows) * S * sizeof(float)});
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         ((sycl::queue *)(strata::q_of(stream)))
             ->submit([&](sycl::handler &cgh) {
@@ -286,8 +284,7 @@ void native_gdn_beta_gate(float* beta, int64_t heads, void* stream) {
     count_and_stream(heads, stream);
     valid({beta, size_t(heads) * sizeof(float)});
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         ((sycl::queue *)(strata::q_of(stream)))
             ->parallel_for<dpct_kernel_name<class beta_sigmoid_fcf68f>>(
@@ -312,8 +309,7 @@ void native_gdn_gate(const float* alpha, const float* dt, const float* ssm_a,
         disjoint(output, input);
     }
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         ((sycl::queue *)(strata::q_of(stream)))
             ->parallel_for<dpct_kernel_name<class gate_softplus_a95cee>>(
@@ -339,8 +335,7 @@ void native_gdn_out_norm(const float* output, const float* z, const float* gamma
         disjoint(writable, input);
     }
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         ((sycl::queue *)(strata::q_of(stream)))
             ->parallel_for<dpct_kernel_name<class out_norm_a49e35>>(

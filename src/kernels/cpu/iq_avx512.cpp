@@ -46,11 +46,11 @@ const int prefetch_ahead = [] {
 
 // lanes 0-7 -> s0, 8-15 -> s1, 16-23 -> s2, 24-31 -> s3 (int16 lanes of a maddubs result: two values each)
 inline __m512i scales4(int s0, int s1, int s2, int s3) {
-    const __m512i idx = _mm512_set_epi16(3, 3, 3, 3, 3, 3, 3, 3, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1,
-                                         0, 0, 0, 0, 0, 0, 0, 0);
-    const uint64_t packed = (uint64_t) (uint16_t) s0 | ((uint64_t) (uint16_t) s1 << 16) |
-                            ((uint64_t) (uint16_t) s2 << 32) | ((uint64_t) (uint16_t) s3 << 48);
-    return _mm512_permutexvar_epi16(idx, _mm512_set1_epi64((long long) packed));
+    const int p0 = (s0 & 0xffff) | (s0 << 16);
+    const int p1 = (s1 & 0xffff) | (s1 << 16);
+    const int p2 = (s2 & 0xffff) | (s2 << 16);
+    const int p3 = (s3 & 0xffff) | (s3 << 16);
+    return _mm512_set_epi32(p3, p3, p3, p3, p2, p2, p2, p2, p1, p1, p1, p1, p0, p0, p0, p0);
 }
 
 // ---- per format: 64 values (chunk j of a 256-value block) -> grid magnitudes, sign mask, scales
@@ -158,95 +158,6 @@ template <> struct Fmt<21> {   // IQ3_S: d, qs[64], qh[8], signs[32], scales[4]
     }
 };
 
-template <int TY, int NT>
-inline void row_dot(const uint8_t* row, int nblocks, const block_q8_K* const* y, float* res) {
-    __m512 accf[NT];
-    for (int t = 0; t < NT; ++t) accf[t] = _mm512_setzero_ps();
-    const __m512i zero = _mm512_setzero_si512();
-    for (int i = 0; i < nblocks; ++i) {
-        const uint8_t* blk = row + (size_t) i * Fmt<TY>::bytes;
-        // E-2: the weight rows stream from DRAM (4 KB pages when large pages are refused): ask for the bytes a few
-        // blocks ahead (the next row's start included) before the decode needs them
-        if (prefetch_ahead > 0) {
-            const uint8_t* ahead = blk + (size_t) prefetch_ahead;
-            _mm_prefetch((const char*) ahead, _MM_HINT_T0);
-            _mm_prefetch((const char*) ahead + 64, _MM_HINT_T0);
-        }
-        __m512i acci[NT];
-        for (int t = 0; t < NT; ++t) acci[t] = _mm512_setzero_si512();
-        for (int j = 0; j < 4; ++j) {
-            __m512i g, sc;
-            __mmask64 m;
-            Fmt<TY>::decode(blk, j, g, m, sc);
-            for (int t = 0; t < NT; ++t) {
-                const __m512i yv = _mm512_loadu_si512((const void*) (y[t][i].qs + 64 * j));
-                const __m512i ys = _mm512_mask_sub_epi8(yv, m, zero, yv);
-                acci[t] = _mm512_add_epi32(acci[t], _mm512_madd_epi16(_mm512_maddubs_epi16(g, ys), sc));
-            }
-        }
-        const float dx = h2f(u16(blk)) * Fmt<TY>::K;
-        for (int t = 0; t < NT; ++t)
-            accf[t] = _mm512_fmadd_ps(_mm512_set1_ps(dx * y[t][i].d), _mm512_cvtepi32_ps(acci[t]), accf[t]);
-    }
-    for (int t = 0; t < NT; ++t) res[t] = _mm512_reduce_add_ps(accf[t]);
-}
-
-template <int TY, int NT>
-void gu_rows(const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act, float* const* ff,
-             int r0, int r1) {
-    const block_q8_K* y[NT];
-    for (int t = 0; t < NT; ++t) y[t] = (const block_q8_K*) act[t];
-    const int nb = n / QK_K;
-    float g[NT], u[NT];
-    for (int r = r0; r < r1; ++r) {
-        row_dot<TY, NT>(blob + (size_t) r * gu_row, nb, y, g);
-        row_dot<TY, NT>(blob + up_off + (size_t) r * gu_row, nb, y, u);
-        for (int t = 0; t < NT; ++t) ff[t][r] = (g[t] / (1.f + std::exp(-g[t]))) * u[t];
-    }
-}
-
-template <int TY, int NT>
-void dot_rows(const uint8_t* w, size_t row_bytes, int n, const void* const* act, float* const* out, int r0, int r1) {
-    const block_q8_K* y[NT];
-    for (int t = 0; t < NT; ++t) y[t] = (const block_q8_K*) act[t];
-    float res[NT];
-    for (int r = r0; r < r1; ++r) {
-        row_dot<TY, NT>(w + (size_t) r * row_bytes, n / QK_K, y, res);
-        for (int t = 0; t < NT; ++t) out[t][r] = res[t];
-    }
-}
-
-template <int TY>
-void gu_rows_nt(int nt, const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act,
-                float* const* ff, int r0, int r1) {
-    switch (nt) {
-        case 1: gu_rows<TY, 1>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
-        case 2: gu_rows<TY, 2>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
-        case 3: gu_rows<TY, 3>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
-        case 4: gu_rows<TY, 4>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
-        case 5: gu_rows<TY, 5>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
-        case 6: gu_rows<TY, 6>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
-        case 7: gu_rows<TY, 7>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
-        default: gu_rows<TY, 8>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
-    }
-}
-
-template <int TY>
-void dot_rows_nt(int nt, const uint8_t* w, size_t row_bytes, int n, const void* const* act, float* const* out, int r0,
-                 int r1) {
-    switch (nt) {
-        case 1: dot_rows<TY, 1>(w, row_bytes, n, act, out, r0, r1); break;
-        case 2: dot_rows<TY, 2>(w, row_bytes, n, act, out, r0, r1); break;
-        case 3: dot_rows<TY, 3>(w, row_bytes, n, act, out, r0, r1); break;
-        case 4: dot_rows<TY, 4>(w, row_bytes, n, act, out, r0, r1); break;
-        default: for (int t0 = 0; t0 < nt; t0 += 4) {
-            const int k = nt - t0 < 4 ? nt - t0 : 4;
-            dot_rows_nt<TY>(k, w, row_bytes, n, act + t0, out + t0, r0, r1);
-        }
-    }
-}
-
-
 // The sign masks of IQ2_XXS / IQ2_XS / IQ3_XXS come from a 7-bit index whose 8th bit is the parity of the other seven (ksigns_iq2xs[i] =
 // i | parity(i) << 7).  The table needs a load and a few shifts and ors a group of eight values; popcount does it for all eight groups
 // of 64 values in one vector: measured on Zen 5, one-token IQ2_XXS rows 33 -> 45-50 GB/s (16 threads, DRAM-sized), cache-resident 16.8 -> 13.4 ns a block.
@@ -301,6 +212,137 @@ template <> struct FmtX<18> : Fmt<18> {
         sc = scales4(sa, sa, sb, sb);
     }
 };
+
+static bool has_vpopcnt_vnni() {
+    static const bool ok = [] {
+#if defined(_MSC_VER)
+        int r[4];
+        __cpuidex(r, 7, 0);
+        return ((r[2] >> 14) & 1) != 0 && ((r[2] >> 11) & 1) != 0;   // AVX512_VPOPCNTDQ + AVX512_VNNI
+#else
+        unsigned a, b, c, d;
+        __cpuid_count(7, 0, a, b, c, d);
+        return ((c >> 14) & 1u) != 0 && ((c >> 11) & 1u) != 0;
+#endif
+    }();
+    return ok;
+}
+
+template <int TY, int NT, bool UseX = false>
+inline void row_dot(const uint8_t* row, int nblocks, const block_q8_K* const* y, float* res) {
+    __m512 accf[NT];
+    for (int t = 0; t < NT; ++t) accf[t] = _mm512_setzero_ps();
+    const __m512i zero = _mm512_setzero_si512();
+    for (int i = 0; i < nblocks; ++i) {
+        const uint8_t* blk = row + (size_t) i * Fmt<TY>::bytes;
+        // E-2: the weight rows stream from DRAM (4 KB pages when large pages are refused): ask for the bytes a few
+        // blocks ahead (the next row's start included) before the decode needs them
+        if (prefetch_ahead > 0) {
+            const uint8_t* ahead = blk + (size_t) prefetch_ahead;
+            _mm_prefetch((const char*) ahead, _MM_HINT_T0);
+            _mm_prefetch((const char*) ahead + 64, _MM_HINT_T0);
+        }
+        __m512i acci[NT];
+        for (int t = 0; t < NT; ++t) acci[t] = _mm512_setzero_si512();
+        for (int j = 0; j < 4; ++j) {
+            __m512i g, sc;
+            __mmask64 m;
+            if constexpr (UseX) {
+                FmtX<TY>::decode(blk, j, g, m, sc);
+            } else {
+                Fmt<TY>::decode(blk, j, g, m, sc);
+            }
+            for (int t = 0; t < NT; ++t) {
+                const __m512i yv = _mm512_loadu_si512((const void*) (y[t][i].qs + 64 * j));
+                const __m512i ys = _mm512_mask_sub_epi8(yv, m, zero, yv);
+                if constexpr (UseX) {
+                    acci[t] = _mm512_dpwssd_epi32(acci[t], _mm512_maddubs_epi16(g, ys), sc);
+                } else {
+                    acci[t] = _mm512_add_epi32(acci[t], _mm512_madd_epi16(_mm512_maddubs_epi16(g, ys), sc));
+                }
+            }
+        }
+        const float dx = h2f(u16(blk)) * Fmt<TY>::K;
+        for (int t = 0; t < NT; ++t)
+            accf[t] = _mm512_fmadd_ps(_mm512_set1_ps(dx * y[t][i].d), _mm512_cvtepi32_ps(acci[t]), accf[t]);
+    }
+    for (int t = 0; t < NT; ++t) res[t] = _mm512_reduce_add_ps(accf[t]);
+}
+
+template <int TY, int NT, bool UseX = false>
+void gu_rows(const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act, float* const* ff,
+             int r0, int r1) {
+    const block_q8_K* y[NT];
+    for (int t = 0; t < NT; ++t) y[t] = (const block_q8_K*) act[t];
+    const int nb = n / QK_K;
+    float g[NT], u[NT];
+    for (int r = r0; r < r1; ++r) {
+        const uint8_t* u_row = blob + up_off + (size_t) r * gu_row;
+        _mm_prefetch((const char*) u_row, _MM_HINT_T0);
+        row_dot<TY, NT, UseX>(blob + (size_t) r * gu_row, nb, y, g);
+        row_dot<TY, NT, UseX>(u_row, nb, y, u);
+        for (int t = 0; t < NT; ++t) ff[t][r] = (g[t] / (1.f + std::exp(-g[t]))) * u[t];
+    }
+}
+
+template <int TY, int NT, bool UseX = false>
+void dot_rows(const uint8_t* w, size_t row_bytes, int n, const void* const* act, float* const* out, int r0, int r1) {
+    const block_q8_K* y[NT];
+    for (int t = 0; t < NT; ++t) y[t] = (const block_q8_K*) act[t];
+    float res[NT];
+    for (int r = r0; r < r1; ++r) {
+        row_dot<TY, NT, UseX>(w + (size_t) r * row_bytes, n / QK_K, y, res);
+        for (int t = 0; t < NT; ++t) out[t][r] = res[t];
+    }
+}
+
+template <int TY, bool UseX>
+void gu_rows_nt_impl(int nt, const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act,
+                     float* const* ff, int r0, int r1) {
+    switch (nt) {
+        case 1: gu_rows<TY, 1, UseX>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
+        case 2: gu_rows<TY, 2, UseX>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
+        case 3: gu_rows<TY, 3, UseX>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
+        case 4: gu_rows<TY, 4, UseX>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
+        case 5: gu_rows<TY, 5, UseX>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
+        case 6: gu_rows<TY, 6, UseX>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
+        case 7: gu_rows<TY, 7, UseX>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
+        default: gu_rows<TY, 8, UseX>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
+    }
+}
+
+template <int TY>
+void gu_rows_nt(int nt, const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act,
+                float* const* ff, int r0, int r1) {
+    if (has_vpopcnt_vnni())
+        gu_rows_nt_impl<TY, true>(nt, blob, gu_row, up_off, n, act, ff, r0, r1);
+    else
+        gu_rows_nt_impl<TY, false>(nt, blob, gu_row, up_off, n, act, ff, r0, r1);
+}
+
+template <int TY, bool UseX>
+void dot_rows_nt_impl(int nt, const uint8_t* w, size_t row_bytes, int n, const void* const* act, float* const* out, int r0,
+                      int r1) {
+    switch (nt) {
+        case 1: dot_rows<TY, 1, UseX>(w, row_bytes, n, act, out, r0, r1); break;
+        case 2: dot_rows<TY, 2, UseX>(w, row_bytes, n, act, out, r0, r1); break;
+        case 3: dot_rows<TY, 3, UseX>(w, row_bytes, n, act, out, r0, r1); break;
+        case 4: dot_rows<TY, 4, UseX>(w, row_bytes, n, act, out, r0, r1); break;
+        default: for (int t0 = 0; t0 < nt; t0 += 4) {
+            const int k = nt - t0 < 4 ? nt - t0 : 4;
+            dot_rows_nt_impl<TY, UseX>(k, w, row_bytes, n, act + t0, out + t0, r0, r1);
+        }
+    }
+}
+
+template <int TY>
+void dot_rows_nt(int nt, const uint8_t* w, size_t row_bytes, int n, const void* const* act, float* const* out, int r0,
+                 int r1) {
+    if (has_vpopcnt_vnni())
+        dot_rows_nt_impl<TY, true>(nt, w, row_bytes, n, act, out, r0, r1);
+    else
+        dot_rows_nt_impl<TY, false>(nt, w, row_bytes, n, act, out, r0, r1);
+}
 
 // ---- the DeepSeek CPU lane's exact rows (iq512x_rows): the same 64-value decode, but summed as ggml's AVX2 dots sum, so a
 // token's row is ggml-cpu's vec_dot bit for bit at any number of tokens: the integer sums of a block fold to ggml's eight lanes

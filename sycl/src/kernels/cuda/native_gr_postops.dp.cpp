@@ -166,8 +166,7 @@ void native_gr_down_silu(float* lo, int hc_lr, int hc, void* stream) {
     check_shape(hc_lr, hc);
     check_pointer(lo);
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         ((sycl::queue *)(strata::q_of(stream)))
             ->submit([&](sycl::handler &cgh) {
@@ -197,8 +196,7 @@ void native_gr_pre_gated_multi(const float* xn, float* gate, float* mixed,
     const dpct::dim3 grid{blocks(n_embd), unsigned(n_tok), 1u};
     if (fused_layer)
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         ((sycl::queue *)(strata::q_of(stream)))
             ->submit([&](sycl::handler &cgh) {
@@ -214,8 +212,7 @@ void native_gr_pre_gated_multi(const float* xn, float* gate, float* mixed,
                     });
             });
     } else {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         ((sycl::queue *)(strata::q_of(stream)))
             ->submit([&](sycl::handler &cgh) {
@@ -246,8 +243,7 @@ void native_gr_post_multi(const float* residual, const float* block_out, const f
     const dpct::dim3 grid{blocks(std::size_t(n_embd) * hc), unsigned(n_tok),
                           1u};
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         ((sycl::queue *)(strata::q_of(stream)))
             ->submit([&](sycl::handler &cgh) {

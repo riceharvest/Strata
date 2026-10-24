@@ -337,8 +337,7 @@ void native_flash_attn_short_step(const float* q, const uint16_t* k, const uint1
                           {status, 4, 4}, {mask, 256 * 2, 2}};
     validate_spans(spans, mask ? 7 : 6);
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
         dpct::has_capability_or_fail(
             ((sycl::queue *)(strata::q_of(stream)))
                 ->get_device(),

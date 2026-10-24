@@ -134,8 +134,7 @@ void rope_neox_apply(const float* x, float* out, int64_t rows, int head_dim, int
     const int threads = 128;
     const unsigned grid = (unsigned) ((rows + threads - 1) / threads);
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         strata::q_of(stream)
             ->submit([&](sycl::handler &cgh) {

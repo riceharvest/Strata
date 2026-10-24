@@ -269,8 +269,7 @@ void launch_sigmoid_scale_rows(float *out, const float *g, int n_embd,
     if ((n_embd & 3) == 0 && ((uintptr_t) out & 15u) == 0) {
         const int n4 = n_embd >> 2;
         {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
             cs->parallel_for<
                 dpct_kernel_name<class sigmoid_scale_rows_vec4_kernel_723a94>>(
@@ -285,8 +284,7 @@ void launch_sigmoid_scale_rows(float *out, const float *g, int n_embd,
                 });
         }
     } else {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         cs->parallel_for<
             dpct_kernel_name<class sigmoid_scale_rows_kernel_26f4a0>>(
@@ -334,8 +332,7 @@ void shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, cons
         native_swiglu_quantize_q8_1(gate, up, nw.q8_1, (int) n_ff, n_tok, stream);
     } else {
         {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
             cs->parallel_for<
                 dpct_kernel_name<class native_swiglu_kernel_c4e755>>(
@@ -387,8 +384,7 @@ void shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, cons
                 bf16_gemv_fp32_mmvf(x + (size_t) t * n_embd, gate_inp_bf16, g + t, n_embd, 1, stream);
                 {
                     auto exp_props =
-                        sycl::ext::oneapi::experimental::properties{
-                            sycl::ext::oneapi::experimental::use_root_sync};
+                        sycl::ext::oneapi::experimental::properties{};
 
                     cs->submit([&](sycl::handler &cgh) {
                         auto g_t_ct0 = g + t;
@@ -403,8 +399,7 @@ void shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, cons
                     });
                 }
             } else {
-                auto exp_props = sycl::ext::oneapi::experimental::properties{
-                    sycl::ext::oneapi::experimental::use_root_sync};
+                auto exp_props = sycl::ext::oneapi::experimental::properties{};
                 dpct::has_capability_or_fail(cs->get_device(),
                                              {sycl::aspect::fp64});
 
@@ -428,8 +423,7 @@ void shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, cons
             }
         }
         {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
             cs->parallel_for<dpct_kernel_name<class scale_rows_kernel_4f17ec>>(
                 sycl::nd_range<3>(
@@ -549,8 +543,7 @@ void shared_expert(const uint8_t *x_q8_0, const uint8_t *x_q8k,
     } else {
         if (native_projection)
         {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
             strata::q_of(stream)
                 ->parallel_for<
@@ -562,8 +555,7 @@ void shared_expert(const uint8_t *x_q8_0, const uint8_t *x_q8k,
                         native_swiglu_kernel(gate, up, gate, (int)n_ff);
                     });
         } else {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};
             dpct::has_capability_or_fail(
                 strata::q_of(stream)->get_device(),
                 {sycl::aspect::fp64});
@@ -612,8 +604,7 @@ void shared_expert(const uint8_t *x_q8_0, const uint8_t *x_q8k,
                                   strata::q_of(stream));
     } else {
         {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};
             dpct::has_capability_or_fail(
                 strata::q_of(stream)->get_device(),
                 {sycl::aspect::fp64});
@@ -631,8 +622,7 @@ void shared_expert(const uint8_t *x_q8_0, const uint8_t *x_q8k,
                         });
         }
         {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
             strata::q_of(stream)
                 ->parallel_for<dpct_kernel_name<class scale_kernel_a41a71>>(
@@ -667,8 +657,7 @@ void moe_combine(const float *parts, const float *weights, const float *shared,
     }
     const unsigned grid = (unsigned) ((n_embd + THREADS - 1) / THREADS);
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
         dpct::has_capability_or_fail(
             strata::q_of(stream)->get_device(),
             {sycl::aspect::fp64});

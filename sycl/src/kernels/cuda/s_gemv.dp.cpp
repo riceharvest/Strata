@@ -418,8 +418,7 @@ void s_gemv(const uint16_t *x, const uint8_t *codes, const float *scales,
     const int cb = (int) form.codebook;
     switch (form.code_bits) {
     case 2: {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         dpct::get_in_order_queue()
             .parallel_for<dpct_kernel_name<class s_gemv_kernel_4f63f9,
@@ -434,8 +433,7 @@ void s_gemv(const uint16_t *x, const uint8_t *codes, const float *scales,
                 });
     } break;
     case 4: {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         dpct::get_in_order_queue()
             .parallel_for<dpct_kernel_name<class s_gemv_kernel_9c529a,
@@ -450,8 +448,7 @@ void s_gemv(const uint16_t *x, const uint8_t *codes, const float *scales,
                 });
     } break;
     case 8: {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         dpct::get_in_order_queue()
             .parallel_for<dpct_kernel_name<class s_gemv_kernel_e40e1f,
@@ -652,8 +649,7 @@ static void s_gemv_split_impl(const uint16_t *x, const uint8_t *codes,
             needed.
             */
         {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};
             dpct::has_capability_or_fail(stream->get_device(),
                                          {sycl::aspect::fp16});
 
@@ -686,8 +682,7 @@ static void s_gemv_split_impl(const uint16_t *x, const uint8_t *codes,
             needed.
             */
         {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};
             dpct::has_capability_or_fail(stream->get_device(),
                                          {sycl::aspect::fp16});
 
@@ -720,8 +715,7 @@ static void s_gemv_split_impl(const uint16_t *x, const uint8_t *codes,
             needed.
             */
         {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};
             dpct::has_capability_or_fail(stream->get_device(),
                                          {sycl::aspect::fp16});
 
@@ -824,8 +818,7 @@ void s_gemv_q8k(const uint8_t* x_q8k, const uint8_t* codes, const float* scales,
     const int ho = form.has_offset ? 1 : 0;
     switch (form.code_bits) {
     case 4: {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         strata::q_of(stream)
             ->parallel_for<dpct_kernel_name<class s_gemv_q8k_kernel_9b1637,
@@ -840,8 +833,7 @@ void s_gemv_q8k(const uint8_t* x_q8k, const uint8_t* codes, const float* scales,
                 });
     } break;
     case 8: {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         strata::q_of(stream)
             ->parallel_for<dpct_kernel_name<class s_gemv_q8k_kernel_adeed5,
@@ -891,8 +883,7 @@ void s_gemv_q8k_split(const uint8_t* x_q8k, const uint8_t* codes, const float* s
     const int ho = form.has_offset ? 1 : 0;
     switch (form.code_bits) {
     case 4: {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         strata::q_of(stream)
             ->parallel_for<dpct_kernel_name<class s_gemv_q8_split_kernel_19ad26,
@@ -910,8 +901,7 @@ void s_gemv_q8k_split(const uint8_t* x_q8k, const uint8_t* codes, const float* s
                     });
     } break;
     case 8: {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         strata::q_of(stream)
             ->parallel_for<dpct_kernel_name<class s_gemv_q8_split_kernel_4da4f5,
@@ -968,8 +958,7 @@ void s_gemv_q8_0_split(const uint8_t* x_q8_0, const uint8_t* codes, const float*
     const int ho = form.has_offset ? 1 : 0;
     switch (form.code_bits) {
     case 4: {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         strata::q_of(stream)
             ->parallel_for<dpct_kernel_name<class s_gemv_q8_split_kernel_147ee4,
@@ -987,8 +976,7 @@ void s_gemv_q8_0_split(const uint8_t* x_q8_0, const uint8_t* codes, const float*
                     });
     } break;
     case 8: {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         strata::q_of(stream)
             ->parallel_for<dpct_kernel_name<class s_gemv_q8_split_kernel_bac5c0,

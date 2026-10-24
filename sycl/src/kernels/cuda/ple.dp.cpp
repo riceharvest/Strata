@@ -292,8 +292,7 @@ void ple_history_advance(float* hist, const float* normalized, void* stream) {
                 normalized, (size_t) NG_HC_DIM * sizeof(float)))
         throw std::invalid_argument("ple_history_advance: history and normalized input overlap");
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         strata::q_of(stream)
             ->parallel_for<
@@ -432,8 +431,7 @@ void ple_block(const float* emb, const float* hidden, const float* hist_rows, co
     }
     if (!native_postops) {
         {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};
             dpct::has_capability_or_fail(st->get_device(),
                                          {sycl::aspect::fp64});
 
@@ -453,8 +451,7 @@ void ple_block(const float* emb, const float* hidden, const float* hist_rows, co
             });
         }
         {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};
             dpct::has_capability_or_fail(st->get_device(),
                                          {sycl::aspect::fp64});
 
@@ -488,8 +485,7 @@ void ple_block(const float* emb, const float* hidden, const float* hist_rows, co
         bf16_gemv_fp32_mmvf(emb, w.value_bf16, d_value, n_embd, n_embd, stream);
     } else {
         {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
             st->parallel_for<dpct_kernel_name<class to_bf16_kernel_ab93ff>>(
                 sycl::nd_range<3>(
@@ -501,8 +497,7 @@ void ple_block(const float* emb, const float* hidden, const float* hist_rows, co
                 });
         }
         {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};
             dpct::has_capability_or_fail(st->get_device(),
                                          {sycl::aspect::fp64});
 
@@ -527,8 +522,7 @@ void ple_block(const float* emb, const float* hidden, const float* hist_rows, co
         normalized_key = d_query;
     } else {
         {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};
             dpct::has_capability_or_fail(st->get_device(),
                                          {sycl::aspect::fp64});
 
@@ -548,8 +542,7 @@ void ple_block(const float* emb, const float* hidden, const float* hist_rows, co
             });
         }
         {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
             st->parallel_for<dpct_kernel_name<class bcast_kernel_79d1c2>>(
                 sycl::nd_range<3>(
@@ -561,8 +554,7 @@ void ple_block(const float* emb, const float* hidden, const float* hist_rows, co
                 });
         }
         {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};
             dpct::has_capability_or_fail(st->get_device(),
                                          {sycl::aspect::fp64});
 
@@ -582,8 +574,7 @@ void ple_block(const float* emb, const float* hidden, const float* hist_rows, co
             });
         }
         {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
             st->submit([&](sycl::handler &cgh) {
                 auto PLE_CONV_KERNEL_ct5 = PLE_CONV_KERNEL;
@@ -603,8 +594,7 @@ void ple_block(const float* emb, const float* hidden, const float* hist_rows, co
             });
         }
         {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
             st->parallel_for<dpct_kernel_name<class add3_kernel_26c4c6>>(
                 sycl::nd_range<3>(

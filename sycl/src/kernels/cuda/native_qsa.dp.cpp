@@ -178,8 +178,7 @@ void native_qsa_rms_norm_weighted(const float* input, const float* gamma, float*
     buffers(input, count * 4, gamma, std::size_t(n_cols) * 4, output, stream);
     if (n_cols < 1024)
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         ((sycl::queue *)(strata::q_of(stream)))
             ->parallel_for<
@@ -199,8 +198,7 @@ void native_qsa_rms_norm_weighted(const float* input, const float* gamma, float*
     info::device::max_work_group_size. Adjust the work-group size if needed.
     */
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         ((sycl::queue *)(strata::q_of(stream)))
             ->parallel_for<
@@ -225,8 +223,7 @@ void native_qsa_rms_norm_grouped(const float* input, const float* gamma, float* 
     buffers(input, count * 4, gamma, std::size_t(n_cols) * groups * 4, output, stream);
     if (n_cols < 1024)
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         ((sycl::queue *)(strata::q_of(stream)))
             ->parallel_for<dpct_kernel_name<class norm_grouped_b5907a,
@@ -247,8 +244,7 @@ void native_qsa_rms_norm_grouped(const float* input, const float* gamma, float* 
     info::device::max_work_group_size. Adjust the work-group size if needed.
     */
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         ((sycl::queue *)(strata::q_of(stream)))
             ->parallel_for<dpct_kernel_name<class norm_grouped_927e80,
@@ -270,8 +266,7 @@ void native_qsa_gate_apply(const float* attn, const float* q_full, float* output
     const auto count = elements(head_dim, n_head);
     buffers(attn, count * 4, q_full, count * 8, output, stream);
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         ((sycl::queue *)(strata::q_of(stream)))
             ->parallel_for<dpct_kernel_name<class gate_148967>>(

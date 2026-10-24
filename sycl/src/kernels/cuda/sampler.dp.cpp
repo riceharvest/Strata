@@ -1503,8 +1503,7 @@ void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* hi
             needed.
             */
         {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
             strata::q_of(stream)
                 ->submit([&](sycl::handler &cgh) {
@@ -1538,8 +1537,7 @@ void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* hi
         the limit. To get the device limit, query
         info::device::max_work_group_size. Adjust the work-group size if needed.
         */
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
         sampler_require_fp64(strata::q_of(stream)->get_device());
 
         strata::q_of(stream)
@@ -1576,8 +1574,7 @@ void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* hi
             scratch = split_scratch(stream, (size_t) (n_tokens > 16 ? n_tokens : 16) * n_blocks * kSelMax);
         if (scratch != nullptr) {
             {
-                auto exp_props = sycl::ext::oneapi::experimental::properties{
-                    sycl::ext::oneapi::experimental::use_root_sync};
+                auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
                 strata::q_of(stream)
                     ->parallel_for<dpct_kernel_name<
@@ -1596,8 +1593,7 @@ void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* hi
                             });
             }
             {
-                auto exp_props = sycl::ext::oneapi::experimental::properties{
-                    sycl::ext::oneapi::experimental::use_root_sync};
+                auto exp_props = sycl::ext::oneapi::experimental::properties{};
                 sampler_require_fp64(strata::q_of(stream)->get_device());
 
                 strata::q_of(stream)
@@ -1621,8 +1617,7 @@ void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* hi
             info::device::max_work_group_size. Adjust the work-group size if
             needed.
             */
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};
             sampler_require_fp64(strata::q_of(stream)->get_device());
 
             strata::q_of(stream)
@@ -1681,8 +1676,7 @@ size_t coupled_draft_scratch_bytes(int nv) {
 void coupled_draft_stage(const SamplerParams* mapped_params, const int32_t* mapped_hist, SamplerParams* params,
                          int32_t* ring, int cap, void* stream) {
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         strata::q_of(stream)
             ->parallel_for<dpct_kernel_name<class coupled_stage_kernel_113245>>(
@@ -1711,8 +1705,7 @@ void coupled_draft_sample(float* logits, int nv, const int32_t* sub_to_id, const
     Adjust the work-group size if needed.
     */
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         s->submit([&](sycl::handler &cgh) {
             /*
@@ -1741,8 +1734,7 @@ void coupled_draft_sample(float* logits, int nv, const int32_t* sub_to_id, const
     // the selection of the split sampler, unchanged: every 4,096-logit block's first `kpart` (the widest list,
     // since the request's top_k is only known on the device), penalties already applied above
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         s->parallel_for<
             dpct_kernel_name<class sampler_split_part_kernel_cc5674>>(
@@ -1758,8 +1750,7 @@ void coupled_draft_sample(float* logits, int nv, const int32_t* sub_to_id, const
     }
     coupled_check("coupled_draft split part");
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
         sampler_require_fp64(s->get_device());
 
         s->parallel_for<dpct_kernel_name<class coupled_merge_kernel_1fbeb1>>(
