@@ -32,8 +32,8 @@ namespace i8 = strata::prefill::i8;
 static uint16_t f2h(float f) { return sycl::bit_cast<uint16_t>(sycl::half(f)); }
 static float h2f(uint16_t h) { return (float) sycl::bit_cast<sycl::half>(h); }
 
-static int block_bytes(int t) { return t == 21 ? 110 : t == 18 ? 98 : t == 22 ? 82 : 18; }
-static int block_vals(int t) { return (t == 21 || t == 18 || t == 22) ? 256 : t == 42 ? 64 : 32; }
+static int block_bytes(int t) { return t == 23 ? 136 : t == 21 ? 110 : t == 18 ? 98 : t == 22 ? 82 : 18; }
+static int block_vals(int t) { return (t == 23 || t == 21 || t == 18 || t == 22) ? 256 : t == 42 ? 64 : 32; }
 
 // host decode of one row (K values) -> double
 static void dec_row(int t, const uint8_t* row, int K, double* out) {
@@ -43,7 +43,18 @@ static void dec_row(int t, const uint8_t* row, int K, double* out) {
         uint16_t dh; std::memcpy(&dh, blk, 2);
         const double d = h2f(dh);
         double* o = out + (size_t) b * bv;
-        if (t == 21) {
+        if (t == 23) {
+            uint16_t sh; std::memcpy(&sh, blk + 2, 2);
+            const uint8_t *sl = blk + 4, *qs = blk + 8;
+            for (int ib = 0; ib < 8; ++ib) {
+                const int ls = ((sl[ib / 2] >> (4 * (ib & 1))) & 0xf) | (((sh >> (2 * ib)) & 3) << 4);
+                const double dd = d * (ls - 32);
+                for (int j = 0; j < 16; ++j) {
+                    o[ib * 32 + j] = dd * kvalues_iq4nl[qs[16 * ib + j] & 15];
+                    o[ib * 32 + 16 + j] = dd * kvalues_iq4nl[qs[16 * ib + j] >> 4];
+                }
+            }
+        } else if (t == 21) {
             const uint8_t *qs = blk + 2, *qh = blk + 66, *sgn = blk + 74, *scl = blk + 106;
             for (int ib = 0; ib < 8; ++ib) {
                 const double dd = d * (1 + 2 * ((scl[ib / 2] >> (4 * (ib % 2))) & 0xf));
@@ -272,7 +283,7 @@ int main(int argc, char** argv) {
     if (!i8::available(q)) { std::printf("esimd_moe_parity: SKIP (no ESIMD device with the s8 8x16x32 DPAS)\n"); return 0; }
     dpct::blas::descriptor_ptr hd = new dpct::blas::descriptor();
     hd->set_queue(q);
-    std::vector<std::pair<int, int>> cases = {{21, 20}, {18, 20}, {22, 20}, {21, 42}, {18, 42}, {22, 42}};
+    std::vector<std::pair<int, int>> cases = {{21, 20}, {18, 20}, {22, 20}, {23, 20}, {21, 42}, {18, 42}, {22, 42}, {23, 42}};
     if (argc > 6) cases = {{std::atoi(argv[5]), std::atoi(argv[6])}};
     int fails = 0;
     for (auto [gt, dt] : cases) {
