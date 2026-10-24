@@ -1,5 +1,5 @@
-"""#1594: --gpus when starting an installed model on a PC with AMD cards and no NVIDIA ones names the AMD cards (as
-setup lists them) instead of failing for want of an NVIDIA GPU.
+"""#1594: --gpus when starting an installed model names the cards of setup's AMD path (sycl/setup_intel.py puts the Intel
+Arc cards there) as setup lists them.
 
     python -m unittest tools.test_setup_start_gpus_amd -v
 """
@@ -12,8 +12,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import setup  # noqa: E402
 
 
-def amd(index, arch="gfx1201"):
-    return {"index": index, "name": f"Radeon {index}", "arch": arch, "vram_gb": 32.0}
+def amd(index, problem=None):
+    return {"index": index, "name": f"Intel Arc Pro B70 {index}", "arch": "xe", "vram_gb": 32.0, "problem": problem}
 
 
 class StartGpusAmd(unittest.TestCase):
@@ -30,7 +30,7 @@ class StartGpusAmd(unittest.TestCase):
 
     def test_a_card_that_cannot_be_used_is_named(self):
         with self.assertRaises(SystemExit):
-            self.run_start_gpus("1,0", [amd(0), amd(1, "gfx1010")])
+            self.run_start_gpus("1,0", [amd(0), amd(1, "not supported")])
 
     def test_nothing_named_is_none(self):
         self.assertIsNone(self.run_start_gpus("", [amd(0)]))

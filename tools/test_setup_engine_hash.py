@@ -333,12 +333,9 @@ class WhatARefusalDoesToTheCaller(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 setup.get_prebuilt(setup.PREBUILT_URL, {"arch": 89}, "gpu")
 
-    def test_the_cuda_and_amd_paths_both_verify(self):
-        # get_prebuilt_hip downloads the AMD engine from a SECOND `download(base + ...)` call site, which
-        # the first version of this change missed entirely - so AMD users got nothing from it.
+    def test_the_cuda_path_verifies(self):
         src = (ROOT / "setup.py").read_text(encoding="utf-8")
-        for call in ('download(base + asset, z, "Strata engine")',
-                     'download(base + WIN_HIP_ASSET, z, "Strata AMD engine")'):
+        for call in ('download(base + asset, z, "Strata engine")',):
             i = src.index(call)
             self.assertIn("verify_engine_archive", src[i:i + 400], f"{call} is not verified")
 

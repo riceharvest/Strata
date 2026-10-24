@@ -119,8 +119,7 @@ class Main8GB(Base):
 
     def test_amd_8gb(self):
         r = [{"index": 0, "name": "AMD Radeon RX 7600", "vram_gb": 8.0, "arch": "gfx1102", "driver": "amdgpu"}]
-        with mock.patch.object(setup, "get_prebuilt_hip", lambda *a, **k: self.t / "engine"), \
-                mock.patch.object(setup, "build_engine_hip", lambda *a, **k: self.t / "engine"),                 mock.patch.object(setup, "hip_card", lambda eng, gpu, listed: gpu):
+        with mock.patch.object(setup, "build_engine_hip", lambda *a, **k: self.t / "engine"):
             code, out, cfg = self.main(["--context", "8192", "--backend", "hip", "--vision", "no"], amd=r)
         self.assertEqual(code, 0, out)
         self.assertNotIn("--mtp", cfg["args"])

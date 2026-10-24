@@ -281,7 +281,7 @@ class Main(Base):
         numbers in docs/QUANTS.md), so AMD is no longer asked before the download."""
         r9700 = [{"index": 0, "name": "AMD Radeon AI PRO R9700", "vram_gb": 31.9, "arch": "gfx1201",
                   "driver": "amdgpu"}]
-        with mock.patch.object(setup, "get_prebuilt_hip", lambda *a, **k: self.t / "engine"),                 mock.patch.object(setup, "build_engine_hip", lambda *a, **k: self.t / "engine"):
+        with mock.patch.object(setup, "build_engine_hip", lambda *a, **k: self.t / "engine"):
             code, out, cfg = self.main(["--context", "8192", "--backend", "hip", "--vision", "no"], amd=r9700)
         self.assertNotIn("has not been run on AMD cards yet", out)
         self.assertIn("RAM budget: 40 GiB of UD-Q4_K_XL's experts", out)
@@ -572,53 +572,10 @@ class IQ4XS(Base):
     def test_amd_is_not_asked(self):
         r9700 = [{"index": 0, "name": "AMD Radeon AI PRO R9700", "vram_gb": 31.9, "arch": "gfx1201",
                   "driver": "amdgpu"}]
-        with mock.patch.object(setup, "get_prebuilt_hip", lambda *a, **k: self.t / "engine"), \
-                mock.patch.object(setup, "build_engine_hip", lambda *a, **k: self.t / "engine"):  # Linux compiles it
+        with mock.patch.object(setup, "build_engine_hip", lambda *a, **k: self.t / "engine"):  # Linux compiles it
             code, out, cfg = self.main(["--context", "8192", "--backend", "hip"], version="0.1.38", amd=r9700, m=X)
         self.assertNotIn("has not been run on AMD cards yet", out)
         self.assertIn("RAM budget: 40 GiB of UD-IQ4_XS's experts", out)
-
-
-class StrixHaloCache(Base):
-    """#1715: on a unified-memory APU the expert cache and the RAM budget are the same RAM: setup writes a cache size
-    that leaves the OS room, not `--expert-cache auto` (it OOM-killed a 128 GB Strix Halo with the desktop open)."""
-
-    HALO = [{"index": 0, "name": "AMD Radeon 8060S", "vram_gb": 2.0, "arch": "gfx1151", "driver": "amdgpu",
-             "uma": True, "dedicated_gb": 2.0, "shared_gb": 112.0}]
-
-    def run_halo(self, ram, argv=("--context", "8192"), amd=None):
-        with mock.patch.object(setup, "get_prebuilt_hip", lambda *a, **k: self.t / "engine"),                 mock.patch.object(setup, "WIN", False),                 mock.patch.object(setup, "build_engine_hip", lambda *a, **k: self.t / "engine"):
-            return self.main([*argv, "--backend", "hip"], version="0.1.41", amd=self.HALO if amd is None else amd,
-                             ram=ram, m="UD-IQ4_XS")
-
-    def test_cache_is_a_number_that_leaves_room(self):
-        code, out, cfg = self.run_halo(124.0)
-        self.assertEqual(code, 0, out)
-        args = cfg["args"]
-        self.assertEqual(args[args.index("--resident-budget-gib") + 1], "55")
-        slots = int(args[args.index("--expert-cache") + 1])
-        # 124 - 24 (left) - 55 (budget) = 45 GiB of 1.1 x the average expert (59.5 GB / 24576)
-        self.assertEqual(slots, int(45 / (59.5e9 / setup.UMA_EXPERTS * 1.1 / 2**30)))
-        self.assertTrue(0 < slots < setup.UMA_EXPERTS)
-        self.assertIn("expert cache: %d slots (not auto)" % slots, out)
-
-    def test_never_more_than_all_the_experts(self):
-        self.assertEqual(setup.uma_expert_cache("UD-IQ4_XS", 512.0, 55), setup.UMA_EXPERTS)
-
-    def test_no_room_keeps_auto_and_says_so(self):
-        self.assertIsNone(setup.uma_expert_cache("UD-IQ4_XS", 64.0, 40))
-        code, out, cfg = self.run_halo(64.0, ("--context", "8192", "--resident-budget-gib", "40"))
-        self.assertEqual(code, 0, out)
-        args = cfg["args"]
-        self.assertEqual(args[args.index("--expert-cache") + 1], "auto")
-        self.assertIn("leaves almost none for the expert cache", out)
-
-    def test_a_discrete_card_keeps_auto(self):
-        r9700 = [{"index": 0, "name": "AMD Radeon AI PRO R9700", "vram_gb": 31.9, "arch": "gfx1201",
-                  "driver": "amdgpu"}]
-        code, out, cfg = self.run_halo(124.0, amd=r9700)
-        self.assertEqual(code, 0, out)
-        self.assertEqual(cfg["args"][cfg["args"].index("--expert-cache") + 1], "auto")
 
 
 class LayerSplit(unittest.TestCase):
@@ -749,9 +706,8 @@ class Resident(Base):
                             (127.8, {Q8}), (191.0, set())):
             for m in (X, M, Q5, Q6, Q8):
                 self.assertEqual(setup.unsloth_budget(m, ram), m in budget, (m, ram))
-        self.assertTrue(setup.unsloth_budget(X, 124.0, {"uma": True}))       # #1715: measured on discrete cards only
         self.assertTrue(setup.unsloth_budget(M, 127.2, None, 40))             # --resident-budget-gib: asked for
-        self.assertFalse(setup.unsloth_budget(M, 127.2, {"uma": False}))
+        self.assertFalse(setup.unsloth_budget(M, 127.2, {}))
 
     def test_install_at_128_gb(self):
         for m, ver in ((M, "0.1.32"), (X, "0.1.38"), (Q5, "0.1.44")):

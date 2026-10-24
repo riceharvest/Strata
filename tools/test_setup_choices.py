@@ -357,7 +357,7 @@ class ExperimentalSm60(unittest.TestCase):
 
 
 class HipVision(unittest.TestCase):
-    """#304: --vision cpu with --backend hip builds the CPU image encoder beside the HIP engine."""
+    """#304: the picture reader setup's AMD path (the Intel Arc's, through sycl/setup_intel.py) asks for."""
 
     @mock.patch.object(setup, "WIN", False)
     def test_the_choice(self):
@@ -366,45 +366,6 @@ class HipVision(unittest.TestCase):
             self.assertEqual(quiet(setup.hip_vision, asked), ("none", ""))
         for asked in (None, "yes", "gpu"):            # pictures are on by default; the engine folder's readers settle gpu vs cpu
             self.assertEqual(quiet(setup.hip_vision, asked), ("gpu", ""))
-
-    def build(self, meta, vision, vexe=False):
-        """build_engine_hip with an engine that is already built: only the encoder can be missing."""
-        with tempfile.TemporaryDirectory() as d:
-            root = Path(d)
-            eng = root / "engine"
-            eng.mkdir()
-            (eng / setup.EXE).write_bytes(b"engine")
-            if vexe:
-                (eng / setup.VEXE).write_bytes(b"vision")
-            src, vsrc = "S", "V"
-            (eng / "BUILD.json").write_text(json.dumps({"backend": "hip", "archs": ["gfx1201"], "src": src, **meta}))
-            built = []
-
-            def cmake_build(src_dir, bdir, target, defs, vcvars, bat):
-                built.append((target, defs))
-                (bdir / "bin").mkdir(parents=True)
-                (bdir / "bin" / setup.VEXE).write_bytes(b"vision")
-
-            with mock.patch.object(setup, "ROOT", root), mock.patch.object(setup, "cmake_build", cmake_build), \
-                    mock.patch.object(setup, "source_hash", lambda paths: vsrc if paths == setup.VISION_SOURCES else src):
-                quiet(setup.build_engine_hip, {"arch": "gfx1201"}, "llama", vision)
-            return built, json.loads((eng / "BUILD.json").read_text()), (eng / setup.VEXE).exists()
-
-    def test_the_cpu_encoder_is_built_once(self):
-        built, meta, have = self.build({}, "cpu")
-        self.assertEqual([t for t, _ in built], ["strata-vision"])
-        self.assertIn("-DSTRATA_VISION_CUDA=OFF", built[0][1])
-        self.assertIn("-DSTRATA_PORTABLE=OFF", built[0][1])            # built for this PC (#411: portable is the default)
-        self.assertEqual((meta["vision"], meta["vision_src"], have), ("cpu", "V", True))
-        built, meta, _ = self.build({"vision": "cpu", "vision_src": "V"}, "cpu", vexe=True)
-        self.assertEqual(built, [])                                    # built and unchanged: nothing to do
-        built, meta, _ = self.build({"vision": "cpu", "vision_src": "old"}, "cpu", vexe=True)
-        self.assertEqual([t for t, _ in built], ["strata-vision"])     # its source changed: again
-
-    def test_without_images_nothing_changes(self):
-        built, meta, have = self.build({}, "none")
-        self.assertEqual((built, have), ([], False))
-        self.assertNotIn("vision_src", meta)
 
 
 class RotationalDisk(unittest.TestCase):

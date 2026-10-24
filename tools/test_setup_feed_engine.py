@@ -76,7 +76,6 @@ class FeedEngine(unittest.TestCase):
 
     def test_the_minimum_is_the_0_2_engine(self):
         self.assertLess((0, 1, 45), setup.MIN_ENGINE)
-        self.assertGreaterEqual((0, 1, 46), setup.WIN_HIP_MIN_ENGINE)
 
 
 if __name__ == "__main__":
