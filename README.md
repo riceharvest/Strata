@@ -153,9 +153,24 @@ Compute the exact B70 VRAM / Host RAM / NVMe expert placement plan with `strata_
 # Preview the B70 hardware placement plan and generated strata-dsv41 command line
 python3 -m strata_control.dsv41_fit \
   --model-dir /path/to/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF \
-  --variant 2.00bpw \
-  --ctx 32768 \
-  --ssd-cache /path/to/fast-nvme/ds4_experts.cache
+  --variant 1.75bpw \
+  --ctx 32768
+```
+
+#### Zero-SSD Execution via Dynamic Router Pruning (`--prune-experts 160`)
+DeepSeek-V4.1 has 384 experts/layer, but activation profiles show a heavy power law: the top 160 experts account for **71.0% of all activations** (and top 192 account for **77.9%**). By setting `--prune-experts 160` (or `STRATA_DS4_PRUNE_EXPERTS=160`):
+- **3,789 active experts (~28.3 GB)** fit completely in the B70's 32 GB GDDR6 VRAM.
+- The remaining **2,611 active experts (~19.5 GB)** fit 100% in Host RAM.
+- **SSD spill drops to 0 GB!** Cold experts outside the top $N$ are masked out of routing decisions with a $-10^9$ router bias, eliminating NVMe read stalls completely from the critical token decode path.
+
+```bash
+# Run with zero SSD spill on an Intel Arc Pro B70 + 64 GB RAM
+./sycl/build/strata-dsv41 \
+  --pack /path/to/DeepSeek-V4.1-Flash-1.75bpw/pack \
+  --prune-experts 160 \
+  --reserve-mib 1024 \
+  --engram-cache-mb 4096 \
+  --serve
 ```
 
 Or select **DeepSeek V4.1-Flash (`1.75bpw` / `2.00bpw` / `2.25bpw`)** interactively in `python3 sycl/setup_intel.py`.
@@ -168,6 +183,7 @@ Or select **DeepSeek V4.1-Flash (`1.75bpw` / `2.00bpw` / `2.25bpw`)** interactiv
 
 | Environment Variable | B70 Default | Description |
 | :--- | :---: | :--- |
+| `STRATA_DS4_PRUNE_EXPERTS` | `0` (off, or `160`/`192`) | Masks bottom $384 - N$ experts per layer in router logits ($-10^9$ bias). `--prune-experts 160` fits all active experts in 32 GB VRAM + 64 GB RAM with **0 GB SSD spill**. |
 | `STRATA_VERIFY_DEVICE_PLAN` | `1` (auto) | Builds the MTP speculative verify expert routing plan on the GPU (`verify_plan_build`) and uses the `lean` direct-to-`parts_out` verify graph. |
 | `STRATA_VERIFY_NO_HOST` | `1` (auto) | Keeps MTP verify MoE dispatch purely on the GPU + asynchronous PCIe DMA stager without stalling on host CPU misses. |
 | `STRATA_STAGER_THREADS` | `12` (auto) | Number of host threads copying missed experts into the pinned staging ring (`12` saturates PCIe 5.0 x16 without scheduling contention). |

@@ -3994,6 +3994,44 @@ struct Model::Impl {
                 cudaSetDevice(devs[(size_t) x.dev].id);
                 CK(cudaMemcpy(x.vram_tab, tab.data(), tab.size() * 8, cudaMemcpyHostToDevice));
             }
+            if (o.prune_experts > 0 && o.prune_experts < l.n_exp && l.gate_bias != nullptr) {
+                const int prune_n = std::max(l.k_exp, o.prune_experts);
+                if (prune_n < l.n_exp) {
+                    std::vector<float> gb((size_t) l.n_exp);
+                    cudaSetDevice(devs[(size_t) l.dev].id);
+                    CK(cudaMemcpy(gb.data(), l.gate_bias, (size_t) l.n_exp * sizeof(float), cudaMemcpyDeviceToHost));
+                    for (int i = prune_n; i < l.n_exp; ++i) {
+                        const int e = order[(size_t) i];
+                        gb[(size_t) e] = -1e9f;
+                        l.heat[(size_t) e] = -1e9f;
+                    }
+                    CK(cudaMemcpy(l.gate_bias, gb.data(), (size_t) l.n_exp * sizeof(float), cudaMemcpyHostToDevice));
+                    if (l.gate_bias_vl != nullptr) {
+                        CK(cudaMemcpy(gb.data(), l.gate_bias_vl, (size_t) l.n_exp * sizeof(float), cudaMemcpyDeviceToHost));
+                        for (int i = prune_n; i < l.n_exp; ++i) {
+                            gb[(size_t) order[(size_t) i]] = -1e9f;
+                        }
+                        CK(cudaMemcpy(l.gate_bias_vl, gb.data(), (size_t) l.n_exp * sizeof(float), cudaMemcpyHostToDevice));
+                    }
+                }
+            }
+        }
+        if (o.prune_experts > 0 && !L.empty()) {
+            const int prune_n = std::max(L[0].k_exp, std::min(o.prune_experts, L[0].n_exp));
+            double kept_hits = 0.0, total_hits = 0.0;
+            for (const Layer& l : L) {
+                const uint32_t* p = prof.data() + (size_t) l.il * g.n_exp;
+                std::vector<int> order((size_t) l.n_exp);
+                std::iota(order.begin(), order.end(), 0);
+                std::stable_sort(order.begin(), order.end(), [&](int a, int b) { return p[a] > p[b]; });
+                for (int i = 0; i < l.n_exp; ++i) {
+                    total_hits += p[i];
+                    if (i < prune_n) kept_hits += p[order[(size_t) i]];
+                }
+            }
+            const double pct = total_hits > 0 ? (kept_hits / total_hits) * 100.0 : 0.0;
+            std::fprintf(stderr, "ds4: dynamic router pruning active: keeping top %d of %d experts/layer (%.1f%% of activation profile), bottom %d masked (-1e9 bias)\n",
+                         prune_n, L[0].n_exp, pct, L[0].n_exp - prune_n);
         }
         return true;
     }
@@ -4589,7 +4627,7 @@ struct Model::Impl {
             if (l.il >= g.nl) continue;
             const uint32_t* p = prof.data() + (size_t) l.il * g.n_exp;
             for (int e = 0; e < l.n_exp; ++e)
-                if (l.slot[(size_t) e] < 0 && p[e] > 0) cand.push_back({(double) p[e] / (double) l.blob, {l.il, e}});
+                if (l.slot[(size_t) e] < 0 && p[e] > 0 && l.heat[(size_t) e] >= 0.0f) cand.push_back({(double) p[e] / (double) l.blob, {l.il, e}});
         }
         std::stable_sort(cand.begin(), cand.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
         std::vector<std::pair<int, int>> list;
