@@ -346,7 +346,8 @@ def _mtp_ready(path: Path) -> bool:
 
 
 def footprint(cfg: dict, config: Path | None = None) -> Footprint:
-    args = [str(a) for a in cfg.get("args") or []]
+    from strata_control import sycl_build
+    args = sycl_build.host_args(cfg) if sycl_build.is_sycl(cfg) else [str(a) for a in cfg.get("args") or []]   # a SYCL config names /work/... paths
     fp = Footprint(config=config)
     for flag in ("--native", "--model", "--gguf", "--ple-gguf"):
         v = _flag_value(args, flag)

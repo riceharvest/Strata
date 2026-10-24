@@ -154,7 +154,8 @@ NO_ENGINE_NEXT = ("Update Strata (`strata update`) and run `strata launch` again
 
 STAGES = ("engine", "model", "config", "tune", "start", "access")
 
-NO_ENGINE_STEP = ("run `strata update` to get the newest engines and start again; if this stays, your graphics card is not one Strata supports yet, "
+NO_ENGINE_STEP = ("build the engine on this computer with sycl/tools/build.sh in the strata-sycl-dev image (docs/INTEL.md) and start again, or run "
+                  "`strata update` for a ready-made one; if this stays, your graphics card is not one Strata supports yet, "
                   "and the model files stay on this computer for when it is")
 
 #: no graphics card Strata can use at all (an Intel UHD/Iris only, an AMD APU-only laptop, a virtual machine, Windows on ARM)
@@ -242,13 +243,16 @@ def _inside(path: Path, folder: Path) -> bool:
 
 
 def files_present(cfg: dict) -> list[str]:
-    """The model files a run config names that are missing (empty list: all there)."""
+    """The model files a run config names that are missing (empty list: all there). A SYCL config's container paths (/work/...) are checked
+    where they are on this computer."""
+    from strata_control import sycl_build
+    host = sycl_build.host_args(cfg) if sycl_build.is_sycl(cfg) else list(cfg.get("args") or [])
     missing = []
-    for tok in cfg.get("args") or []:
+    for tok in host:
         if isinstance(tok, str) and tok.lower().endswith(".gguf") and not Path(tok).exists():
             missing.append(tok)
     for flag in ("--pack", "--mtp"):
-        args = [str(a) for a in cfg.get("args") or []]
+        args = [str(a) for a in host]
         if flag == "--mtp" and flag in args and args.index(flag) + 1 < len(args) and args[args.index(flag) + 1].isdigit():
             continue                                      # Qwen3.6: a number is the draft depth, not a folder (#3298)
         if flag in args and args.index(flag) + 1 < len(args) and not Path(args[args.index(flag) + 1]).exists():
@@ -546,6 +550,12 @@ class Runner:
             self.emit("engine", "DeepSeek runs on its own engine package, so the Strata engine is not downloaded for it.", 100)
             return
         self.emit("engine", "Checking the engine for this computer…")
+        built = self.source_engine()
+        if built:                                            # the SYCL engine built from this checkout: what sycl/setup_intel.py's config runs
+            where = Path(built["exe"])
+            self.emit("engine", f"Engine {built['version']} ({built['backend']}) is built from source in this Strata folder "
+                                f"({where.parent.name}/{where.name}).", 100)
+            return
         from strata_control import engine_component as ec
         root = Path(self.components_dir) if self.components_dir else None
         report = ec.status(root)
@@ -626,6 +636,21 @@ class Runner:
             raise LaunchError("The engine could not be installed." + (f" {why}" if why else ""),
                               "Check your internet connection, or point Strata at an update source with --feed, then try again.", 6)
         self.emit("engine", "The engine is installed.", 100)
+
+    _source_engine: "dict | None | bool" = False             # not looked up yet
+
+    def source_engine(self) -> dict | None:
+        """The SYCL engine built from source in the Strata folder this Terminal runs from (sycl/tools/build.sh: build-sycl-aot/strata, run by
+        sycl/serve/strata-sycl.sh), or None. It is not a package: no update fetches it, setup (sycl/setup_intel.py) writes configs that run it,
+        and the runtime starts sycl/serve/server_intel.py for them (strata_control/sycl_build.py)."""
+        if self._source_engine is False:
+            found = None
+            src = getattr(self.catalog, "src", None)
+            if isinstance(src, (str, os.PathLike)):
+                from strata_control import sycl_build
+                found = sycl_build.find(src)
+            self._source_engine = found
+        return self._source_engine or None
 
     def needed_engine(self) -> tuple[int, ...] | None:
         """The oldest engine this model runs on, from setup.py's own tables (MIN_ENGINE for everything, GYRO_ENGINE for Gyro), or None."""
@@ -771,6 +796,10 @@ class Runner:
     def installed_state(self) -> tuple[Path | None, dict | None]:
         tag = self.catalog.tag_of(self.s.family, self.s.model)
         path = self.catalog.installed_config(tag)
+        if self.source_engine():                            # ./setup.sh --backend sycl writes strata-<tag>.json into the Strata folder itself
+            own = Path(self.catalog.src) / f"strata-{tag.lower()}.json"
+            if own.is_file():
+                path = own
         if path is None:
             return None, None
         desc = self.catalog.strata.describe_config(path)
@@ -785,7 +814,8 @@ class Runner:
             return True
         try:
             cfg = read_config(path)
-            args = [str(a) for a in cfg.get("args") or []]
+            from strata_control import sycl_build
+            args = sycl_build.host_args(cfg) if sycl_build.is_sycl(cfg) else [str(a) for a in cfg.get("args") or []]
             if s.model_path:
                 want = Path(s.model_path).expanduser().resolve()
                 folder = want if want.is_dir() else want.parent
@@ -916,12 +946,22 @@ class Runner:
                   f"Getting {title} ready (a download may be large; it continues where it stopped if interrupted)…", 0)
         argv = [self.python, str(cat.src / "setup.py"), *self.setup_args()]
         env = self._env()
-        env.update(STRATA_CONTROL_INSTALL="1", STRATA_INSTALL_DIR=str(cat.root), PYTHONNOUSERSITE="1")
         env.pop("STRATA_NEED_ENGINE", None)
-        if self.engine_problem:
-            env["STRATA_ALLOW_NO_ENGINE"] = "1"              # the person said go on: setup warns about the engine instead of stopping
-        elif not self.multi_file():                          # (DeepSeek does not use the Strata engine: nothing to require)
-            env["STRATA_NEED_ENGINE"] = "1"
+        if self.source_engine():
+            # the engine is built from source here: setup runs as `./setup.sh --backend sycl` does (sycl/setup_intel.py's engine step finds the
+            # build, and it writes strata-<tag>.json and run-<tag>.sh into the Strata folder), not in the app's installer mode, whose engine step
+            # only knows packages and whose installer may not compile the picture reader
+            script = Path(cat.src) / "setup.sh"
+            argv = (["/bin/sh", str(script)] if script.is_file() else argv[:2]) + [*self.setup_args(), "--backend", "sycl"]
+            env.update(PYTHONNOUSERSITE="1")
+            for k in ("STRATA_CONTROL_INSTALL", "STRATA_INSTALL_DIR", "STRATA_ALLOW_NO_ENGINE"):
+                env.pop(k, None)
+        else:
+            env.update(STRATA_CONTROL_INSTALL="1", STRATA_INSTALL_DIR=str(cat.root), PYTHONNOUSERSITE="1")
+            if self.engine_problem:
+                env["STRATA_ALLOW_NO_ENGINE"] = "1"          # the person said go on: setup warns about the engine instead of stopping
+            elif not self.multi_file():                      # (DeepSeek does not use the Strata engine: nothing to require)
+                env["STRATA_NEED_ENGINE"] = "1"
         for k in ("PYTHONHOME", "PYTHONPATH", "VIRTUAL_ENV"):
             env.pop(k, None)
         env["PYTHONPATH"] = str(cat.src)
@@ -1709,9 +1749,10 @@ class Runner:
                              "Nothing to download: the model is already on this computer." if gb < 0.05 else
                              f"About {gb:.1f} GB to download.")}
         try:
-            report = engine_component.status(Path(self.components_dir) if self.components_dir else None)
-            engine = bool(report.get("usable"))
-            here = [str(i.get("version")) for i in report.get("installed") or [] if i.get("version")]
+            if not self.source_engine():                     # the engine built from source here is usable as it is
+                report = engine_component.status(Path(self.components_dir) if self.components_dir else None)
+                engine = bool(report.get("usable"))
+                here = [str(i.get("version")) for i in report.get("installed") or [] if i.get("version")]
         except Exception:                                    # noqa: BLE001 - the plan must not fail on this
             pass
         if gb < 0.05:
@@ -1745,7 +1786,7 @@ class Runner:
         out: list[str] = list(self.identity_notes)
         try:
             from strata_control import engine_component as ec
-            report = ec.status(Path(self.components_dir) if self.components_dir else None)
+            report = {} if self.source_engine() else ec.status(Path(self.components_dir) if self.components_dir else None)
             if report.get("usable"):
                 stale = self.stale_engine(report["engine"].get("version"))
                 if stale:
