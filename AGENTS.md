@@ -20,11 +20,9 @@ Follow **[docs/AI_SETUP.md](docs/AI_SETUP.md)**. For an agent that has a shell, 
 1. Install the Terminal. It needs no administrator rights.
 
    ```sh
-   curl -fsSL https://github.com/Niko1221/Strata/releases/latest/download/install.sh -o install.sh && sh install.sh                  # Linux, Mac
-   irm https://github.com/Niko1221/Strata/releases/latest/download/install.ps1 | iex                         # Windows PowerShell
+   curl -fsSL https://github.com/Niko1221/Strata/releases/latest/download/install.sh -o install.sh && sh install.sh                  # Linux
    ```
 
-   On Windows, open a new terminal afterwards so that `strata` is on the PATH.
 2. Check what would happen. Nothing is changed:
 
    ```sh

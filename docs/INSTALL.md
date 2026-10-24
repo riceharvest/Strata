@@ -148,12 +148,6 @@ the build tools), and the same start: `http://127.0.0.1:8080`. Later runs of `./
 start the model directly; `./setup.sh --setup` installs another model or changes the settings. Other distributions,
 WSL and compiling: [details](DETAILS.md#linux).
 
-On Nix/NixOS, you can use the flake:
-
-```bash
-nix develop -c ./setup.sh
-```
-
 ### Build from git on Linux (to try a pull request or change the code)
 
 You do not need the app or the AppImage for this: the source install builds the engine on your PC and keeps
@@ -220,16 +214,12 @@ card, this start only). Each card keeps the experts of its own layers, and promp
 pipeline: on an RTX 5080 + RTX 3090 prompts were read 18-20% faster than on the 5080 alone, decoding on par.
 Every card must be an RTX 20 series or newer with 8 GB or more. See [MULTI_GPU.md](MULTI_GPU.md).
 
-**Several AMD cards:** setup takes one card (the one with the most VRAM, or `--gpu N`) unless you name more:
-`--gpus 1,0` splits the model's layers across them, the faster card goes last and is the Main card (`--gpu-roles 1=main,0=helper` says it yourself; docs/MULTI_GPU.md; numbers as setup lists them). A
-split pays only when no single card holds the model's experts ([AMD_HIP.md](AMD_HIP.md#rdna4-gfx1201)).
-
 ## Docker (Linux)
 
-Ready-made images for NVIDIA (CUDA 13 and CUDA 12), AMD (RX 9000 / R9700 and RX 7000) and Intel Arc cards, with the Terminal
+Ready-made images for Intel Arc cards (the SYCL engine), with the Terminal
 inside: `docker run` one command, the model downloads on the first start into a volume, nothing is compiled on your computer.
-Which image for which card, the commands, Docker Compose, the API key, updating and troubleshooting: [DOCKER.md](DOCKER.md).
-Building from source: `docker build -t strata:src .` (CUDA 13; [DOCKER.md](DOCKER.md#build-it-yourself)).
+The commands, Docker Compose, the API key, updating and troubleshooting: [DOCKER.md](DOCKER.md). Building the engine
+from source: `docker build --pull -t strata-sycl-dev sycl/tools`, then `sycl/tools/build.sh` in that image ([B70.md](B70.md)).
 
 ## Older CPUs (experimental)
 
