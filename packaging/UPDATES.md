@@ -31,14 +31,14 @@ Two separate private keys, both kept by the owner, neither in git, neither the s
   "generated_at": "2026-10-20T10:00:00Z", "expires_at": "2027-10-20T10:00:00Z",   // expires_at may be null
   "app": {                                  // exactly Tauri's static updater JSON, plus sha256/size per platform
     "version": "0.2.0", "notes": "...", "pub_date": "2026-10-20T10:00:00Z",
-    "platforms": {"windows-x86_64": {"url": "app/Strata_0.2.0_x64-setup.exe", "signature": "<minisign, base64>", "sha256": "...", "size": 71000000}}
+    "platforms": {"linux-x86_64": {"url": "app/Strata-0.2.0-linux-update.AppImage", "signature": "<minisign, base64>", "sha256": "...", "size": 71000000}}
   },
   "control": {"version": "0.1.48", "packages": [{"platform": "linux-x86_64", "format": "tar.gz", "url": "control/...tar.gz",
                                                   "size": 0, "sha256": "...", "installed_bytes": 0, "entry": "strata.py"}]},
   "engine": {"packages": [{
-    "version": "0.1.48", "platform": "linux-x86_64", "backend": "cuda", "variant": "cuda13",
-    "archs": ["sm_75", "sm_86", "sm_89", "sm_120", "compute_120"], "min_driver": {"nvidia": "580.65"}, "min_runtime": null,
-    "build_id": "be885026f96a-cuda13.0", "format": "tar.gz", "url": "engine/strata-engine-0.1.48-linux-x86_64-cuda-cuda13.tar.gz",
+    "version": "0.1.48", "platform": "linux-x86_64", "backend": "sycl",
+    "archs": ["intel-arc"], "min_driver": {}, "min_runtime": null,
+    "build_id": "be885026f96a-oneapi2026.1", "format": "tar.gz", "url": "engine/strata-engine-0.1.48-linux-x86_64-sycl.tar.gz",
     "size": 505568970,                      // bytes of the archive
     "sha256": "...",                        // of the archive
     "manifest_sha256": "...",               // of the package's engine-component.json (it holds every file's hash)
@@ -55,9 +55,7 @@ For a GitHub release the assets are flat: pack with `--url-prefix ""` and upload
 1. the signature of the feed (key ids it trusts: `strata_control/update_keys.json`, plus `STRATA_UPDATE_TRUSTED_KEYS` for a test setup, which
    the CLI announces);
 2. `channel`, `expires_at`, and `sequence` not lower than the last accepted feed (the downgrade guard for a replayed old feed);
-3. the engine package that fits **this** PC (`feed.select_engine`): platform, backend (CUDA / HIP / SYCL / Metal as detected),
-   CUDA `archs` against the card (a `compute_NN` PTX entry covers newer cards), HIP `archs` against the card's gfx name,
-   `min_driver` against the NVIDIA driver (this is how CUDA 13 beats CUDA 12 on a new driver and CUDA 12 is chosen on an old one),
+3. the engine package that fits **this** PC (`feed.select_engine`): platform, backend (SYCL for an Intel Arc card), `min_driver`,
    `min_runtime` against Control; newest version wins, and equal versions prefer the build that needs the newer driver;
 4. never older than what is installed (an update never downgrades; only `strata components rollback` goes back).
 
@@ -118,64 +116,41 @@ All signing happens on the release PC, on the finished files.
 
 **What is built (per OS)**
 
-* *Full installers* (the first download, engine inside): Windows `cuda13`, `cuda12`, `rx9070`; Linux `nvidia-cuda13`, `nvidia-cuda12`, `amd-rx9070`,
-  `amd-rx7900`; Mac `dmg`. Each carries ONE signed engine package in `engine-bundle/` (the Mac one unsigned, see below).
-* *Update installers* (the only files `latest.json` names): built with `--config src-tauri/tauri.update.conf.json`, which drops `engine-bundle`.
-  Windows: `Strata-0.2.3-windows-update.exe`; Linux: the base AppImage before the engines are repacked into it
-  (`Strata-0.2.3-linux-update.AppImage`); Mac: `Strata.app.tar.gz` (the Metal engine is 2 MB and there is one Mac variant, so it stays inside).
-  Why: an app update must not carry an engine. One `latest.json` entry per OS goes to every variant, and a CUDA installer on an AMD PC
-  would copy a useless CUDA engine beside the AMD one (`bundled-engine.test.mjs`). Engines come per card from the signed feed
-  (`feed.select_engine`: platform, backend, CUDA `archs` and `min_driver`, HIP `archs`; `tests/terminal/test_release_matrix.py`).
+* *Full installers* (the first download, engine inside): the Linux AppImage with the Intel Arc (SYCL) engine. It carries ONE signed
+  engine package in `engine-bundle/`.
+* *Update installers* (the only files `latest.json` names): built with `--config src-tauri/tauri.update.conf.json`, which drops `engine-bundle`:
+  the base AppImage before the engine is repacked into it (`Strata-0.2.3-linux-update.AppImage`).
+  Why: an app update must not carry an engine. Engines come from the signed feed (`feed.select_engine`; `tests/terminal/test_release_matrix.py`).
 
 **Steps**
 
-    python packaging/feed_tool.py sign-package <engine package folder> --key <feed-key.json>        # every engine package (the Mac app bundles its UNSIGNED copy)
+    python packaging/feed_tool.py sign-package <engine package folder> --key <feed-key.json>        # every engine package
     python packaging/feed_tool.py pack-engine  <engine package folder> --out RELEASE/engine --url-prefix=
-    python packaging/feed_tool.py pack-control <control folder> --version 0.1.48 --platform P --out RELEASE/control --url-prefix=   # --format zip for windows-x86_64
-    # --url-prefix= (not --url-prefix "") because PowerShell 5.1 drops an empty argument. The Control version is the VERSION file
-    # (0.1.48), not the app version: a Control package newer than the installed one is installed by `strata update`.
-    # Pack Linux and Mac packages on Linux / the Mac or on Windows with this tool: it sets the execute bit from the file header either way.
-    cd apps/desktop && npx tauri build --bundles nsis                                               # Windows full installers: engine-bundle holds the one signed package
-    cd apps/desktop && npx tauri build --bundles nsis --config src-tauri/tauri.update.conf.json    # Windows update installer
-    # Linux: tauri build --bundles appimage (no engine) is the update AppImage; repack-appimage.sh puts an engine package into a copy for each full AppImage
-    # on the release PC, per updater artifact (Windows update .exe, Linux update .AppImage, Mac Strata.app.tar.gz):
+    python packaging/feed_tool.py pack-control <control folder> --version 0.1.48 --platform P --out RELEASE/control --url-prefix=   # --platform linux-x86_64
+    # The Control version is the VERSION file (0.1.48), not the app version: a Control package newer than the installed one is
+    # installed by `strata update`.
+    # tauri build --bundles appimage (no engine) is the update AppImage; repack-appimage.sh puts an engine package into a copy for the full AppImage
+    # on the release PC, for the update .AppImage:
     npx tauri signer sign -f <path to tauri-updater.key> <artifact>                                 # writes <artifact>.sig
-    python packaging/feed_tool.py set-app-platform --app-json RELEASE/tauri-latest.json --target windows-x86_64 --version 0.2.3 --archive <update .exe> --sig <update .exe.sig> --notes "..."
-    python packaging/feed_tool.py set-app-platform --app-json RELEASE/tauri-latest.json --target linux-x86_64   --version 0.2.3 --archive <update .AppImage> --sig <update .AppImage.sig>
-    python packaging/feed_tool.py set-app-platform --app-json RELEASE/tauri-latest.json --target darwin-aarch64 --version 0.2.3 --archive Strata.app.tar.gz --sig Strata.app.tar.gz.sig
+    python packaging/feed_tool.py set-app-platform --app-json RELEASE/tauri-latest.json --target linux-x86_64 --version 0.2.3 --archive <update .AppImage> --sig <update .AppImage.sig>
     python packaging/feed_tool.py build-feed --out RELEASE --sequence N --key <feed-key.json> --engine RELEASE/engine --control RELEASE/control --app-json RELEASE/tauri-latest.json
     python packaging/feed_tool.py verify-feed RELEASE --pub <feed-key.pub.json>
 
 `set-app-platform` checks each `.sig` against the public key in `tauri.conf.json` over the exact bytes, so a file signed with another key, or changed after
 signing, stops the release. The full installers are not in `latest.json` and need no Tauri signature (they are downloaded by hand).
 
-### The Mac app
+The Linux AppImage needs no extra step: its `.sig` file from `tauri build` is the one to pass to `set-app-platform`.
 
-`tauri build` signs its installers with the Tauri key before anything else touches them. On a Mac that is too early: `sign-and-notarize.sh` then re-signs every
-Mach-O in the app with the Developer ID and notarises and staples it, which changes the bytes. The `Strata.app.tar.gz` and `.sig` that `tauri build` wrote hold the
-**unsigned, un-notarised** app, and the updater would install exactly that on a user's Mac. So the in-app Mac update is built from the finished app instead:
-
-1. `sign-and-notarize.sh <dmg> --updater-archive` (on the Mac) packs the signed, notarised, stapled `.app` into `Strata.app.tar.gz` (the app folder at the root, the layout
-   Tauri's bundler makes), unpacks it again and checks `codesign`, the staple and `spctl`. It never reads the Tauri key.
-2. Move the `.tar.gz` to the release PC and sign it there with `npx tauri signer sign -f <key> Strata.app.tar.gz` (or `TAURI_SIGNING_PRIVATE_KEY_PATH` and the password variable).
-   The key stays on the PC and in the owner's safe storage; nothing in this tree reads or stores it, and the Mac needs no node and no key.
-3. `feed_tool.py set-app-platform` checks that signature against the public key in `tauri.conf.json` over the exact archive bytes, checks the archive holds `<Name>.app` at its root,
-   and writes `url`, `signature`, `sha256` and `size` of the darwin entry. A signature that was made for the pre-notarisation file does not verify, so it cannot be published by mistake.
-4. `build-feed --app-json` and `verify-feed` as above. Upload the notarised `Strata.dmg`, `Strata.app.tar.gz`, and the `latest.json` from the feed folder (`app/latest.json`).
-
-The Windows installer and the Linux AppImage need no extra step: their `.sig` files from `tauri build` are the ones to pass to `set-app-platform`. Re-signing the Mac app after the archive
-was made (a second `sign-and-notarize.sh` run) makes a new archive: sign and add it again.
-
-`build-feed` also writes `RELEASE/install-manifest.txt`, the file the one-line installers read (`install.sh` L76, `install.ps1` L45): one line per Control package,
+`build-feed` also writes `RELEASE/install-manifest.txt`, the file the one-line installer reads (`install.sh`): one line per Control package,
 `platform version url sha256 size`, taken from the `*.entry.json` files in `RELEASE/control`. The Control package is the Terminal that `install.sh` unpacks (it must hold `bin/strata`).
-`install.sh` unpacks with `tar -xzf` and `install.ps1` with `Expand-Archive`, so `windows-x86_64` must be packed with `--format zip` and the other platforms as `tar.gz`;
-`build-feed` leaves a pack in the wrong format out of the manifest and says so. Pack Control for every platform you want the one-line install to cover (`install.sh` knows `linux-x86_64` and `macos-arm64`, `install.ps1` `windows-x86_64`);
-a platform with no line gets "this release has no Terminal for <platform>". Upload `install.sh` and `install.ps1` from `packaging/` unchanged: their built-in address is the release folder.
+`install.sh` unpacks with `tar -xzf`, so pack Control as `tar.gz` (`build-feed` leaves a pack in the wrong format out of the manifest and says so).
+`install.sh` knows `linux-x86_64`; a platform with no line gets "this release has no Terminal for <platform>". Upload `install.sh` from `packaging/`
+unchanged: its built-in address is the release folder.
 
 The feed is hosted as the files of a GitHub release of `Niko1221/Strata`. The built-in address is
 `https://github.com/Niko1221/Strata/releases/latest/download` (`strata_cli/update_cmd.py` `DEFAULT_FEED` adds `/strata-feed.json`; `install.sh`
-and `install.ps1` use the folder). GitHub assets are flat, so build the packages with `--url-prefix ""` and upload every file of the release folder
-as an asset: `strata-feed.json`, `strata-feed.json.sig`, `install-manifest.txt`, `install.sh`, `install.ps1`, the engine and Control archives and the
+uses the folder). GitHub assets are flat, so build the packages with `--url-prefix ""` and upload every file of the release folder
+as an asset: `strata-feed.json`, `strata-feed.json.sig`, `install-manifest.txt`, `install.sh`, the engine and Control archives and the
 app installer with `latest.json` (the Tauri updater endpoint). `STRATA_FEED` (installers) and `--feed` / `STRATA_UPDATE_FEED` (`strata update`) override the
 address. Nothing in this tree uploads anything.
 

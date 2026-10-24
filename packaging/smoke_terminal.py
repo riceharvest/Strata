@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Smoke-test a terminal archive in a clean environment.
 
-    python packaging/smoke_terminal.py release/artifacts/strata-terminal-0.1.45-windows-x86_64.zip [--json out.json]
+    python packaging/smoke_terminal.py release/artifacts/strata-terminal-0.1.45-linux-x86_64.tar.gz [--json out.json]
 
 The archive is extracted into a fresh folder whose name has a space in it (so a moved or awkward path is part of
 the test), and every command runs with a PATH that holds no Python (Windows: System32 only; POSIX: a folder with

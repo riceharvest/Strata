@@ -8,7 +8,7 @@ decides). Nothing is uploaded by this tool.
 Typical use (the owner's offline machine; replace ``KEYDIR`` with a folder that is NOT in a git checkout):
 
     python packaging/feed_tool.py keygen --out KEYDIR                      # once: feed-key.json (SECRET) + feed-key.pub.json
-    python packaging/feed_tool.py sign-package <components>/engine/0.1.46-linux-x86_64-cuda --key KEYDIR/feed-key.json
+    python packaging/feed_tool.py sign-package <components>/engine/0.1.46-linux-x86_64-sycl --key KEYDIR/feed-key.json
     python packaging/feed_tool.py pack-engine  <that folder> --out RELEASE/engine           # archive + <name>.entry.json
     python packaging/feed_tool.py pack-control <control bundle folder> --version 0.1.46 --platform linux-x86_64 --out RELEASE/control
     python packaging/feed_tool.py build-feed --out RELEASE --sequence 12 --key KEYDIR/feed-key.json \
