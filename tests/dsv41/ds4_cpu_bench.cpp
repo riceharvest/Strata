@@ -8,7 +8,7 @@
 // that node's physical cores (CPU i is on node i % 2 here, CPUs 0..43 the physical cores), each call computing
 // --per-call experts' gate and up (all columns) from one activation: the time of a matrix pass and its GB/s.
 #include "strata/dsv41/exl3_cpu.hpp"
-#include "../../src/dsv41/ds4_pool.hpp"
+#include "../../sycl/src/dsv41/ds4_pool.hpp"
 
 #include <sys/mman.h>
 #include <sys/syscall.h>

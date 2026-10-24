@@ -12,8 +12,8 @@
 // experts, so the weights come from RAM, not the cache.  Prints the weights' GB/s for each kernel x tokens x threads
 // (T tokens a call: each row read once for up to 8 of them), the int8 tiers' agreement with the scalar tier, and the
 // cost of the activation quant and of madvise(WILLNEED) on cached pages.
-#include "../../src/dsv41/ds4_gguf_cpu.hpp"
-#include "../../src/dsv41/ds4_pool.hpp"
+#include "../../sycl/src/dsv41/ds4_gguf_cpu.hpp"
+#include "../../sycl/src/dsv41/ds4_pool.hpp"
 
 #if defined(STRATA_NATIVE_EXPERTS)
 #include "ggml-cpu.h"
