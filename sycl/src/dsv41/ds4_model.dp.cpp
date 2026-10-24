@@ -3891,16 +3891,40 @@ struct Model::Impl {
             std::fprintf(stderr, "ds4: Windows' commit has room for the GPU's experts (%.1f GB beside %.0f GB for the other "
                                  "programs)\n", room0 / 1e9, commit_margin() / 1e9);
         }
+        // --prune-experts (opt-in, CHANGES THE ANSWERS): the trunk's routed layers only (the drafter's mtp layers keep all their
+        // experts and take none of the budget), each layer's coldest experts by the profile masked out of the router
+        auto prunable = [](const Layer& l) { return !l.mtp && l.n_exp > 0 && l.gate_bias != nullptr; };
+        if (o.prune_experts > 0) {
+            // without a profile row for a layer (no profile, `none`, a profile of another size) its "coldest" experts
+            // would be its last indices: refuse rather than mask experts by number
+            for (const Layer& l : L) {
+                if (!prunable(l)) continue;
+                const uint32_t* p = prof.data() + (size_t) l.il * g.n_exp;
+                uint64_t sum = 0;
+                for (int e = 0; e < l.n_exp; ++e) sum += p[e];
+                if (sum == 0) {
+                    std::fprintf(stderr, "ds4: --prune-experts %d refused: the expert profile has no hits for layer %d (%s); "
+                                         "running with every expert\n",
+                                 o.prune_experts, l.il, o.profile.empty() ? "no profile" : o.profile.c_str());
+                    o.prune_experts = 0;
+                    break;
+                }
+            }
+        }
+        if (o.prune_experts > 0)
+            std::fprintf(stderr, "ds4: WARNING: --prune-experts %d masks the router's coldest experts: the answers change (a "
+                                 "token's pick of a masked expert goes to another one); the quality cost is not measured\n",
+                         o.prune_experts);
         std::vector<int> prune_alloc(L.size(), 0);
         if (o.prune_experts > 0 && !L.empty()) {
             int n_moe = 0;
             for (const Layer& l : L)
-                if (l.n_exp > 0 && l.gate_bias != nullptr) ++n_moe;
+                if (prunable(l)) ++n_moe;
             if (n_moe > 0) {
                 const int target_budget = std::min(o.prune_experts, L[0].n_exp) * n_moe;
                 std::vector<std::vector<double>> cum_p(L.size());
                 for (const Layer& l : L) {
-                    if (l.n_exp <= 0 || l.gate_bias == nullptr) continue;
+                    if (!prunable(l)) continue;
                     const uint32_t* p = prof.data() + (size_t) l.il * g.n_exp;
                     std::vector<uint32_t> sorted_p(p, p + l.n_exp);
                     std::sort(sorted_p.begin(), sorted_p.end(), std::greater<uint32_t>());
@@ -3920,7 +3944,7 @@ struct Model::Impl {
                     const double mid = 0.5 * (low + high);
                     int needed = 0;
                     for (const Layer& l : L) {
-                        if (l.n_exp <= 0 || l.gate_bias == nullptr) continue;
+                        if (!prunable(l)) continue;
                         const auto& c = cum_p[(size_t) l.il];
                         auto it = std::lower_bound(c.begin(), c.end(), mid);
                         int idx = (int) std::distance(c.begin(), it) + 1;
@@ -3931,7 +3955,7 @@ struct Model::Impl {
                 }
                 int cur_budget = 0;
                 for (const Layer& l : L) {
-                    if (l.n_exp <= 0 || l.gate_bias == nullptr) continue;
+                    if (!prunable(l)) continue;
                     const auto& c = cum_p[(size_t) l.il];
                     auto it = std::lower_bound(c.begin(), c.end(), low);
                     int idx = (int) std::distance(c.begin(), it) + 1;
@@ -3942,7 +3966,7 @@ struct Model::Impl {
                     int best_l = -1;
                     double min_cov = 2.0;
                     for (const Layer& l : L) {
-                        if (l.n_exp <= 0 || l.gate_bias == nullptr || prune_alloc[(size_t) l.il] >= l.n_exp) continue;
+                        if (!prunable(l) || prune_alloc[(size_t) l.il] >= l.n_exp) continue;
                         const double cov = cum_p[(size_t) l.il][(size_t) (prune_alloc[(size_t) l.il] - 1)];
                         if (cov < min_cov) { min_cov = cov; best_l = l.il; }
                     }
@@ -3954,7 +3978,7 @@ struct Model::Impl {
                     int best_l = -1;
                     double max_cov = -1.0;
                     for (const Layer& l : L) {
-                        if (l.n_exp <= 0 || l.gate_bias == nullptr || prune_alloc[(size_t) l.il] <= l.k_exp) continue;
+                        if (!prunable(l) || prune_alloc[(size_t) l.il] <= l.k_exp) continue;
                         const double cov = cum_p[(size_t) l.il][(size_t) (prune_alloc[(size_t) l.il] - 1)];
                         if (cov > max_cov) { max_cov = cov; best_l = l.il; }
                     }
@@ -4068,22 +4092,19 @@ struct Model::Impl {
                 CK(cudaMemcpy(x.vram_tab, tab.data(), tab.size() * 8, cudaMemcpyHostToDevice));
             }
             const int prune_n = prune_alloc[(size_t) l.il];
-            if (prune_n > 0 && prune_n < l.n_exp && l.gate_bias != nullptr) {
+            if (prune_n > 0 && prune_n < l.n_exp && prunable(l)) {
+                for (int i = prune_n; i < l.n_exp; ++i) l.heat[(size_t) order[(size_t) i]] = -1e9f;
+                // every member of a group routes with its own copy of the biases: each one masked the same
                 std::vector<float> gb((size_t) l.n_exp);
-                cudaSetDevice(devs[(size_t) l.dev].id);
-                CK(cudaMemcpy(gb.data(), l.gate_bias, (size_t) l.n_exp * sizeof(float), cudaMemcpyDeviceToHost));
-                for (int i = prune_n; i < l.n_exp; ++i) {
-                    const int e = order[(size_t) i];
-                    gb[(size_t) e] = -1e9f;
-                    l.heat[(size_t) e] = -1e9f;
-                }
-                CK(cudaMemcpy(l.gate_bias, gb.data(), (size_t) l.n_exp * sizeof(float), cudaMemcpyHostToDevice));
-                if (l.gate_bias_vl != nullptr) {
-                    CK(cudaMemcpy(gb.data(), l.gate_bias_vl, (size_t) l.n_exp * sizeof(float), cudaMemcpyDeviceToHost));
-                    for (int i = prune_n; i < l.n_exp; ++i) {
-                        gb[(size_t) order[(size_t) i]] = -1e9f;
+                for (int m = 0; m < l.nm; ++m) {
+                    Layer& x = member(l, m);
+                    cudaSetDevice(devs[(size_t) x.dev].id);
+                    for (float* b : {x.gate_bias, x.gate_bias_vl}) {
+                        if (b == nullptr) continue;
+                        CK(cudaMemcpy(gb.data(), b, (size_t) l.n_exp * sizeof(float), cudaMemcpyDeviceToHost));
+                        for (int i = prune_n; i < l.n_exp; ++i) gb[(size_t) order[(size_t) i]] = -1e9f;
+                        CK(cudaMemcpy(b, gb.data(), (size_t) l.n_exp * sizeof(float), cudaMemcpyHostToDevice));
                     }
-                    CK(cudaMemcpy(l.gate_bias_vl, gb.data(), (size_t) l.n_exp * sizeof(float), cudaMemcpyHostToDevice));
                 }
             }
         }
@@ -4092,7 +4113,7 @@ struct Model::Impl {
             double min_layer_cov = 1.0, max_layer_cov = 0.0;
             int min_k = L[0].n_exp, max_k = 0, total_k = 0;
             for (const Layer& l : L) {
-                if (l.n_exp <= 0 || l.gate_bias == nullptr) continue;
+                if (!prunable(l)) continue;
                 const int pn = prune_alloc[(size_t) l.il] > 0 ? prune_alloc[(size_t) l.il] : l.n_exp;
                 min_k = std::min(min_k, pn);
                 max_k = std::max(max_k, pn);
@@ -9133,6 +9154,8 @@ struct Model::Impl {
 
     void save_profile() const {
         if (o.profile.empty()) return;
+        // (a pruned run never routes to its masked experts: their counts would only fall behind, so the profile is kept as it was)
+        if (o.prune_experts > 0) return;
         const std::string tmp = o.profile + ".tmp";
         std::FILE* f = std::fopen(tmp.c_str(), "wb");
         if (f == nullptr) return;

@@ -43,7 +43,8 @@ struct Options {
     int disk_skip_from = 0;           // layers from which disk_skip_w takes effect
     int engram_cache_mb = -1;         // < 0: auto (scaled to RAM, up to 4096 MB), 0: off, > 0: exact MB
     int engram_threads = -1;          // < 0: auto (32 on Linux NVMe), > 0: exact reader thread count
-    int prune_experts = 0;            // 0: off (all 384 experts), >0: keep only top N experts per layer (e.g. 160 or 192)
+    int prune_experts = 0;            // 0: off; > 0 CHANGES THE ANSWERS (opt-in): about N experts per trunk layer kept, the
+                                      // profile's coldest masked out of the router; refused without a profile
     // dspark_auto: the drafter is loaded only where the routed experts fit the GPUs (more than 1.5x what they have, the verify rounds
     // read 3.3x the bytes of a token and measured no faster than plain decoding, and the drafter's 7 GB of experts take the VRAM the
     // trunk's hottest would have had); --dspark on / off / none says it outright
