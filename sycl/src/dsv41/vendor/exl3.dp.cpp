@@ -591,7 +591,7 @@ __device__ __forceinline__ bool pair_last(unsigned* cnt, int& last) {
 __device__ __forceinline__ float combine(const float* plan_w, const float* p, int k, const float* cpu_part, float sh) {
     float m = 0.0f;
     for (int i = 0; i < k; ++i) m = __fmaf_rn(plan_w[i], p[i], m);
-    if (cpu_part != nullptr) m = __fadd_rn(m, *cpu_part);
+    if (cpu_part != nullptr) m = __fadd_rn(m, ds4_ld_mapped(cpu_part));   // (the CPU lane's row: host-mapped)
     return __fadd_rn(m, sh);
 }
 
@@ -650,7 +650,7 @@ __global__ void EXL3_BOUNDS(kMinBlocksX<K>) moe_down_kernel(const KMoe a) {
         const int r = g * kCols + threadIdx.x;
         float p[8];
         for (int i = 0; i < a.k; ++i) p[i] = *(volatile const float*) &a.part[(size_t) i * a.n_embd + r];
-        a.out[r] = combine(a.plan_w, p, a.k, a.cpu_flag != nullptr && *a.cpu_flag ? a.cpu_part + r : nullptr,
+        a.out[r] = combine(a.plan_w, p, a.k, a.cpu_flag != nullptr && ds4_ld_flag(a.cpu_flag) ? a.cpu_part + r : nullptr,
                            a.sh_out != nullptr ? a.sh_out[r] : 0.0f);
     }
     if (threadIdx.x == 0) a.cnt[g] = 0u;
@@ -746,16 +746,13 @@ __global__ void __launch_bounds__(kCols) win_combine_kernel(const KWin a) {
     }
     a.out[(size_t) t * a.out_stride + r] =
         combine(a.plan_w + t * 8, p, a.k,
-                a.cpu_flag != nullptr && a.cpu_flag[t] ? a.cpu_part + (size_t) t * a.cpu_stride + r : nullptr,
+                a.cpu_flag != nullptr && ds4_ld_flag(a.cpu_flag + t) ? a.cpu_part + (size_t) t * a.cpu_stride + r : nullptr,
                 a.sh_out != nullptr ? a.sh_out[(size_t) t * a.n_embd + r] : 0.0f);
 }
 
-__global__ void win_wait_kernel(const unsigned* p, unsigned v) {
+__global__ void win_wait_kernel(const unsigned* p, unsigned v, uint32_t spin_max) {
     if (threadIdx.x != 0) return;
-    while (*(volatile const unsigned*) p != v) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
-        __nanosleep(200);
-#endif
+    for (uint32_t spin = 0; spin < spin_max && ds4_ld_flag(p) != v; ++spin) {
     }
     __threadfence_system();
 }
@@ -1584,7 +1581,7 @@ bool win_experts(const WinArgs& a, cudaStream_t s) {
     if (!dispatch<RunWin>(a.lay.K[0], a.lay.cb, w, groups, s) ||
         !dispatch<RunWinDown>(a.lay.K[2], a.lay.cb, w, groups, s))
         return false;
-    if (a.wait_ptr != nullptr) STRATA_LAUNCH(s, 1, 32, 0, win_wait_kernel, a.wait_ptr, a.wait_val);
+    if (a.wait_ptr != nullptr) STRATA_LAUNCH(s, 1, 32, 0, win_wait_kernel, a.wait_ptr, a.wait_val, ds4_spin_max(s));
     STRATA_LAUNCH(s, dim3((unsigned) (a.n_embd / kCols), (unsigned) a.T), kCols, 0, win_combine_kernel, w);
     launch_check("win_experts");
     return true;

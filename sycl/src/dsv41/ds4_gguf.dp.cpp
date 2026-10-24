@@ -163,7 +163,7 @@ __device__ __forceinline__ float swiglu(float gv, float uv, float limit) {
 __device__ __forceinline__ float combine(const float* plan_w, const float* p, int k, const float* cpu_part, float sh) {
     float m = 0.0f;
     for (int i = 0; i < k; ++i) m = __fmaf_rn(plan_w[i], p[i], m);
-    if (cpu_part != nullptr) m = __fadd_rn(m, *cpu_part);
+    if (cpu_part != nullptr) m = __fadd_rn(m, ds4_ld_mapped(cpu_part));   // (the CPU lane's row: host-mapped)
     return __fadd_rn(m, sh);
 }
 
@@ -578,16 +578,13 @@ __global__ void __launch_bounds__(128) mx_combine_kernel(const CombArgs a) {
     }
     a.out[(size_t) t * a.out_stride + r] =
         combine(a.plan_w + t * 8, p, a.k,
-                a.cpu_flag != nullptr && a.cpu_flag[t] ? a.cpu_part + (size_t) t * a.cpu_stride + r : nullptr,
+                a.cpu_flag != nullptr && ds4_ld_flag(a.cpu_flag + t) ? a.cpu_part + (size_t) t * a.cpu_stride + r : nullptr,
                 a.sh_out != nullptr ? a.sh_out[(size_t) t * a.n_embd + r] : 0.0f);
 }
 
-__global__ void mx_wait_kernel(const unsigned* p, unsigned v) {
+__global__ void mx_wait_kernel(const unsigned* p, unsigned v, uint32_t spin_max) {
     if (threadIdx.x != 0) return;
-    while (*(volatile const unsigned*) p != v) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
-        __nanosleep(200);
-#endif
+    for (uint32_t spin = 0; spin < spin_max && ds4_ld_flag(p) != v; ++spin) {
     }
     __threadfence_system();
 }
@@ -1287,7 +1284,7 @@ bool win_experts(const x3::WinArgs& a, cudaStream_t s) {
     q8_quant(a.h, (size_t) a.n_ff, a.T * 8, a.n_ff, sc->hq, sc->hd, s);   // (rows of picks not on the device: unused)
     if (mx) launch_groups<DownK>(m, a.n_embd, groups, a.T, s);
     else iq::down(ia, groups, a.T, s);
-    if (a.wait_ptr != nullptr) STRATA_LAUNCH(s, 1, 32, 0, mx_wait_kernel, a.wait_ptr, a.wait_val);
+    if (a.wait_ptr != nullptr) STRATA_LAUNCH(s, 1, 32, 0, mx_wait_kernel, a.wait_ptr, a.wait_val, ds4_spin_max(s));
     CombArgs c{};
     c.plan_ptr = a.plan_ptr;
     c.plan_w = a.plan_w;

@@ -12,6 +12,7 @@
 #include <dpct/dpct.hpp>
 #include <dpct/blas_utils.hpp>
 #include "strata/sycl_queue.hpp"
+#include "strata/sycl_doorbell.hpp"
 #include "strata/sycl_math.hpp"
 
 #include <algorithm>
@@ -874,3 +875,43 @@ inline void strata_launch_impl(cudaStream_t s, dim3 grid, dim3 block, size_t shm
         std::apply([_slm](const auto&... _ds4_a) { kernel(_ds4_a..., _slm); }, _ds4_args); \
     })
 
+// ---------------------------------------------------------------- host-mapped hand-offs (docs/INTEL.md: "Host-mapped flags",
+// "Bounded spins")
+// A volatile load of memory the host or another device writes is served from the GPU's caches on Intel, and a spin on it never
+// ends - the xe driver then resets the GT and the card stays wedged.  Every flag goes through the main engine's uncached
+// sys_load / sys_store, payloads through the same hints a 32-bit word at a time, and every spin is bounded: on the bound it
+// goes on, as the main engine's doorbell waits do.
+__dpct_inline__ unsigned ds4_ld_flag(const void* p) { return strata::sys_load((const volatile uint32_t*) p); }
+__dpct_inline__ void ds4_st_flag(void* p, unsigned v) { strata::sys_store((volatile uint32_t*) p, v); }
+template <class T>
+__dpct_inline__ T ds4_ld_mapped(const T* p) {
+    static_assert(sizeof(T) % 4 == 0, "32-bit words");
+    T v;
+    uint32_t* d = reinterpret_cast<uint32_t*>(&v);
+#pragma unroll
+    for (int i = 0; i < (int) (sizeof(T) / 4); ++i) d[i] = strata::sys_load_mapped(reinterpret_cast<const uint32_t*>(p) + i);
+    return v;
+}
+template <class T>
+__dpct_inline__ void ds4_st_mapped(T* p, const T& v) {
+    static_assert(sizeof(T) % 4 == 0, "32-bit words");
+    const uint32_t* w = reinterpret_cast<const uint32_t*>(&v);
+#pragma unroll
+    for (int i = 0; i < (int) (sizeof(T) / 4); ++i) strata::sys_store_mapped(reinterpret_cast<uint32_t*>(p) + i, w[i]);
+}
+// The bound, in reads, passed to each spinning kernel by its launcher.  strata::spin_max picks 20,000 on an xe card for the main
+// engine's device-plan windows, which spin only when something failed; here the GPU waits for the CPU lane's experts at every
+// layer, which can take tens of milliseconds when they come from the SSD, and a spin that gives up goes on without them (the
+// A-series failure spin_max describes).  So these take the main engine's other bound, 2,000,000 reads (a few seconds);
+// STRATA_SPIN_MAX or -DSTRATA_SYCL_SPIN_MAX set it through strata::spin_max.
+inline uint32_t ds4_spin_max(cudaStream_t s) {
+#ifdef STRATA_SYCL_SPIN_MAX
+    return strata::spin_max(*strata::q_of(s));
+#else
+    static const bool env = [] {
+        const char* e = std::getenv("STRATA_SPIN_MAX");
+        return e != nullptr && std::atol(e) > 0;
+    }();
+    return env ? strata::spin_max(*strata::q_of(s)) : 2000000u;
+#endif
+}
