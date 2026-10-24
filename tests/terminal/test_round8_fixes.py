@@ -44,34 +44,6 @@ class EngineExitIsExplained(unittest.TestCase):
         self.assertIn("render group", nxt)
         self.assertIn(str(log), nxt)
 
-    def test_a_gpu_runtime_start_failure_gets_a_plain_sentence_and_keeps_the_runtime_text_out_of_it(self):
-        cfg, log = self.config_with_log(["strata generate: loading", "terminate called after throwing an instance of 'rocr::AMD::hsa_exception'",
-                                         "  what():  "])
-        text, nxt = R.explain_engine_exit({"state": "failed", "error": "server_exited", "engine_exit_code": 134}, cfg)
-        self.assertIn("stopped while it was loading the model (exit code 134)", text)
-        self.assertNotIn("hsa_exception", text + nxt)
-        self.assertNotIn("terminate called", text + nxt)
-        self.assertIn("graphics card was not ready yet", nxt)
-        self.assertIn("wait a few seconds", nxt)
-        self.assertIn("restart the PC", nxt)
-        self.assertIn(str(log), nxt)
-        text, nxt = R.explain_engine_exit({"error": "server_exited", "engine_exit_code": 134,
-                                           "log_tail": "terminate called after throwing an instance of 'rocr::AMD::hsa_exception' | what():"}, None)
-        self.assertNotIn("hsa_exception", text)
-        self.assertIn("graphics card was not ready yet", nxt)
-
-    def test_a_real_cause_in_the_same_log_wins_over_the_gpu_runtime_start_failure(self):
-        cfg, log = self.config_with_log(["strata generate: CUDA error: out of memory",
-                                         "terminate called after throwing an instance of 'rocr::AMD::hsa_exception'", "  what():  "])
-        text, nxt = R.explain_engine_exit({"state": "failed", "error": "server_exited", "engine_exit_code": 134}, cfg)
-        self.assertIn("out of memory", text)
-        self.assertIn("--context 16k", nxt)
-        self.assertNotIn("graphics card was not ready", nxt)
-        cfg, _ = self.config_with_log(["Permission denied: /dev/dri/renderD128", "terminate called after throwing an instance of 'rocr::AMD::hsa_exception'"])
-        self.assertIn("render group", R.explain_engine_exit({"error": "server_exited", "engine_exit_code": 134}, cfg)[1])
-        cfg, _ = self.config_with_log(["hsaKmtOpenKFD ok", "strata generate: CUDA error: out of memory"])
-        self.assertNotIn("graphics card was not ready", R.explain_engine_exit({"error": "server_exited"}, cfg)[1])
-
     def test_out_of_memory_and_old_engine_get_their_own_next_step(self):
         cfg, _ = self.config_with_log(["strata generate: CUDA error: out of memory"])
         self.assertIn("--context 16k", R.explain_engine_exit({"error": "server_exited"}, cfg)[1])
@@ -168,7 +140,7 @@ class PlanPredictsEveryDownload(unittest.TestCase):
     def plan_text(self, h: Home, own: Path, **kw) -> dict:
         s = S.LaunchSettings(family="qwen", model="IQ3_XXS", context=32768, vision="on", model_path=str(own), data_dir=str(h.base / "data"), **kw)
         r = Runner(s, catalog=catalog(HW_12))
-        with mock.patch.object(Runner, "check_own_files"), mock.patch.object(Runner, "ready_pack_gap", return_value=None):
+        with mock.patch.object(Runner, "check_own_files"):
             return r.download_plan()
 
     def test_a_local_gguf_without_a_reader_shows_the_picture_reader_and_the_switch(self):
@@ -199,21 +171,6 @@ class PlanPredictsEveryDownload(unittest.TestCase):
             self.assertNotIn("draft layer", self.plan_text(h, own, mtp="off")["text"])
 
 
-class ReadyPackPlan(unittest.TestCase):
-    def test_a_ready_made_pack_is_counted_and_the_hint_is_a_launch_option(self):
-        with Home() as h:
-            own = h.base / "own"
-            own.mkdir()
-            r = Runner(S.LaunchSettings(family="qwen", model="IQ3_XXS", context=32768, vision="off", model_path=str(own)), catalog=catalog(HW_12))
-            gap = {"gb": 129.0, "folder": str(h.base / "data" / "models"), "free_gb": 110.0}
-            with mock.patch.object(Runner, "ready_pack_gap", return_value=gap):
-                plan = r.download_plan()
-            self.assertGreaterEqual(plan["gb"], 129.0)
-            self.assertIn("ready-made pack", plan["text"])
-            self.assertIn("--data-dir", plan["text"])
-            self.assertNotIn("Nothing to download", plan["text"])
-
-
 class EngineIsFreshEnough(unittest.TestCase):
     def test_versions_compare_by_numbers(self):
         self.assertEqual(R.version_tuple("0.1.45.3"), (0, 1, 45, 3))
@@ -228,20 +185,6 @@ class EngineIsFreshEnough(unittest.TestCase):
             self.assertIn("0.1.45.3", words)
             self.assertIsNone(r.stale_engine("0.1.47"))
             self.assertIsNone(r.stale_engine("source"))
-
-    def test_gyro_on_a_mac_needs_engine_0_1_47(self):
-        with Home():
-            r = Runner(S.LaunchSettings(family="gyro", model="Gyro-S", context=32768, vision="off"), catalog=catalog(HW_12))
-            with mock.patch.object(sys, "platform", "darwin"):
-                self.assertEqual(r.needed_engine(), (0, 1, 47))
-                self.assertIn("older than this model needs (0.1.47", r.stale_engine("0.1.45.3"))
-                self.assertIsNone(r.stale_engine("0.1.47"))
-            with mock.patch.object(sys, "platform", "linux"):
-                self.assertLess(r.needed_engine(), (0, 1, 47))               # CUDA, HIP and SYCL had the kernels earlier
-                self.assertIsNone(r.stale_engine("0.1.46"))
-            with mock.patch.object(sys, "platform", "darwin"):
-                q = Runner(S.LaunchSettings(family="qwen", model="IQ3_XXS", context=32768, vision="off"), catalog=catalog(HW_12))
-                self.assertLess(q.needed_engine(), (0, 1, 47))              # only Gyro is held to it
 
     def test_a_stale_engine_is_updated_or_said_never_ignored(self):
         with Home():

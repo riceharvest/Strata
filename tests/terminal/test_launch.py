@@ -138,22 +138,6 @@ class CatalogRules(unittest.TestCase):
         gyro = fit_on({"mem_total": True, "ram_needed_gb": 27.6}, 64, 12)
         self.assertEqual(gyro["memoryGb"], 27.6)
 
-    def test_a_mac_is_judged_by_unified_memory_and_the_words_follow(self):
-        hw = {"ram_gb": 32.0, "os": "Darwin", "cpu": {"avx2": None, "name": "Apple M4"}, "mac": {"chip": "Apple M4", "macos": "27.2", "unified_gb": 32.0},
-              "gpus": [{"index": 0, "name": "Apple M4", "vendor": "apple", "vram_gb": 0.0, "unified_gb": 32.0, "usable": True}]}
-        with Home():
-            cat = catalog(hw)
-            rows = {r.model: r for r in cat.rows()}
-            self.assertEqual(set(rows), {"Q2_0", "IQ3_XXS", "IQ3_S", "Gyro-S", "Gyro-M"})
-            self.assertEqual([r.model for r in rows.values() if r.recommended], ["Q2_0"])
-            self.assertEqual((rows["Q2_0"].verdict, rows["Q2_0"].words), ("fits", "fits, part read from SSD"))
-            self.assertEqual(rows["IQ3_S"].verdict, "tight")
-            self.assertGreater(rows["IQ3_S"].spill_gb, 10)
-            self.assertEqual(cat.max_context("qwen", "Q2_0", hw), 32768)
-            self.assertEqual(cat.computer().line(), "Apple M4 · 32 GB unified memory · " + cat.computer().line().split(" · ")[-1])
-            # no "0 GB" of video memory in the card part of the line (the free-disk figure after it may end in a zero: "60 GB free")
-            self.assertNotIn("0 GB", " · ".join(cat.computer().line().split(" · ")[:2]))
-
     def test_verdict_words_never_block(self):
         self.assertEqual(verdict("fits")[0], "fits")
         self.assertEqual(verdict("does not fit")[0], "no")
@@ -376,23 +360,6 @@ class SetupArgs(unittest.TestCase):
                     self.assertIn("--vision off", nxt)
                     self.assertIn("github.com/Niko1221/Strata/issues", nxt)
 
-    def test_a_mac_defaults_pictures_to_the_metal_reader_whatever_its_memory(self):
-        for gb in (16.0, 32.0, 128.0):
-            hw = {"ram_gb": gb, "os": "Darwin", "cpu": {"avx2": None, "name": "Apple M4"},
-                  "mac": {"chip": "Apple M4", "macos": "27.2", "unified_gb": gb},
-                  "gpus": [{"index": 0, "name": "Apple M4", "vendor": "apple", "vram_gb": 0.0, "unified_gb": gb, "usable": True}]}
-            with Home():
-                cat = catalog(hw)
-                with mock.patch.object(type(cat), "reader_state", lambda self: "present"):
-                    self.assertTrue(cat.is_mac())
-                    self.assertEqual(cat.picture_default(True), "gpu", gb)
-                    r = Runner(S.LaunchSettings(family="qwen", model="Q2_0", context=32768), catalog=cat)
-                    with mock.patch.object(sys, "platform", "darwin"):
-                        args = r.setup_args()
-                    self.assertEqual(args[args.index("--vision") + 1], "gpu", gb)
-                with mock.patch.object(type(cat), "reader_state", lambda self: "missing"):
-                    self.assertEqual(cat.picture_default(True), "off")
-
     def test_a_model_that_cannot_read_pictures_stays_off_without_a_question(self):
         import dataclasses
         with Home():
@@ -431,13 +398,6 @@ class SetupArgs(unittest.TestCase):
             self.assertIn(pair[0], a)
             self.assertEqual(a[a.index(pair[0]) + 1], pair[1])
         self.assertIn("--set-default-data-dir", a)             # a folder the person chose is the remembered one (the app and the next start use it)
-
-    def test_a_mac_gets_only_the_options_its_setup_knows(self):
-        with mock.patch.object(sys, "platform", "darwin"):
-            a = self.runner(data_dir="/d", gpus=[0])
-        self.assertEqual(a, ["--yes", "--no-start", "--family", "qwen", "--model", "IQ3_XXS", "--context", "32768", "--vision", "no", "--data-dir", "/d",
-                             "--set-default-data-dir"])
-
 
 class AdoptRules(unittest.TestCase):
     def files(self, root: Path, shards=2, pack=True, tokenizer=True, mtp=True):
@@ -943,7 +903,7 @@ class FlagsCommand(unittest.TestCase):
         self.assertTrue(any("cannot read pictures" in w for w in p["warnings"]))
 
     def test_does_not_fit_is_a_warning_with_the_reason(self):
-        p = self.plan("--model", "nvfp4")
+        p = self.plan("--model", "ud-q8_k_xl")
         self.assertTrue(any("does not fit" in w for w in p["warnings"]))
 
     def test_human_plan_changes_nothing(self):

@@ -119,7 +119,7 @@ class Computer:
     os: str = ""
     avx2: bool | None = None
     raw: dict = field(default_factory=dict)
-    engine_vendor: str | None = None           # the make of card the engine drives (nvidia, amd, intel, apple); None: the cards name none
+    engine_vendor: str | None = None           # the make of card the engine drives (intel); None: the cards name none
 
     @property
     def usable_gpus(self) -> list[dict]:
@@ -157,10 +157,7 @@ class Computer:
 
     def line(self, data_dir: str | None = None) -> str:
         g = self.usable_gpus
-        if g and g[0].get("unified_gb"):                       # a Mac: one pool of memory, the chip is the graphics
-            disk = f"{self.disk_free_gb:,.0f} GB free" if self.disk_free_gb is not None else ""
-            return " · ".join(x for x in (g[0].get("name", "Apple silicon"), f"{self.ram_gb:.0f} GB unified memory" if self.ram_gb else "memory unknown", disk) if x)
-        card = (f"{g[0].get('name', 'GPU').replace('NVIDIA GeForce ', '').replace('AMD Radeon ', '')} {g[0].get('vram_gb', 0):.0f} GB"
+        card = (f"{g[0].get('name', 'GPU')} {g[0].get('vram_gb', 0):.0f} GB"
                 + (f" x{len(g)}" if len(g) > 1 else "")) if g else "no usable graphics card found"
         ram = f"{self.ram_gb:.0f} GB RAM" if self.ram_gb else "RAM unknown"
         disk = f"{self.disk_free_gb:,.0f} GB free" if self.disk_free_gb is not None else ""
@@ -258,31 +255,11 @@ class Catalog:
             hw.setdefault("disk_free_gb", self.strata.disk_free(self.strata.data_dir()))
             return hw
         hw = dict(self.strata.hardware(fresh=fresh))
-        hw["gpus"] = self._admit_old_nvidia(list(hw.get("gpus") or []))
         if not hw.get("gpus") and not str(hw.get("os", "")).startswith("Windows"):
             arc = intel_arc_cards()
             if arc:
-                hw["gpus"] = arc                       # the shared hardware reader knows NVIDIA and AMD only; an Arc is added here
+                hw["gpus"] = arc                       # the shared hardware reader does not list an Arc; it is added here
         return hw
-
-    @staticmethod
-    def _admit_old_nvidia(gpus: list[dict]) -> list[dict]:
-        """Pascal / Volta cards (P100, P40, V100: compute capability 6.0-7.0) run on the experimental CUDA 12 engine. setup.py admits them when they
-        are the only kind of graphics card in the computer (`old_gpus_opt_in`: "it is the only kind of NVIDIA GPU in this PC"); the shared hardware
-        reader does not, so the screens said "no usable graphics card found" and left out the Cards step on a computer with several V100s.
-        A newer NVIDIA card or a usable AMD card keeps the old cards out of the way, exactly as in setup."""
-        def arch(g: dict) -> int:
-            try:
-                return int(g.get("arch"))
-            except (TypeError, ValueError):
-                return 0
-        old = [g for g in gpus if g.get("vendor") == "nvidia" and 60 <= arch(g) <= 70 and not g.get("usable", True)]
-        if not old:
-            return gpus
-        if any(g.get("usable", True) for g in gpus):
-            return gpus
-        return [({**g, "usable": True, "problem": None,
-                  "note": "experimental: the CUDA 12 engine (docs/OLDER_GPUS.md)"} if g in old else g) for g in gpus]
 
     def computer(self, fresh: bool = False) -> Computer:
         hw = self.hardware(fresh)
@@ -291,7 +268,7 @@ class Catalog:
                         engine_vendor=self.engine_vendor(hw))
 
     def installed_backend(self) -> str | None:
-        """The installed engine's backend (cuda, hip, sycl, cpu, metal), None when there is no usable engine yet."""
+        """The installed engine's backend (sycl, cpu), None when there is no usable engine yet."""
         try:
             from strata_control import engine_component as ec
             rep = ec.status()
@@ -302,8 +279,7 @@ class Catalog:
         return None
 
     def engine_vendor(self, hw: dict | None = None) -> str | None:
-        """The make of card the engine drives: the installed engine's; with none installed, the engine setup would fetch (NVIDIA first when the
-        computer has several makes)."""
+        """The make of card the engine drives: the installed engine's; with none installed, the make of the cards that count."""
         from strata_control import gpu_fit
         hw = hw if hw is not None else self.hardware()
         return gpu_fit.pick_vendor(list(hw.get("gpus") or []), self.installed_backend())
@@ -388,10 +364,6 @@ class Catalog:
         hw = hw or self.hardware()
         if self.strata.multi_family(family):                   # DeepSeek-V4.1-Flash: the context the engine was checked at
             return int(getattr(self.strata.setup_module(), "DSV41_CONTEXT", 8192))
-        if hw.get("mac") and hw.get("ram_gb"):                 # a Mac: the context by unified memory (strata_control/mac_fit.py)
-            mac = self.strata.mac()
-            if mac is not None:
-                return int(mac.recommend_context(float(hw["ram_gb"])))
         usable = [g for g in hw.get("gpus") or [] if g.get("usable", True)]
         vram = max((float(g.get("vram_gb") or 0) for g in usable), default=12.0)
         rec = 32768 if vram < 14 else 65536 if vram < 20 else 131072
@@ -419,15 +391,12 @@ class Catalog:
 
     # ---- pictures
     def engine_backend(self) -> str | None:
-        """The installed engine's backend (cuda, hip, sycl, cpu, metal), else the one this computer's graphics card needs, else None."""
+        """The installed engine's backend (sycl, cpu), else the one this computer's graphics card needs (an Intel Arc: sycl), else None."""
         installed = self.installed_backend()
         if installed:
             return installed
         for g in self.computer().usable_gpus:
-            v = str(g.get("vendor") or "").lower()
-            if g.get("unified_gb") or v == "apple":
-                return "metal"
-            return {"nvidia": "cuda", "amd": "hip", "intel": "sycl"}.get(v)
+            return "sycl" if str(g.get("vendor") or "").lower() == "intel" else None
         return None
 
     def reader_state(self) -> str:
@@ -448,19 +417,13 @@ class Catalog:
     def picture_default(self, images: bool) -> str:
         """The picture setting nobody chose: off for a model that cannot read pictures or an engine without the reader; else on, with the
         reader the one rule of strata_control/vision_reader.py gives: the CPU reader under 24 GB of graphics memory, the GPU reader from 24 GB,
-        on every make of card (owner decision 2026-10-18); on a Mac the Metal reader (unified memory). Without a usable graphics card there is nothing to read on: the CPU reader."""
+        (owner decision 2026-10-18), except an Intel Arc, which keeps the CPU reader. Without a usable graphics card there is nothing to read on: the CPU reader."""
         from strata_control import vision_reader as VR
         if not images or self.reader_state() == "missing":
             return "off"
-        if self.is_mac():
-            return VR.default_mode(None, unified=True)           # a Mac (unified memory): the Metal reader, nothing to keep free for a card
         comp = self.computer()
         vram = comp.main_vram_gb
         return VR.default_mode(vram, "intel" if comp.engine_vendor == "intel" else "") if vram > 0 else "cpu"      # no usable card: nothing to read on, the CPU reader
-
-    def is_mac(self) -> bool:
-        """An Apple Silicon Mac: the chip's memory is the system's (the Metal engine; strata_control/vision_reader.py)."""
-        return self.engine_backend() == "metal"
 
     # ---- installed models
     def installed_configs(self) -> list[dict]:

@@ -21,8 +21,7 @@ UNSUPPORTED = ("no nvidia gpu found", "no amd gpu", "nvidia gpu", "not supported
 
 def setup_cannot_handle_this_card(message: str) -> bool:
     low = (message or "").lower()
-    return ("no nvidia gpu found" in low or "no amd gpu strata can use" in low or "nvidia-smi did not answer" in low
-            or "no mac model installer" in low)
+    return "no nvidia gpu found" in low or "no amd gpu strata can use" in low or "nvidia-smi did not answer" in low
 
 
 def intel_driver() -> str:
@@ -85,37 +84,30 @@ def plan(*, family: str, model: str, model_dir: Path, data_dir: Path, src: Path,
     args = ["--pack", str(pack), "--native", str(shards[0])]
     if len(shards) > 1 or family == "gyro":            # Gyro's one file holds the n-gram table too
         args += ["--ple-gguf", str(shards[-1])]
-    if backend == "metal":
-        # a Mac: the Metal defaults metal/setup_mac.py writes for a model that streams from the SSD (one token per step, no draft layer, the GGUF mapped in place)
-        args += ["--expert-profile", str(profile), "--expert-cache", "64", "--prefill", "auto", "--spec", "2", "--suffix-draft", "0",
-                 "--max-context", str(context), "--mmap-experts"]
-    else:
-        args += ["--expert-profile", str(profile), "--expert-cache", "auto", "--prefill", "auto", "--spec", "4", "--spec-min-p", "0.5"]
-        if mtp.exists():
-            args += ["--mtp", str(mtp)]
-        args += ["--max-context", str(context), "--kv", kv or ("int8" if context > 8192 else "fp16")]
-        if backend == "sycl":
-            # an Intel Arc, as sycl/setup_intel.py writes it: an A-series card on i915 loads the experts into a RAM arena and the CPU computes the misses
-            # (--ple-io ram); every other Arc (xe: the B70) streams the experts from the GGUF into VRAM (--stream-experts); both keep a VRAM reserve
-            reserve = "1024" if context <= 32768 else "2048"
-            if vram_gb:                                  # 0.2.2: a card a few hundred MiB short gets a smaller context / reserve (vram_fit)
-                from strata_control import vram_fit
-                fr = vram_fit.plan(model, vram_gb, context, kv or "int8", int(reserve), "auto", "intel", title=model, ctx_fixed=True)   # the context was settled by max_context or the person
-                if fr.changed:
-                    args[args.index("--max-context") + 1] = str(fr.ctx)
-                    reserve = str(fr.reserve_mib)
-                    if fr.prefill:
-                        args[args.index("--prefill") + 1] = fr.prefill
-                    if notes is not None:
-                        notes.append(fr.line)
-            if intel_driver() == "i915":
-                args += ["--ple-io", "ram", "--vram-reserve-mib", reserve]
-            else:
-                args += ["--stream-experts", "--vram-reserve-mib", reserve]
+    args += ["--expert-profile", str(profile), "--expert-cache", "auto", "--prefill", "auto", "--spec", "4", "--spec-min-p", "0.5"]
+    if mtp.exists():
+        args += ["--mtp", str(mtp)]
+    args += ["--max-context", str(context), "--kv", kv or ("int8" if context > 8192 else "fp16")]
+    if backend == "sycl":
+        # an Intel Arc, as sycl/setup_intel.py writes it: an A-series card on i915 loads the experts into a RAM arena and the CPU computes the misses
+        # (--ple-io ram); every other Arc (xe: the B70) streams the experts from the GGUF into VRAM (--stream-experts); both keep a VRAM reserve
+        reserve = "1024" if context <= 32768 else "2048"
+        if vram_gb:                                  # 0.2.2: a card a few hundred MiB short gets a smaller context / reserve (vram_fit)
+            from strata_control import vram_fit
+            fr = vram_fit.plan(model, vram_gb, context, kv or "int8", int(reserve), "auto", "intel", title=model, ctx_fixed=True)   # the context was settled by max_context or the person
+            if fr.changed:
+                args[args.index("--max-context") + 1] = str(fr.ctx)
+                reserve = str(fr.reserve_mib)
+                if fr.prefill:
+                    args[args.index("--prefill") + 1] = fr.prefill
+                if notes is not None:
+                    notes.append(fr.line)
+        if intel_driver() == "i915":
+            args += ["--ple-io", "ram", "--vram-reserve-mib", reserve]
+        else:
+            args += ["--stream-experts", "--vram-reserve-mib", reserve]
     cfg = {"exe": "component:strata-engine", "args": args, "cwd": str(src), "tokenizer": str(tokenizer), "model_name": model_name,
            "log": str(log), "lib_dirs": [], "port": 8080}
-    if backend == "metal":
-        cfg["env"] = {"STRATA_METAL_STREAM": "1"}
     if backend:
         cfg["backend"] = backend
     return cfg, []

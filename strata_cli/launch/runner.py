@@ -55,8 +55,6 @@ def install_isolation_words(catalog, data_dir: str | os.PathLike | None = None) 
             f"{chosen}: the data folder only says where model files are kept. To test from scratch, use a new user account or remove the earlier install first."]
 
 
-#: the first engine whose Metal build reads Gyro files (round 8, M: 0.1.45.3 was reused and failed on missing TQK6/TQK7 kernels)
-GYRO_METAL_ENGINE = (0, 1, 47)
 
 
 def version_tuple(version: str | None) -> tuple[int, ...]:
@@ -161,7 +159,7 @@ NO_ENGINE_STEP = ("run `strata update` to get the newest engines and start again
 
 #: no graphics card Strata can use at all (an Intel UHD/Iris only, an AMD APU-only laptop, a virtual machine, Windows on ARM)
 NO_GPU_PREFIX = "no graphics card that Strata can use was found"
-NO_GPU_STEP = ("Strata needs an NVIDIA or AMD graphics card, an Intel Arc card or an Apple Silicon Mac, and there is no CPU-only engine for this "
+NO_GPU_STEP = ("Strata needs an Intel Arc graphics card (the SYCL engine), and there is no CPU-only engine for this "
                 "computer. Run Strata on a computer that has one; the model files stay here")
 
 
@@ -636,8 +634,6 @@ class Runner:
             need = tuple(getattr(mod, "MIN_ENGINE", ()) or ())
             if self.s.family == "gyro":
                 need = max(need, tuple(getattr(mod, "GYRO_ENGINE", ()) or ()))
-                if sys.platform == "darwin":
-                    need = max(need, GYRO_METAL_ENGINE)      # the Metal Gyro kernels (TQK6/TQK7/TQ2_T) first shipped in 0.1.47; CUDA, HIP, SYCL had them earlier
             return need or None
         except Exception:                                    # noqa: BLE001 - no table, no check
             return None
@@ -751,21 +747,6 @@ class Runner:
             args += ["--gpus", ",".join(str(g) for g in s.gpus)] if len(s.gpus) > 1 else ["--gpu", str(s.gpus[0])]
         else:
             args += self.installed_card_args()
-        if sys.platform == "darwin":
-            # a Mac's setup (Control mode, strata_control/mac_fit.py) takes fewer options (no --kv, --gpu, speed projection)
-            keep = {"--yes", "--no-start", "--family", "--model", "--context", "--vision", "--data-dir", "--gguf-dir", "--move-data",
-                    "--set-default-data-dir"}
-            flags = ("--yes", "--no-start", "--move-data", "--set-default-data-dir")
-            out, i = [], 0
-            while i < len(args):
-                if args[i] in keep:
-                    out.append(args[i])
-                    if args[i] not in flags and i + 1 < len(args):
-                        out.append(args[i + 1])
-                    i += 2 if args[i] not in flags else 1
-                else:
-                    i += 2 if i + 1 < len(args) and not args[i + 1].startswith("--") else 1
-            args = out
         return args
 
     def installed_card_args(self) -> list[str]:
@@ -931,12 +912,6 @@ class Runner:
             self.emit("model", "The model already installed here is somewhere else than the folder you gave, so Strata uses the folder you gave "
                                "and points this launch at it.", 0)
         title = f"{s.family} {s.model}"
-        if sys.platform == "darwin" and not (cat.src / "strata_control" / "mac_fit.py").is_file():
-            # a Terminal from before the Mac rules moved into strata_control/mac_fit.py: setup.py cannot install a Mac model in its Control
-            # mode (no source build, no setup_mac.py), so use model files prepared on this Mac. Every other Terminal installs through setup.py.
-            adopted = self.adopt_prepared_files("no Mac model installer in this Terminal")
-            if adopted is not None:
-                return adopted
         self.emit("model", f"Preparing {title} from your model files…" if s.model_path else
                   f"Getting {title} ready (a download may be large; it continues where it stopped if interrupted)…", 0)
         argv = [self.python, str(cat.src / "setup.py"), *self.setup_args()]
@@ -1726,11 +1701,6 @@ class Runner:
                 parts.append({"kind": "dflash2", "label": "the DFlash2 drafter", "gb": drafting.DOWNLOAD_GB})
         except Exception:                                    # noqa: BLE001 - the plan still shows the rest
             pass
-        gap = self.ready_pack_gap() if st.own_files else None
-        if gap:
-            # a ready-made pack (NVFP4) is taken from setup's own models folder, not from where the person's files are (round 8, N2: the plan
-            # said "nothing to download" and setup then asked for 129 GB): count what setup will fetch
-            parts = [p for p in parts if p["kind"] != "weights"] + [{"kind": "weights", "label": "the ready-made pack", "gb": gap["gb"]}]
         gb = round(sum(p["gb"] for p in parts), 1)
         engine, here = True, []
         if self.multi_file():                                # DeepSeek does not use the Strata engine: nothing about it in the plan (its own package is in the placement)
@@ -1755,10 +1725,6 @@ class Runner:
                 text += f" {st.on_disk_gb:.0f} GB of the model is already in its folder."
             if st.own_files:
                 text += " Your model files are used where they are."
-            if gap:
-                text += (f" This is a ready-made pack, and setup takes it from its own folder ({gap['folder']}), not from where your files are. "
-                         "Copy or link your pack there to use it as it is" +
-                         (f"; only {gap['free_gb']:.0f} GB are free on that drive, so choose a bigger drive with --data-dir" if gap.get("free_gb") is not None and gap["free_gb"] < gap["gb"] else "") + ".")
             if any(p["kind"] == "mmproj" for p in parts):
                 text += " To skip the picture reader (the model then answers text only), add --vision off; or put its mmproj file next to your model files."
             if any(p["kind"] == "mtp" for p in parts):
@@ -1772,28 +1738,6 @@ class Runner:
         elif not engine:
             text += " The engine for your graphics card is downloaded first (from the update source; its size is shown when it starts)."
         return {"gb": gb, "parts": parts, "engine_missing": not engine and not here, "engine_usable": engine, "own_files": st.own_files, "text": text}
-
-    def ready_pack_gap(self) -> dict | None:
-        """For a ready-made pack family (NVFP4): what setup would still fetch into its models folder for these choices, {gb, folder, free_gb}, or None."""
-        s = self.s
-        try:
-            mod = self.catalog.strata.setup_module()
-            _m, families, _c, _src = self.catalog.tables()
-            if mod is None or not (families.get(s.family or "") or {}).get("ready") or not hasattr(mod, "ready_needed"):
-                return None
-            data = Path(s.data_dir) if s.data_dir else (self.existing_data_dir() or self.catalog.data_dir())
-            models_dir = data / "models"
-            need = 0
-            for f in mod.ready_needed(s.model, models_dir):
-                if not mod.ready_verified(mod.ready_where(models_dir, f), f[5]):
-                    need += int(f[4])
-            if need <= 0:
-                return None
-            probe = next((q for q in (models_dir, *models_dir.parents) if q.exists()), None)
-            free = self.catalog.disk_free(probe) if probe is not None else None
-            return {"gb": round(need / 1e9, 1), "folder": str(models_dir), "free_gb": free}
-        except Exception:                                    # noqa: BLE001 - a plan that cannot work this out still shows the rest
-            return None
 
     def preflight_words(self) -> list[str]:
         """Plain warnings for `--plan` that the run itself would meet: an engine older than the model needs, an earlier install taking the
@@ -2059,20 +2003,15 @@ def _read_json(path: Path) -> dict | None:
 #: lines of an engine log that say why it stopped (the last one wins), and a plain next step for the causes we know. Recommend, never force.
 CAUSE_LINE = re.compile(r"error|exception|failed|cannot|can't|could not|no device|not found|out of memory|unsupported|abort|invalid|missing|"
                         r"no kernel|illegal|denied|refus", re.I)
-# The GPU runtime (ROCm) failed while the card was being set up, often right after another engine exited: the runtime's own text
-# ("terminate called after throwing an instance of 'rocr::AMD::hsa_exception'") stays in the log, not in the sentence shown.
-HSA_START = re.compile(r"hsa_exception|HSA_STATUS_ERROR", re.I)
-HSA_START_NEXT = ("The graphics card was not ready yet; wait a few seconds and run it again. If it keeps happening, restart the PC "
-                  "and report the log.")
 KNOWN_CAUSES = (
     (re.compile(r"no device of requested type|device not found|no (gpu|sycl|level.zero) device|permission denied.*(dri|render)", re.I),
      "The engine could not open the graphics card. On Linux the account must be allowed to use it: add it to the render group "
      "(`sudo usermod -aG render $USER`), log in again and start it again."),
-    (re.compile(r"out of memory|not enough (gpu |video |free )?memory|cudaerrormemory|allocation failed", re.I),
+    (re.compile(r"out of memory|not enough (gpu |video |free )?memory|allocation failed", re.I),
      "The card or memory ran out. Close other programs that use the card, or choose a smaller context (`--context 16k`) and start again."),
     (re.compile(r"tqk\d|no kernel|unsupported (quant|type|model)|unknown (quant|tensor) type", re.I),
      "This engine is too old for this model. Update it with `strata update` and start again."),
-    (re.compile(r"dll|libcu|cannot open shared object|0xc0000135", re.I),
+    (re.compile(r"dll|libsycl|libze|cannot open shared object|0xc0000135", re.I),
      "A library the engine needs is missing. Update the engine (`strata update`) or install the graphics driver again."),
 )
 
@@ -2142,19 +2081,10 @@ def explain_engine_exit(result: dict, config: Path | None, marks: dict | None = 
         stage = "The engine stopped while it was loading the model" + (f" (exit code {code})" if code not in (None, 0) else "")
     else:
         stage = f"The server did not become ready ({state}: {why or 'see the engine log'})"
-    hsa = HSA_START.search(" ".join(lines + [str(why or "")]))   # the runtime's own text is kept out of the sentence (it is in the log)
-    if hsa:
-        # a real cause in the same log (out of memory, no permission on the card ...) wins: its line is the cause shown
-        real = next((x for x in reversed(lines) if any(p.search(x) for p, _ in KNOWN_CAUSES)), None)
-        if real:
-            hsa = None
-            cause = re.sub(r"^(\[strata\]\s*)?(\d{4}-\d\d-\d\d[ T][\d:.]+\s*)?", "", real.strip())[:240]
-        else:
-            cause = ""
     text = stage + (f": {cause}" if cause else ".")
     if not text.endswith((".", "!")):
         text += "."
-    step = HSA_START_NEXT if hsa else next((words for pattern, words in KNOWN_CAUSES if pattern.search(" ".join([cause, str(why or "")]))), "Run it again; if it repeats, report the log.")
+    step = next((words for pattern, words in KNOWN_CAUSES if pattern.search(" ".join([cause, str(why or "")]))), "Run it again; if it repeats, report the log.")
     return text, step + (f" The engine's log: {log}" if log else " The engine's log has the reason (strata logs, or the log named in the run config).")
 
 

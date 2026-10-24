@@ -678,7 +678,7 @@ class CardsScreen(Base):
 
     def is_cpu_engine(self) -> bool:
         try:
-            return (self.ctx.catalog.installed_backend() or "") in ("cpu", "metal")
+            return (self.ctx.catalog.installed_backend() or "") == "cpu"
         except Exception:                                    # noqa: BLE001
             return False
 
@@ -993,12 +993,8 @@ class PicturesScreen(Base):
         self.paint()
 
     def explain(self) -> Text:
-        amd = any(str(g.get("vendor")) == "amd" for g in self.ctx.computer.usable_gpus)
         on_card = self.ctx.catalog.picture_default(True) == "gpu"
-        extra = ("a 0.9 GB download (if it is not on this computer yet). On your AMD card the picture reader runs on the graphics card "
-                 "(about 1 GB of its memory, under a second per picture) and starts on the processor by itself if it cannot."
-                 if amd and on_card and self.reader() != "missing" else
-                 "a 0.9 GB download (if it is not on this computer yet), and about 1.4 GB of graphics memory kept free for the picture reader "
+        extra = ("a 0.9 GB download (if it is not on this computer yet), and about 1.4 GB of graphics memory kept free for the picture reader "
                  "(text is a few % slower)." if on_card else
                  "a 0.9 GB download (if it is not on this computer yet). The picture reader runs on the CPU: a few seconds per picture, nothing "
                  "taken from the graphics card.")
@@ -1013,7 +1009,7 @@ class PicturesScreen(Base):
 
     def commit(self) -> None:
         key = self.menu().current.key
-        if key == "on":                                      # yes: the reader on the card (NVIDIA, AMD) or the CPU, as the default says
+        if key == "on":                                      # yes: the reader on the card or the CPU, as the default says
             device = self.ctx.catalog.picture_default(True)
             key = device if device != "off" else "on"
         self.ctx.settings.vision = key

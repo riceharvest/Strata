@@ -79,7 +79,7 @@ class LaunchSettings:
     """Every choice of `strata launch`. `None` means "the recommendation for this computer"."""
 
     name: str | None = None                    # the saved preset's name
-    family: str | None = None                  # catalog family id (qwen, swift, coder, unsloth, gyro, nvfp4...)
+    family: str | None = None                  # catalog family id (qwen, swift, coder, unsloth, gyro, ...)
     model: str | None = None                   # catalog size (IQ3_XXS ...)
     model_path: str | None = None              # "Use model files I already have": a .gguf file or a folder
     dsv41_package: str | None = None           # DeepSeek: the engine package the person downloaded by hand (checked, then installed)
