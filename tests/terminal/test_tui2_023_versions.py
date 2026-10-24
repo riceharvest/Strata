@@ -39,10 +39,7 @@ class VersionBump(unittest.TestCase):
 
     def test_the_documents_that_state_the_current_version_agree(self):
         self.assertIn("Version 0.2.3, engine 0.1.48.", (ROOT / "AGENTS.md").read_text(encoding="utf-8"))
-        for name in ("README.md", "README.de.md", "README.es.md", "README.fr.md", "README.ja.md", "README.pt-BR.md", "README.zh-CN.md"):
-            text = (ROOT / name).read_text(encoding="utf-8")
-            self.assertIn("Strata-0.2.3-", text, name)       # (the restyled READMEs state the app version through the download buttons: the app stays 0.2.3)
-            self.assertNotIn("Strata-0.2.2-", text, name)
+        # the B70 fork's README (no translations) names no app download, so it states no app version
 
     def test_version_prints_the_product_and_the_build(self):
         done = subprocess.run([sys.executable, str(ROOT / "strata.py"), "--version"], capture_output=True, text=True, cwd=str(ROOT),
