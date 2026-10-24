@@ -121,11 +121,11 @@ uint32_t* tables(sycl::queue& q) {
     return t;
 }
 
-// unaligned 32-bit read at a 2-byte aligned byte offset (per lane) through two dword gathers
+// unaligned 32-bit read at a 2-byte aligned byte offset (per lane): the two dwords around it, one 2-dword gather
 SYCL_ESIMD_FUNCTION inline simd<uint32_t, 16> ld32(const uint8_t* base, simd<uint32_t, 16> off) {
     simd<uint32_t, 16> a = off & ~3u;
-    simd<uint32_t, 16> lo = gather<uint32_t, 16>(reinterpret_cast<const uint32_t*>(base), a);
-    simd<uint32_t, 16> hi = gather<uint32_t, 16>(reinterpret_cast<const uint32_t*>(base), a + 4u);
+    simd<uint32_t, 32> v = gather<uint32_t, 32, 2>(reinterpret_cast<const uint32_t*>(base), a);   // both dwords in one message
+    simd<uint32_t, 16> lo = v.template select<16, 1>(0), hi = v.template select<16, 1>(16);
     simd<uint32_t, 16> sh = (off & 2u) << 3;   // 0 or 16
     return (lo >> sh) | ((hi << 16) << (16u - sh));
 }
@@ -133,10 +133,14 @@ SYCL_ESIMD_FUNCTION inline simd<uint32_t, 16> ld32(const uint8_t* base, simd<uin
 // whose last field is not dword aligned would otherwise read up to 3 bytes past it
 SYCL_ESIMD_FUNCTION inline simd<uint32_t, 16> ld32c(const uint8_t* base, simd<uint32_t, 16> off, uint32_t lim) {
     simd<uint32_t, 16> a = off & ~3u;
-    simd<uint32_t, 16> a2 = a + 4u;
-    a2.merge(simd<uint32_t, 16>(lim), a2 > lim);
-    simd<uint32_t, 16> lo = gather<uint32_t, 16>(reinterpret_cast<const uint32_t*>(base), a);
-    simd<uint32_t, 16> hi = gather<uint32_t, 16>(reinterpret_cast<const uint32_t*>(base), a2);
+    // one 2-dword gather; a lane whose dword is the last one (a == lim) reads the pair before it and takes its second dword
+    // for both halves, as the two clamped reads did
+    const simd_mask<16> end = a + 4u > lim;
+    simd<uint32_t, 16> b = a;
+    b.merge(simd<uint32_t, 16>(lim - 4u), end);
+    simd<uint32_t, 32> v = gather<uint32_t, 32, 2>(reinterpret_cast<const uint32_t*>(base), b);
+    simd<uint32_t, 16> lo = v.template select<16, 1>(0), hi = v.template select<16, 1>(16);
+    lo.merge(hi, end);
     simd<uint32_t, 16> sh = (off & 2u) << 3;
     return (lo >> sh) | ((hi << 16) << (16u - sh));
 }
