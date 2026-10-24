@@ -957,13 +957,6 @@ def _memory_status():
 def ram_gb():
     if WIN:
         return _memory_status().ullTotalPhys / 2**30
-    if sys.platform == "darwin":
-        try:
-            value = subprocess.run(["sysctl", "-n", "hw.memsize"], capture_output=True,
-                                   text=True, timeout=3, check=True).stdout.strip()
-            return int(value) / 2**30
-        except (OSError, ValueError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
-            return 0.0
     try:
         with open("/proc/meminfo") as stream:
             for line in stream:
@@ -3609,12 +3602,12 @@ def mem_have(model: str, ram: float, vram: float = 0.0) -> float:
 # 0.2.0, the owner's memory tiers (README "The other sizes"): RAM + VRAM together pick the size.  The floors sit 2 GB
 # below the tiers' names (40 / 48 / 64 GB) because the OS reports a little less than the installed memory.  64 GB and
 # up: IQ3_S (the original; Swift 1.5's IQ3_S is an equal choice), 48 GB: IQ3_XXS, 40 GB: Swift 1.5's IQ2_XS, with Gyro-M
-# (35 GB) as the other choice.  Below 40 GB the older rules stand (Gyro-S, or the Coder for code).  The Mac has its own
-# rules (strata_control/mac_fit.py).  tools/strata_mcp.py's recommend() holds the same floors (the app and `strata launch`).
+# (35 GB) as the other choice.  Below 40 GB the older rules stand (Gyro-S, or the Coder for code).
+# tools/strata_mcp.py's recommend() holds the same floors (the app and `strata launch`).
 MEMORY_TIERS = ((62.0, "qwen", "IQ3_S"), (46.0, "qwen", "IQ3_XXS"), (38.0, "swift", "IQ2_XS"))
 # #3425 (owner's rule): the tiers count RAM + VRAM less this much, which Windows and the system keep for themselves.  A PC
 # with a 16 GB card and 32 GB of RAM used to land in the 48 GB tier and then read ~11 GB of it from the SSD on every answer.
-# tools/strata_mcp.py has the same constant; the Mac (strata_control/mac_fit.py) keeps its own macOS share and does not use it.
+# tools/strata_mcp.py has the same constant.
 TIER_SYSTEM_RESERVE_GB = 5.0
 
 
@@ -7311,13 +7304,6 @@ def resolve_rope(ctx: int, scaling, scale, trained: int = 262144):
 
 
 # ------------------------------------------------------------------------------------------------ main
-def mac_setup(argv) -> int:
-    """A Mac (Apple Silicon): the Metal engine, built from source on the Mac by metal/setup_mac.py (its own steps:
-    the Mac check, the pack by unified memory, the engine build, the Metal defaults). Nothing of the CUDA / HIP paths
-    is used or changed."""
-    return subprocess.call([sys.executable, str(ROOT / "metal" / "setup_mac.py"), *argv])
-
-
 def sycl_setup(argv) -> int:
     """--backend sycl: the Intel Arc engine (the SYCL port in sycl/, PR #423), experimental. There is no ready-made
     Intel engine: it is compiled from source on the PC (docs/INTEL_ARC.md), then sycl/setup_intel.py runs this setup
@@ -8204,219 +8190,12 @@ def preview_family(a) -> int:
     return 0
 
 
-def mac_vision(asked, model: str, ram: float) -> str:
-    """The picture setting of a Mac's setup: "gpu", "cpu" or "none".  Pictures are on wherever the model can read them (owner rule
-    2026-10-18) and the reader follows strata_control/vision_reader.py: on a Mac, the GPU (Metal) reader, because the memory is shared
-    (no card to keep free) and the CPU reader is ~100x slower.  --vision cpu is kept, with a note (recommend, never force)."""
-    from strata_control import vision_reader as VR
-    if asked in ("no", "none", "off"):
-        return "none"
-    if asked is None and not images_default(model, "qwen", ram):
-        return "none"
-    if MODELS.get(model, {}).get("vision") is False:
-        if asked is not None:
-            warn(f"images are not available with {model} yet: off")
-        return "none"
-    mode = VR.wanted(asked, None, unified=True)
-    if mode == "cpu":
-        warn(VR.MAC_CPU_NOTE)
-    return mode
-
-
-def mac_reader(eng: Path, vision: str):
-    """The picture reader the Mac engine folder carries (strata-vision: Metal built in), for `vision` "gpu" or "cpu".  A folder
-    without it gets pictures off, said once."""
-    from strata_control import vision_reader as VR
-    r = VR.choose(eng, vision, windows=False, mac=True)
-    if r.mode == "none":
-        warn(r.note or "this engine has no picture reader: pictures off")
-    return r
-
-
-def mac_control_setup(a) -> int:
-    """The app (and the Terminal's `strata launch`) on a Mac, STRATA_CONTROL_INSTALL=1: the same job as on Windows and Linux. It
-    downloads and prepares the model files and writes a run config whose engine is "component:strata-engine"; it builds nothing
-    (the Metal engine is a component: a ready-made package from the feed, or the one inside the installer) and runs no
-    metal/setup_mac.py. Which sizes a Mac can run, whether one stays in memory or streams its experts from the SSD, and the
-    Metal flags of the config are strata_control/mac_fit.py's, the module setup_mac.py and the model list use too."""
-    from strata_control import mac_fit as MF
-    say("Strata on a Mac (Apple Silicon, Metal)")
-    step(1, "checking your Mac")
-    info = MF.mac_info()
-    ram = float(info["ram_gb"] or ram_gb())
-    ok(f"{info['chip']}, {ram:.0f} GB unified memory, macOS {info['macos'] or '?'}")
-    problems = MF.mac_problems(info, need_compiler=False)       # the app compiles nothing: no Command Line Tools needed
-    for p in problems:
-        warn(p)
-    data, elsewhere = data_folder_for(a)
-    roots = [data, *elsewhere]
-    models_root = Path(a.models_dir) if a.models_dir else data / "models"
-    free = free_gb(data if data.exists() else home())
-    ok(f"free disk: {free:.0f} GB at {data}")
-    if a.check:
-        return 1 if problems else 0
-    if problems:
-        fail(problems[0])
-
-    step(2, "your choices")
-    app_sizes = [m for m, d in MF.MAC_MODELS.items() if d.get("family", "qwen") in ("qwen", "gyro")]   # Gyro: one file, no repack
-    if a.family not in (None, "qwen", "gyro"):
-        fail(f"the app on a Mac runs the Qwen3.8-Flash-Next sizes ({', '.join(app_sizes)}); {a.family} is not one of them",
-             "choose Qwen3.8-Flash-Next")
-    rec, notes = MF.recommend_model(ram)
-    if rec not in app_sizes:
-        rec = "Q2_0"
-    model = a.model or rec
-    if model not in app_sizes:
-        fail(f"{model} is not offered on a Mac in the app", "choose one of: " + ", ".join(app_sizes))
-    for n in MF.model_note(model, ram):
-        warn(n)
-    vision = mac_vision(a.vision, model, ram)
-    ctx = a.context or MF.recommend_context(ram)
-    if ctx > MF.TESTED_CONTEXT:
-        say(f"  context {ctx}: measured on the Mac up to {MF.TESTED_CONTEXT} (needles found at 8K-32K); longer is kept")
-    ok(f"{model}, context {ctx}")
-    family = MF.MAC_MODELS[model].get("family", "qwen")
-    fam = FAMILIES[family]
-    tag = fam["tag"] + model
-    stream = MF.streams(model, ram)
-
-    step(4, "the Strata engine (Metal)")
-    from strata_control import engine_component as EC
-    llama = get_llama_cpp()                            # gguf-py for the preparation tools only: no git, no compiler
-    ok(f"llama.cpp {LLAMA_CPP_COMMIT[:7]} (gguf-py for the preparation tools)")
-    reader = None
-    try:
-        found = EC.resolve(full=False)
-        ok(f"engine component: {found.version} ({found.platform}-{found.backend})")
-        if vision != "none":
-            reader = mac_reader(Path(found.root), vision)
-            vision = reader.mode
-    except EC.EngineMissing as e:
-        warn(f"no Metal engine is installed for this Mac yet ({e}). The model is downloaded and prepared now; the engine comes "
-             "with the app or its update feed, and is looked up when the model loads")
-        if vision != "none":
-            warn("pictures are off for now: the picture reader comes with the engine (run setup again once it is installed)")
-            vision = "none"
-    else:
-        if family == "gyro":                           # an engine from before the trellis kernels refuses the file when it loads
-            try:
-                has_tq = b"inputs are rotated on the GPU" in Path(found.exe).read_bytes()
-            except (OSError, AttributeError):
-                has_tq = True                          # cannot tell: not a reason to hold the install back
-            if not has_tq:
-                warn(f"the Metal engine component {found.version} has no kernels for Gyro's trellis experts yet: the model is "
-                     "downloaded and prepared, and it runs once the app or its update feed brings a newer engine")
-    ok("engine: the engine component (looked up when the model loads)")
-    ok("images: " + {"none": "off", "gpu": "on (read on the Mac's GPU)", "cpu": "on (read on the CPU)"}[vision])
-
-    step(5, f"downloading {fam['title']} {model}")
-    models_dir = Path(a.gguf_dir) if a.gguf_dir else models_root / tag
-    files = gguf_dir_shards(models_dir, fam, model) if a.gguf_dir else \
-        [models_dir / model_file(fam, model, i) for i in range(1, model_shards(fam, model) + 1)]
-    problem = gguf_dir_problem(models_dir, files[0], fam, model) if a.gguf_dir else None
-    if problem:                                        # files Strata cannot run, or another choice's files
-        fail(*problem)
-    for s in files:                                    # a whole file copied in by hand has no finish mark
-        if s.exists() and not done(s) and whole_shard(s):
-            try:
-                mark(s, "whole (checked against its own tensor directory)")
-            except OSError as e:                       # a read-only folder: the file is still whole
-                warn(f"{s.name} is whole but its finish mark cannot be written ({e})")
-    need = (0 if a.gguf_dir or all(s.exists() and done(s) for s in files) else MODELS[model]["download_gb"]) + 6
-    if free_gb(models_dir if models_dir.exists() else data) < need:
-        warn(f"about {need:.0f} GB are needed on the disk: kept as you chose; it may run out")
-    if not a.gguf_dir:
-        models_dir.mkdir(parents=True, exist_ok=True)
-        missing = [s.name for s in files if not (s.exists() and done(s))]
-        if missing:
-            say(f"  The model files go in {models_dir}")
-        for s in files:
-            if s.exists() and done(s):
-                ok(f"{s.name} already downloaded")
-                continue
-            download(fam["hf"].format(q=model) + s.name, s)
-    check_shards(files)
-    ok("model files present")
-    mmproj = None
-    if vision != "none":
-        mmproj = Path(models_root) / fam["mmproj"]
-        if not mmproj.exists():                        # an earlier install's copy (the same file for every family)
-            mmproj = find_in(roots, f"models/{fam['mmproj']}") or mmproj
-        if not mmproj.exists() and a.gguf_dir and (Path(a.gguf_dir) / fam["mmproj"]).exists():
-            mmproj = Path(a.gguf_dir) / fam["mmproj"]
-        elif not (mmproj.exists() and done(mmproj)):
-            download(fam["mmproj_hf"] + fam["mmproj"], mmproj, "vision encoder")
-        if fam["mmproj"] in ISTA_FILES:
-            verify_sha256(mmproj, *ISTA_FILES[fam["mmproj"]])
-        ok(f"vision encoder: {mmproj}")
-
-    step(6, "preparing the model for Strata")
-    pack = find_in(roots, f"packs/{tag.lower()}") or data / "packs" / tag.lower()
-    env = dict(os.environ, STRATA_GGUF_PY=str(llama / "gguf-py"))
-    if not (pack / "native_experts.txt").exists() or not (pack / "tokenizer" / "vocab.json").exists():
-        run([sys.executable, str(ROOT / "tools" / "iq_pack.py"), "--gguf", str(files[0]), "--out", str(pack),
-             *fam.get("pack_args", [])], env=env)       # Gyro: --compat-bf16
-    ok(f"model prepared: {pack}")
-    use_mtp = MF.stream_mtp(stream, ram)
-    mtp = (find_in(roots, "mtp/mtp-q2_0.gguf") or data / "mtp" / "mtp-q2_0.gguf").parent
-    rt = mtp / "rt"
-    if stream and not use_mtp:
-        ok("the experts stream from the SSD: no MTP draft layer (one token per step is faster there)")
-    elif stream:
-        ok(f"the experts stream from the SSD; the MTP draft layer stays on, with --spec {MF.STREAM_SPEC}")
-    if use_mtp and a.mtp == "off" and not (mtp / "mtp-q2_0.gguf").exists():
-        ok("the draft layer (MTP) is off: its ~5 GB are not downloaded (`--mtp on` fetches it later)")   # round 8, N3
-        use_mtp = False
-    if use_mtp and not (mtp / "mtp-q2_0.gguf").exists():
-        say("  The MTP draft layer (speculative decoding) comes from the original Qwen checkpoint: only its ~5 GB of MTP tensors are downloaded.")
-        fetch_mtp(mtp, env)
-        run([sys.executable, str(ROOT / "tools" / "mtp_pack.py"), "--src", str(mtp), "--experts", "q2_0",
-             "--out", str(mtp / "mtp-q2_0.gguf")], env=env)
-    if use_mtp:
-        rt.mkdir(parents=True, exist_ok=True)          # the Metal engine reads mtp-q2_0.gguf beside it (no rt pack)
-        refresh_draft_vocab(rt, a.draft_vocab or "cjk")
-        ok(f"MTP draft layer: {mtp / 'mtp-q2_0.gguf'}")
-
-    step(7, "writing the run settings")
-    port = a.port or 8080
-    args = MF.engine_args(pack, [files[0], files[0]] if family == "gyro" else files, rt, ctx, stream, ram,
-                          ROOT / "data" / "expert-profile.bin")      # Gyro: one file, the model and its n-gram table
-    cfg = {"exe": engine_exe(Path("engine")), "args": args, "cwd": str(ROOT), "tokenizer": str(pack / "tokenizer"),
-           "model_name": f"{fam['name']}-{model.lower()}", "log": str(home() / f"strata-{tag.lower()}.log"),
-           "lib_dirs": [], "port": port, "backend": "metal", "env": {"STRATA_METAL_STREAM": "1" if stream else "0"}}
-    if a.host:
-        cfg["host"] = a.host
-    if a.api_key:
-        cfg["api_key"] = a.api_key
-    if a.draft_vocab:
-        cfg["draft_vocab"] = a.draft_vocab
-    if a.browser is not None:
-        cfg["open_browser"] = a.browser
-    if vision != "none":                               # the Mac's one program reads on the GPU (--gpu) or the CPU (strata_control/vision_reader.py)
-        from strata_control import vision_reader as VR
-        cfg["args"].append("--vision")
-        cfg["vision"] = VR.vision_section(reader, {"exe": str(reader.exe), "mmproj": str(mmproj), "model": str(files[0]),
-                                                   "gpu": vision == "gpu", "max_tokens": vision_tokens(a.vision_tokens, vision, None)})
-        if vision == "cpu":
-            cfg["vision"]["threads"] = vision_threads()
-    cfg_path = home() / f"strata-{tag.lower()}.json"
-    write_setup_config(cfg_path, cfg)
-    script = write_run_script(tag, cfg_path, port, cfg.get("open_browser") is not False)
-    ok(f"start script: {script.name}")
-    say()
-    say("All set.")
-    return 0
-
-
 def main() -> int:
     try:                                               # files made by a run as administrator still belong to the user
         from strata_control import private_files as _pf
         _pf.adopt_user_defaults()
     except Exception:
         pass
-    if sys.platform == "darwin" and not CONTROL:       # a Mac: metal/setup_mac.py (the Metal engine); the app (Control mode) goes on below
-        return mac_setup(sys.argv[1:])
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--family", choices=list(FAMILIES) + list(PREVIEW_FAMILIES) + list(MULTI_FILE_FAMILIES),
                     help="qwen = Qwen3.8-Flash-Next, swift = Swift 1.5, qwen36 = Qwen3.6-35B-A3B (pictures with --vision, "
@@ -8558,8 +8337,6 @@ def main() -> int:
         os.environ["STRATA_SOURCE"] = a.source
     if a.inspect:                                      # headers only: nothing is installed
         sys.exit(subprocess.run([sys.executable, str(ROOT / "tools" / "strata_inspect.py"), *a.inspect[:2]]).returncode)
-    if sys.platform == "darwin" and CONTROL:           # the app on a Mac: model files only; the Metal engine is a component
-        return mac_control_setup(a)
     if a.backend == "sycl":                            # Intel Arc: the SYCL port's own setup (sycl/setup_intel.py)
         return sycl_setup(sys.argv[1:])
     if a.resident_budget_gib is not None and not a.resident_budget_gib > 0:
