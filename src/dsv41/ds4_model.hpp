@@ -39,11 +39,12 @@ struct Options {
     // most (never past the RAM the process can still get less 8 GB); 0: off, the OS page cache as before
     double ssd_cache_gb = -1.0;   // < 0: auto (the RAM the process can get less a floor, at most 48 GB; off below 4 GB), 0: off
     int ssd_policy = 0;
-    float disk_skip_w = -1.0f;        // < 0: auto (STRATA_DS4_DISK_SKIP_W, or 0.025 if ssd_cache active), 0: off
-    int disk_skip_from = 0;           // layers from which disk_skip_w takes effect
-    int engram_cache_mb = -1;         // < 0: auto (scaled to RAM, up to 4096 MB), 0: off, > 0: exact MB
-    int engram_threads = -1;          // < 0: auto (32 on Linux NVMe), > 0: exact reader thread count
-    int prune_experts = 0;            // 0: off (all 384 experts), >0: keep only top N experts per layer (e.g. 160 or 192)
+    float disk_skip_w = -1.0f;        // < 0: STRATA_DS4_DISK_SKIP_W (unset: 0, off); > 0 CHANGES THE ANSWERS (opt-in, experimental)
+    int disk_skip_from = 0;           // layers from which disk_skip_w takes effect (0: STRATA_DS4_DISK_SKIP_FROM, else 0)
+    int engram_cache_mb = -1;         // < 0: DS4_ENGRAM_CACHE_MB, else upstream's default (RAM / 64, 16-256 MB); >= 0: exact MB
+    int engram_threads = -1;          // < 0: DS4_ENGRAM_THREADS, else upstream's default (half the threads, 4-16); > 0: exact count
+    int prune_experts = 0;            // 0: off; > 0 CHANGES THE ANSWERS (opt-in): about N experts per trunk layer kept, the
+                                      // profile's coldest masked out of the router; refused without a profile
     // dspark_auto: the drafter is loaded only where the routed experts fit the GPUs (more than 1.5x what they have, the verify rounds
     // read 3.3x the bytes of a token and measured no faster than plain decoding, and the drafter's 7 GB of experts take the VRAM the
     // trunk's hottest would have had); --dspark on / off / none says it outright

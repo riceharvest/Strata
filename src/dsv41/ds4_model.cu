@@ -988,7 +988,7 @@ struct Model::Impl {
     // layer after (from L's input too); DS4_AHEAD_EXTRA: guesses past the next layer's top k (< 0: fewer - the guess's
     // picks by rank on Sun: 97 91 81 70 57 41 %, past the top 6 29 20 %: reads wasted on an SSD-bound PC).
     int ahead_mode = std::getenv("DS4_AHEAD") ? std::atoi(std::getenv("DS4_AHEAD")) : 1;
-    int ahead_extra = std::getenv("DS4_AHEAD_EXTRA") ? std::atoi(std::getenv("DS4_AHEAD_EXTRA")) : (o.ssd_cache_gb > 0.0 ? 2 : 0);
+    int ahead_extra = 0;   // (set in load(): DS4_AHEAD_EXTRA, 0 when unset)
     // (DS4_AHEAD_ORDER=0: the CPU lane computes a layer's experts in expert order, not the ones asked for early first)
     bool ahead_order = std::getenv("DS4_AHEAD_ORDER") == nullptr || std::atoi(std::getenv("DS4_AHEAD_ORDER")) != 0;
     std::vector<uint8_t> ahead_fl;     // [layer][1024]: 1 the top-k guess, 2 any guess, a layer before; 4 two layers before;
@@ -1038,17 +1038,10 @@ struct Model::Impl {
     // weights is below this and whose pages are not in RAM now (the page cache or the RAM tier; os::in_ram - Linux every
     // page, Windows sampled pages of the working set), so a token waits on the SSD only for the experts that weigh; the
     // weight it carried is lost (no renormalisation).  On layers from STRATA_DS4_DISK_SKIP_FROM (0) on.  An expert left
-    // out still counts as used (the expert cache, the profile).
-    const float disk_skip_w = [this] {
-        if (o.disk_skip_w >= 0.0f) return o.disk_skip_w;
-        const char* v = std::getenv("STRATA_DS4_DISK_SKIP_W");
-        return v != nullptr ? std::max(0.0f, (float) std::atof(v)) : 0.0f;
-    }();
-    const int disk_skip_from = [this] {
-        if (o.disk_skip_from > 0) return o.disk_skip_from;
-        const char* v = std::getenv("STRATA_DS4_DISK_SKIP_FROM");
-        return v != nullptr ? std::max(0, std::atoi(v)) : 0;
-    }();
+    // out still counts as used (the expert cache, the profile).  --disk-skip-w / --disk-skip-from say the same; set in
+    // load(), once the options are known (a member initialiser runs before load() copies them in).
+    float disk_skip_w = 0.0f;
+    int disk_skip_from = 0;
     // the RAM store (--ssd-cache): the CPU lane's experts in slots a policy owns, read unbuffered (null: off)
     std::unique_ptr<ExpertStore> store;
     uint8_t* zc_stage_buf = nullptr;   // device: k staging slots for the store's experts of a decode token
@@ -1854,6 +1847,20 @@ struct Model::Impl {
     // ---- loading
     bool load(const Options& opt, std::string& err) {
         o = opt;
+        ahead_extra = std::getenv("DS4_AHEAD_EXTRA") ? std::atoi(std::getenv("DS4_AHEAD_EXTRA")) : 0;
+        disk_skip_w = [this] {
+            if (o.disk_skip_w >= 0.0f) return o.disk_skip_w;
+            const char* v = std::getenv("STRATA_DS4_DISK_SKIP_W");
+            return v != nullptr ? std::max(0.0f, (float) std::atof(v)) : 0.0f;
+        }();
+        disk_skip_from = [this] {
+            if (o.disk_skip_from > 0) return o.disk_skip_from;
+            const char* v = std::getenv("STRATA_DS4_DISK_SKIP_FROM");
+            return v != nullptr ? std::max(0, std::atoi(v)) : 0;
+        }();
+        if (disk_skip_w > 0.0f)
+            std::fprintf(stderr, "ds4: WARNING: disk skip %.3f (from layer %d) leaves out routed experts that are not in RAM: the "
+                                 "answers change and depend on what the page cache holds\n", disk_skip_w, disk_skip_from);
         const double t0 = now_ms();
         if (!pk.load(o.pack, err)) return false;
         g.from(pk);
@@ -2461,23 +2468,14 @@ struct Model::Impl {
             //  gave +4.5% on a 4K prompt but no decode gain in every pair: DS4_ENGRAM_THREADS=64 turns them on)
 #endif
             const unsigned hw = std::max(1u, std::thread::hardware_concurrency());
-            int nth = o.engram_threads > 0 ? o.engram_threads :
-#if defined(_WIN32)
-                (int) std::min(16u, std::max(4u, hw / 2));
-#else
-                (int) std::min(64u, std::max(16u, hw * 2));
-#endif
-            if (const char* e = std::getenv("DS4_ENGRAM_THREADS")) nth = std::max(1, std::atoi(e));
+            // (--engram-threads / --engram-cache-mb, else DS4_ENGRAM_THREADS / DS4_ENGRAM_CACHE_MB, else upstream's defaults)
+            int nth = (int) std::min(16u, std::max(4u, hw / 2));
+            if (o.engram_threads > 0) nth = o.engram_threads;
+            else if (const char* e = std::getenv("DS4_ENGRAM_THREADS")) nth = std::max(1, std::atoi(e));
             const uint64_t avail = ram_avail();
-            uint64_t mb = 64;
-            if (o.engram_cache_mb >= 0) {
-                mb = (uint64_t) o.engram_cache_mb;
-            } else if (const char* e = std::getenv("DS4_ENGRAM_CACHE_MB")) {
-                mb = std::strtoull(e, nullptr, 10);
-            } else if (avail != ~uint64_t{0}) {
-                // Dynamically scale Engram cache up to 10% of available RAM, capped at 4096 MB
-                mb = std::min<uint64_t>(4096, std::max<uint64_t>(64, (avail >> 20) / 10));
-            }
+            uint64_t mb = avail == ~uint64_t{0} ? 64 : std::min<uint64_t>(256, std::max<uint64_t>(16, (avail >> 20) / 64));
+            if (o.engram_cache_mb >= 0) mb = (uint64_t) o.engram_cache_mb;
+            else if (const char* e = std::getenv("DS4_ENGRAM_CACHE_MB")) mb = std::strtoull(e, nullptr, 10);
             eg_cache.init((size_t) ((mb << 20) / row), row);
             std::vector<std::string> paths;
             for (const std::string& fn : pk.files) paths.push_back(pk.model_dir + "/" + fn);
@@ -3891,16 +3889,40 @@ struct Model::Impl {
             std::fprintf(stderr, "ds4: Windows' commit has room for the GPU's experts (%.1f GB beside %.0f GB for the other "
                                  "programs)\n", room0 / 1e9, commit_margin() / 1e9);
         }
+        // --prune-experts (opt-in, CHANGES THE ANSWERS): the trunk's routed layers only (the drafter's mtp layers keep all their
+        // experts and take none of the budget), each layer's coldest experts by the profile masked out of the router
+        auto prunable = [](const Layer& l) { return !l.mtp && l.n_exp > 0 && l.gate_bias != nullptr; };
+        if (o.prune_experts > 0) {
+            // without a profile row for a layer (no profile, `none`, a profile of another size) its "coldest" experts
+            // would be its last indices: refuse rather than mask experts by number
+            for (const Layer& l : L) {
+                if (!prunable(l)) continue;
+                const uint32_t* p = prof.data() + (size_t) l.il * g.n_exp;
+                uint64_t sum = 0;
+                for (int e = 0; e < l.n_exp; ++e) sum += p[e];
+                if (sum == 0) {
+                    std::fprintf(stderr, "ds4: --prune-experts %d refused: the expert profile has no hits for layer %d (%s); "
+                                         "running with every expert\n",
+                                 o.prune_experts, l.il, o.profile.empty() ? "no profile" : o.profile.c_str());
+                    o.prune_experts = 0;
+                    break;
+                }
+            }
+        }
+        if (o.prune_experts > 0)
+            std::fprintf(stderr, "ds4: WARNING: --prune-experts %d masks the router's coldest experts: the answers change (a "
+                                 "token's pick of a masked expert goes to another one); the quality cost is not measured\n",
+                         o.prune_experts);
         std::vector<int> prune_alloc(L.size(), 0);
         if (o.prune_experts > 0 && !L.empty()) {
             int n_moe = 0;
             for (const Layer& l : L)
-                if (l.n_exp > 0 && l.gate_bias != nullptr) ++n_moe;
+                if (prunable(l)) ++n_moe;
             if (n_moe > 0) {
                 const int target_budget = std::min(o.prune_experts, L[0].n_exp) * n_moe;
                 std::vector<std::vector<double>> cum_p(L.size());
                 for (const Layer& l : L) {
-                    if (l.n_exp <= 0 || l.gate_bias == nullptr) continue;
+                    if (!prunable(l)) continue;
                     const uint32_t* p = prof.data() + (size_t) l.il * g.n_exp;
                     std::vector<uint32_t> sorted_p(p, p + l.n_exp);
                     std::sort(sorted_p.begin(), sorted_p.end(), std::greater<uint32_t>());
@@ -3920,7 +3942,7 @@ struct Model::Impl {
                     const double mid = 0.5 * (low + high);
                     int needed = 0;
                     for (const Layer& l : L) {
-                        if (l.n_exp <= 0 || l.gate_bias == nullptr) continue;
+                        if (!prunable(l)) continue;
                         const auto& c = cum_p[(size_t) l.il];
                         auto it = std::lower_bound(c.begin(), c.end(), mid);
                         int idx = (int) std::distance(c.begin(), it) + 1;
@@ -3931,7 +3953,7 @@ struct Model::Impl {
                 }
                 int cur_budget = 0;
                 for (const Layer& l : L) {
-                    if (l.n_exp <= 0 || l.gate_bias == nullptr) continue;
+                    if (!prunable(l)) continue;
                     const auto& c = cum_p[(size_t) l.il];
                     auto it = std::lower_bound(c.begin(), c.end(), low);
                     int idx = (int) std::distance(c.begin(), it) + 1;
@@ -3942,7 +3964,7 @@ struct Model::Impl {
                     int best_l = -1;
                     double min_cov = 2.0;
                     for (const Layer& l : L) {
-                        if (l.n_exp <= 0 || l.gate_bias == nullptr || prune_alloc[(size_t) l.il] >= l.n_exp) continue;
+                        if (!prunable(l) || prune_alloc[(size_t) l.il] >= l.n_exp) continue;
                         const double cov = cum_p[(size_t) l.il][(size_t) (prune_alloc[(size_t) l.il] - 1)];
                         if (cov < min_cov) { min_cov = cov; best_l = l.il; }
                     }
@@ -3954,7 +3976,7 @@ struct Model::Impl {
                     int best_l = -1;
                     double max_cov = -1.0;
                     for (const Layer& l : L) {
-                        if (l.n_exp <= 0 || l.gate_bias == nullptr || prune_alloc[(size_t) l.il] <= l.k_exp) continue;
+                        if (!prunable(l) || prune_alloc[(size_t) l.il] <= l.k_exp) continue;
                         const double cov = cum_p[(size_t) l.il][(size_t) (prune_alloc[(size_t) l.il] - 1)];
                         if (cov > max_cov) { max_cov = cov; best_l = l.il; }
                     }
@@ -4068,22 +4090,19 @@ struct Model::Impl {
                 CK(cudaMemcpy(x.vram_tab, tab.data(), tab.size() * 8, cudaMemcpyHostToDevice));
             }
             const int prune_n = prune_alloc[(size_t) l.il];
-            if (prune_n > 0 && prune_n < l.n_exp && l.gate_bias != nullptr) {
+            if (prune_n > 0 && prune_n < l.n_exp && prunable(l)) {
+                for (int i = prune_n; i < l.n_exp; ++i) l.heat[(size_t) order[(size_t) i]] = -1e9f;
+                // every member of a group routes with its own copy of the biases: each one masked the same
                 std::vector<float> gb((size_t) l.n_exp);
-                cudaSetDevice(devs[(size_t) l.dev].id);
-                CK(cudaMemcpy(gb.data(), l.gate_bias, (size_t) l.n_exp * sizeof(float), cudaMemcpyDeviceToHost));
-                for (int i = prune_n; i < l.n_exp; ++i) {
-                    const int e = order[(size_t) i];
-                    gb[(size_t) e] = -1e9f;
-                    l.heat[(size_t) e] = -1e9f;
-                }
-                CK(cudaMemcpy(l.gate_bias, gb.data(), (size_t) l.n_exp * sizeof(float), cudaMemcpyHostToDevice));
-                if (l.gate_bias_vl != nullptr) {
-                    CK(cudaMemcpy(gb.data(), l.gate_bias_vl, (size_t) l.n_exp * sizeof(float), cudaMemcpyDeviceToHost));
-                    for (int i = prune_n; i < l.n_exp; ++i) {
-                        gb[(size_t) order[(size_t) i]] = -1e9f;
+                for (int m = 0; m < l.nm; ++m) {
+                    Layer& x = member(l, m);
+                    cudaSetDevice(devs[(size_t) x.dev].id);
+                    for (float* b : {x.gate_bias, x.gate_bias_vl}) {
+                        if (b == nullptr) continue;
+                        CK(cudaMemcpy(gb.data(), b, (size_t) l.n_exp * sizeof(float), cudaMemcpyDeviceToHost));
+                        for (int i = prune_n; i < l.n_exp; ++i) gb[(size_t) order[(size_t) i]] = -1e9f;
+                        CK(cudaMemcpy(b, gb.data(), (size_t) l.n_exp * sizeof(float), cudaMemcpyHostToDevice));
                     }
-                    CK(cudaMemcpy(l.gate_bias_vl, gb.data(), (size_t) l.n_exp * sizeof(float), cudaMemcpyHostToDevice));
                 }
             }
         }
@@ -4092,7 +4111,7 @@ struct Model::Impl {
             double min_layer_cov = 1.0, max_layer_cov = 0.0;
             int min_k = L[0].n_exp, max_k = 0, total_k = 0;
             for (const Layer& l : L) {
-                if (l.n_exp <= 0 || l.gate_bias == nullptr) continue;
+                if (!prunable(l)) continue;
                 const int pn = prune_alloc[(size_t) l.il] > 0 ? prune_alloc[(size_t) l.il] : l.n_exp;
                 min_k = std::min(min_k, pn);
                 max_k = std::max(max_k, pn);
@@ -9132,6 +9151,8 @@ struct Model::Impl {
 
     void save_profile() const {
         if (o.profile.empty()) return;
+        // (a pruned run never routes to its masked experts: their counts would only fall behind, so the profile is kept as it was)
+        if (o.prune_experts > 0) return;
         const std::string tmp = o.profile + ".tmp";
         std::FILE* f = std::fopen(tmp.c_str(), "wb");
         if (f == nullptr) return;

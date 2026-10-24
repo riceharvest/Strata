@@ -1186,6 +1186,21 @@ int spec_eval(strata::ds4::Model& m, const std::string& ids_path, int n, int win
 #endif
 
 int main(int argc, char** argv) {
+#if defined(SYCL_LANGUAGE_VERSION)
+    // the SYCL (Intel) build, before the first SYCL call; a value the user set is kept.  Level Zero GPUs only (dpct's device
+    // list otherwise also holds the card's OpenCL twin and the CPU, and the engine would give each of them layers); buffers past
+    // 4 GiB (the per-layer pools, the drafter, long-context KV); ZES_ENABLE_SYSMAN for the driver's free-memory figure.
+    static const std::pair<const char*, const char*> kSyclEnv[] = {
+        {"ONEAPI_DEVICE_SELECTOR", "level_zero:gpu"}, {"UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS", "1"}, {"ZES_ENABLE_SYSMAN", "1"}};
+    for (const auto& kv : kSyclEnv) {
+        if (std::getenv(kv.first) != nullptr) continue;
+#if defined(_WIN32)
+        _putenv_s(kv.first, kv.second);
+#else
+        setenv(kv.first, kv.second, 0);
+#endif
+    }
+#endif
     strata::ds4::os::fine_timer();
     strata::ds4::Options o;
     std::string ids_s, dump, eos = "1";
