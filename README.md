@@ -44,7 +44,10 @@ agents. Your chats and files stay on your PC.
 >   - Supports **all 5 gate/up formats** (`T_IQ3S=21`, `T_IQ3XXS=18`, `T_IQ2S=22`, `T_IQ2XS=17`, `T_IQ2XXS=16`, `T_IQ4XS=23`) and **all 3 down formats** (`T_IQ4NL=20`, `T_Q2_0=42`, `T_Q8_0=8`) on Xe2 `8x16x32` int8 DPAS, fixing the `prefill.cpp` whitelist and enabling SLM activation-tile sharing (`launch_gu_wg`) for `IQ2_S` / `IQ2_XS` / `IQ2_XXS` with `tab_bytes = 0` plus coalesced prefill barrier submission.
 > - **CPU Expert Lane (`iq_avx512.cpp`, `pool.hpp`) & `DeepSeek-V4.1-Flash-1017` (`sycl/src/dsv41/`, `dsv41_fit.py`):**
 >   - **AVX-512 `VPOPCNTDQ` + `VNNI` (`_mm512_dpwssd_epi32`) in `iq512_gu_rows` / `iq512_rows`:** Enables vectorized popcount parity sign decoding (`FmtX`) and single-instruction VNNI accumulation across all CPU expert gate/up/down projections, replaces cross-lane `scales4` permutes, and cache-line-pads `ExpertPool::wstate_` (`alignas(64)`).
->   - **`DeepSeek-V4.1-Flash-1017` (`strata-dsv41`) SYCL Port & B70 Placement:** Ports `src/dsv41` to SYCL (`sycl/src/dsv41/`) and configures `strata_control/dsv41_fit.py` + `sycl/setup_intel.py` for Intel Arc Pro B70 (`ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF` `2.00bpw` / `2.25bpw` / `1.75bpw`).
+>   - **`DeepSeek-V4.1-Flash-1017` (`strata-dsv41`) Full 16-TU SYCL 2020 Port & B70 Placement (`sycl/src/dsv41/`, `sycl/CMakeLists.txt`, `dsv41_fit.py`, `sycl/setup_intel.py`):**
+>     - Ports all 6 device kernel translation units (`ds4_gemv.dp.cpp`, `ds4_mla_ops.dp.cpp`, `ds4_moe_ops.dp.cpp`, `ds4_SanityCheck.dp.cpp`, `ds4_prefill_sm120.dp.cpp`, `ds4_trellis_tricache.dp.cpp`) and all 10 host engine units (`ds4_model.cpp`, `ds4_generate.cpp`, `ds4_prefill.cpp`, `ds4_verify.cpp`, `ds4_mla.cpp`, `ds4_moe.cpp`, `ds4_CPU_moe.cpp`, `ds4_embed.cpp`, `ds4_sampler.cpp`, `ds4_tok.cpp`) to SYCL 2020 with native `sub_group_size(16)` Xe2 subgroup collectives and generic-space SLM atomics (`ds4_sycl.hpp`).
+>     - Replaces CUDA Driver API `cuMemAddressReserve` / `cuMemCreate` / `cuMemMap` virtual memory stitching in `ds4_moe.cpp` with a contiguous USM device pool (`sycl::malloc_device`) and a pinned USM host staging pool (`sycl::malloc_host`) for PCIe 5.0 DMA expert streaming.
+>     - Wires `strata-dsv41` into `sycl/CMakeLists.txt` and `sycl/setup_intel.py` alongside `strata-generate`, and updates `strata_control/dsv41_fit.py` for Intel Arc Pro B70 (`ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF` `2.00bpw` / `2.25bpw` / `1.75bpw`, reserving 1024 MiB for Level Zero and caching ~12,800–16,300 hot experts in 32 GB GDDR6 VRAM).
 
 **New here?** Check [what you need](#what-you-need), then [install the app](#option-a-the-strata-app).
 
@@ -211,7 +214,7 @@ Every size, download and what fits where: [docs/MODELS.md](docs/MODELS.md).
 
 ### DeepSeek V4.1-Flash (in the Terminal, from 0.2.4)
 
-[DeepSeek V4.1-Flash](https://huggingface.co/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF) is a different, much bigger model. ISTA-DASLab made the three sets below. Strata runs them on a PC with one 12 GB graphics card and 46 to 64 GB of RAM, and reads the rest from your SSD. It runs on NVIDIA RTX 30 to 50 cards and on the Radeon AI PRO R9700. It uses its own engine package, `strata-dsv41`, which `strata launch` downloads when you pick DeepSeek. The desktop app does not offer it yet.
+[DeepSeek V4.1-Flash](https://huggingface.co/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF) is a different, much bigger model. ISTA-DASLab made the three sets below. Strata runs them on a PC with one 12 GB graphics card and 46 to 64 GB of RAM, and reads the rest from your SSD. It runs on NVIDIA RTX 30 to 50 cards, on the Radeon AI PRO R9700, and (in this fork via `sycl/src/dsv41`) on **Intel Arc Pro B70 (32 GB)** and Battlemage cards. It uses its own engine package, `strata-dsv41`, which `strata launch` downloads (or `sycl/setup_intel.py` builds alongside `strata-generate`) when you pick DeepSeek. The desktop app does not offer it yet.
 
 | Set | Download | Quality against the original model | Writes at |
 | --- | ---: | --- | --- |
