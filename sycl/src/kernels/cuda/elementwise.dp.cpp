@@ -152,29 +152,16 @@ __dpct_inline__ void rms_norm_weighted_kernel(float *__restrict__ x,
     float acc = 0.0f;
 #pragma unroll
     for (int64_t c = lane; c < cols; c += 32) acc += r[c] * r[c];
-    /*
-DPCT1108: '__shfl_down_sync' was migrated with the experimental feature
-masked sub_group function which may not be supported by all compilers or
-runtimes. You may need to adjust the code.
-*/
+    auto sg = sycl::ext::oneapi::this_work_item::get_sub_group();
 #pragma unroll
-    for (int off = 16; off > 0; off >>= 1) acc +=
-        dpct::experimental::shift_sub_group_left(
-            0xFFFFFFFFu, sycl::ext::oneapi::this_work_item::get_sub_group(),
-            acc, off);
+    for (int off = 16; off > 0; off >>= 1)
+        acc += sycl::shift_group_left(sg, acc, off);
     // The MEAN, not the sum: `ref/qsa.py::rms_norm` divides by `np.mean(np.square(x))`.  Broadcasting the
     // reciprocal from lane 0 keeps all 32 lanes on the same value - computing `rsqrt` per lane would be the
     // same number but a needless 32-way divergence in the last bit.
     float inv = 0.0f;
     if (lane == 0) inv = sycl::rsqrt(acc / (float)cols + eps);
-    /*
-    DPCT1108: '__shfl_sync' was migrated with the experimental feature masked
-    sub_group function which may not be supported by all compilers or runtimes.
-    You may need to adjust the code.
-    */
-    inv = dpct::experimental::select_from_sub_group(
-        0xFFFFFFFFu, sycl::ext::oneapi::this_work_item::get_sub_group(), inv,
-        0);
+    inv = sycl::select_from_group(sg, inv, 0);
 #pragma unroll
     for (int64_t c = lane; c < cols; c += 32)
         r[c] = (w ? r[c] * w[c] : r[c]) * inv;
@@ -209,8 +196,7 @@ void embedding_gather(const uint8_t* codes, const float* scales, const float* of
                       float* out, void* stream) {
     if (n <= 0) return;
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         strata::q_of(stream)
             ->parallel_for<
@@ -232,8 +218,7 @@ void gdn_gate(const float* alpha, const float* dt, const float* ssm_a, float* ga
     if (n_tokens <= 0 || h_v <= 0) return;
     const int64_t n = n_tokens * h_v;
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         strata::q_of(stream)
             ->parallel_for<dpct_kernel_name<class gdn_gate_kernel_de22c0>>(
@@ -251,8 +236,7 @@ void gdn_gate(const float* alpha, const float* dt, const float* ssm_a, float* ga
 void scale_inplace(float* x, int64_t n, float s, void* stream) {
     if (n <= 0) return;
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         strata::q_of(stream)
             ->parallel_for<dpct_kernel_name<class scale_kernel_501571>>(
@@ -270,8 +254,7 @@ void scale_inplace(float* x, int64_t n, float s, void* stream) {
 void add_inplace(float* dst, const float* src, int64_t n, void* stream) {
     if (n <= 0) return;
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         strata::q_of(stream)
             ->parallel_for<dpct_kernel_name<class add_kernel_95886e>>(
@@ -289,8 +272,7 @@ void add_inplace(float* dst, const float* src, int64_t n, void* stream) {
 void f32_to_f16_bulk(const float* x, uint16_t* y, int64_t n, void* stream) {
     if (n <= 0) return;
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         strata::q_of(stream)
             ->parallel_for<dpct_kernel_name<class to_f16_kernel_ba0968>>(
@@ -308,8 +290,7 @@ void f32_to_f16_bulk(const float* x, uint16_t* y, int64_t n, void* stream) {
 void f32_to_bf16_bulk(const float* x, uint16_t* y, int64_t n, void* stream) {
     if (n <= 0) return;
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         strata::q_of(stream)
             ->parallel_for<dpct_kernel_name<class to_bf16_kernel_7b22d1>>(
@@ -327,8 +308,7 @@ void f32_to_bf16_bulk(const float* x, uint16_t* y, int64_t n, void* stream) {
 void silu_inplace(float* x, int64_t n, void* stream) {
     if (n <= 0) return;
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
         dpct::has_capability_or_fail(
             strata::q_of(stream)->get_device(),
             {sycl::aspect::fp64});
@@ -398,8 +378,7 @@ void doorbell_wait(const uint32_t* d_flag, const uint32_t* d_seq, void* stream) 
     if (d_flag == nullptr || d_seq == nullptr) return;
     const uint32_t spin_max = strata::spin_max(*strata::q_of(stream));
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         strata::q_of(stream)
             ->parallel_for<dpct_kernel_name<class doorbell_wait_kernel_47b360>>(
@@ -492,8 +471,7 @@ void scatter_rows_f32(const float* src, float* dst, const int32_t* rows, int64_t
         std::exit(1);
     }
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         strata::q_of(stream)
             ->submit([&](sycl::handler &cgh) {
@@ -520,8 +498,7 @@ void copy_rows_from_mapped(float* dst, const float* src, int64_t rows, int64_t w
         std::exit(1);
     }
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         strata::q_of(stream)
             ->submit([&](sycl::handler &cgh) {
@@ -550,8 +527,7 @@ void copy_from_mapped(float* dst, const float* src, int64_t n, void* stream) {
     const int64_t n4 = n / 4;
     const int blocks = (int) ((n4 + 255) / 256 < 64 ? (n4 + 255) / 256 : 64);
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         strata::q_of(stream)
             ->parallel_for<
@@ -744,8 +720,7 @@ void doorbell_publish_value(const float* x, const int32_t* ids, const float* wei
     Adjust the work-group size if needed.
     */
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         strata::q_of(stream)
             ->parallel_for<
@@ -771,8 +746,7 @@ void doorbell_publish(const float* x, const int32_t* ids, const float* weights, 
     Adjust the work-group size if needed.
     */
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         strata::q_of(stream)
             ->parallel_for<
@@ -800,8 +774,7 @@ void doorbell_publish_res(const float* x, const int32_t* ids, const int32_t* d_r
     Adjust the work-group size if needed.
     */
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         strata::q_of(stream)
             ->parallel_for<
@@ -893,8 +866,7 @@ void copy_from_mapped_multi(const MappedCopy* copies, int n, void* stream) {
     const int64_t units = (most + 3) / 4;
     const unsigned bx = (unsigned) ((units + 255) / 256 < 32 ? (units + 255) / 256 : 32);
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         strata::q_of(stream)
             ->parallel_for<
@@ -913,8 +885,7 @@ void copy_from_mapped_multi(const MappedCopy* copies, int n, void* stream) {
 void copy_i32_from_mapped(int32_t* dst, const int32_t* src, int64_t n, void* stream) {
     if (n <= 0) return;
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         strata::q_of(stream)
             ->parallel_for<
@@ -939,8 +910,7 @@ void copy_from_mapped_multi(const MappedCopy* copies, int n, void* stream) {
 void doorbell_ring(uint32_t* d_seq, void* stream) {
     if (d_seq == nullptr) return;
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         strata::q_of(stream)
             ->parallel_for<dpct_kernel_name<class doorbell_ring_kernel_b862a4>>(
@@ -960,8 +930,7 @@ void rms_norm_weighted(float* x, const float* w, int64_t rows, int64_t cols, flo
     const unsigned warps_per_block = 4;
     const unsigned grid = (unsigned) ((rows + warps_per_block - 1) / warps_per_block);
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         strata::q_of(stream)
             ->parallel_for<

@@ -1124,8 +1124,7 @@ bool launch_i8(const float *q, const QsaAttnPools &pools, const int32_t *ids,
     for (int64_t q0 = 0; q0 < n_q; q0 += 65535) {
         const int64_t nb = n_q - q0 < 65535 ? n_q - q0 : 65535;
         {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};
             dpct::has_capability_or_fail(st->get_device(),
                                          {sycl::aspect::fp16});
 
@@ -1206,8 +1205,7 @@ bool launch(const float *q, const QsaAttnPools &pools, const int32_t *ids,
     for (int64_t q0 = 0; q0 < n_q; q0 += 65535) {
         const int64_t nb = n_q - q0 < 65535 ? n_q - q0 : 65535;
         {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};
             dpct::has_capability_or_fail(st->get_device(),
                                          {sycl::aspect::fp16});
 

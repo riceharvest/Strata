@@ -678,7 +678,11 @@ bool router_top10_variant(const float* logits, int n_tokens, int n_expert, int k
 
 void router_top10(const float *logits, int n_tokens, int n_expert, int k,
                   int *ids, float *weights, void *stream) try {
-    if (strata::a770_fast() && n_tokens > 0 && n_expert > 64 && n_expert <= 512 && k > 0 && k <= 32) {
+    static const bool s6_old = [] {
+        const char* v = std::getenv("STRATA_SYCL_ROUTER_OLD");
+        return v && v[0] == '1';
+    }();
+    if (!s6_old && n_tokens > 0 && n_expert > 64 && n_expert <= 512 && k > 0 && k <= 32) {
         auto& q = *strata::q_of(stream);
         launch_sycl_fast<false>(q, logits, n_tokens, n_expert, k, ids, weights);
         if (stream == nullptr) q.wait_and_throw();
@@ -753,8 +757,7 @@ void router_top10(const float *logits, int n_tokens, int n_expert, int k,
     Adjust the work-group size if needed.
     */
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
         dpct::has_capability_or_fail(
             strata::q_of(stream)->get_device(),
             {sycl::aspect::fp64});

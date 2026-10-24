@@ -843,7 +843,7 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
     const int tb_[2] = {0, (T + 1) / 2}, te_[2] = {G == 2 ? (T + 1) / 2 : T, T};
     // S26 STRATA_LFUSE=1: where the shared expert's gate / scale fusions apply (the paths they replace are the ones taken)
     auto lfuse_on = [&](int n) {
-        return g_lfuse() && ar_on() && native_moe_combine_enabled() && dec_batch && n > 1 && n <= 8 &&
+        return g_lfuse() && (ar_on() || lean) && native_moe_combine_enabled() && dec_batch && n > 1 && n <= 8 &&
                shared_expert_native_bf16_enabled();
     };
     bool sg_gated_[2] = {false, false};   // per group: the combine applies the shared gate
@@ -1301,7 +1301,7 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
         const bool sh_fork = sh_stream_on() && !prof_on_ && !g_stepped &&
                              sh_cs_ != &dpct::get_in_order_queue() &&
                              ev_fork_ != nullptr && ev_join_ != nullptr;
-        const bool sh_fork_late = sh_fork && sh_fork_late_env && !ar_on();
+        const bool sh_fork_late = sh_fork && sh_fork_late_env && !ar_on() && !lean;
         dpct::queue_ptr sh_stream = sh_fork ? sh_cs_ : cs;
         if (sh_fork && !sh_fork_late) {
             dpct::sync_barrier(ev_fork_, cs);
@@ -1463,7 +1463,7 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
                                hit_xs_ + (size_t) tb * (N / 32), hit_scratch_, dst_buf, cs);
             }
         };
-        if (ar_on()) {
+        if (ar_on() || lean) {
             stamp(l, 19, grp);
             grouped(p_ptr, p_start, p_counts, 0, parts_out);
             stamp(l, 20, grp);

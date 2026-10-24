@@ -272,8 +272,7 @@ void cvec_apply(float *R, int64_t layer, int64_t T, int64_t r_ld,
     if (t.dir == nullptr) throw std::runtime_error("cvec_apply: the control vector is not on this device (cvec_replicate)");
     const dpct::dim3 grid((unsigned)g_cvec.hc, (unsigned)T);
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         strata::q_of(stream)
             ->submit([&](sycl::handler &cgh) {

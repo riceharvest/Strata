@@ -290,8 +290,7 @@ void native_qsa_score(const float* pooled,const float* query,const float* bias,
         pooled,query,bias,step,int(max_cells),cells);
 #else
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         ((sycl::queue *)(strata::q_of(stream)))
             ->parallel_for<dpct_kernel_name<class score_kernel_59cd1b>>(

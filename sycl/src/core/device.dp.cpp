@@ -425,8 +425,7 @@ DeviceArena::DeviceArena(uint64_t bytes, int ordinal, bool poison)
         for (uint64_t b = 0; b < blocks; b += max_blocks) {
             const uint64_t chunk = (blocks - b < max_blocks) ? (blocks - b) : max_blocks;
             {
-                auto exp_props = sycl::ext::oneapi::experimental::properties{
-                    sycl::ext::oneapi::experimental::use_root_sync};
+                auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
                 dpct::get_in_order_queue().submit([&](sycl::handler &cgh) {
                     auto float_base__b_threads_ct0 =

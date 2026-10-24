@@ -112,6 +112,20 @@ int dp4a_ref(int a, int b, int c) {
     return c + (int) pa[0] * pb[0] + (int) pa[1] * pb[1] + (int) pa[2] * pb[2] + (int) pa[3] * pb[3];
 }
 
+int q6_k_centred(const int v) {
+    const uint32_t b = (uint32_t) v ^ 0x20202020u;
+    return (int) (b | ((b & 0x20202020u) * 6u));
+}
+
+int ref_q6_k_centred(const int v) {
+    uint32_t out = 0;
+    for (int i = 0; i < 4; ++i) {
+        const int b = (int) (((uint32_t) v >> (8 * i)) & 0x3Fu) - 32;
+        out |= (uint32_t) (uint8_t) (int8_t) b << (8 * i);
+    }
+    return (int) out;
+}
+
 }  // namespace
 
 int main() {
@@ -219,6 +233,14 @@ int main() {
             int esimd_dot = 0;
             for (int j = 0; j < 8; ++j) esimd_dot = dp4a_ref((int) fr0[j], q8[ib][j], esimd_dot);
             CHECK(esimd_dot * ((int) esimd_ls - 32) == ref_sumi, "ESIMD T_IQ4XS dot matches ref_sumi");
+        }
+    }
+
+    // 5. Test q6_k_centred across all 6-bit unsigned byte values (0..63) and random packed words
+    for (int b0 = 0; b0 < 64; ++b0) {
+        for (int b1 = 0; b1 < 64; ++b1) {
+            const int v = b0 | (b1 << 8) | (((b0 ^ 37) & 63) << 16) | (((b1 ^ 53) & 63) << 24);
+            CHECK(q6_k_centred(v) == ref_q6_k_centred(v), "q6_k_centred matches per-byte b - 32");
         }
     }
 

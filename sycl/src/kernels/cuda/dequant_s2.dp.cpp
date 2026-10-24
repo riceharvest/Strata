@@ -48,8 +48,7 @@ void dequant_s2(const uint8_t *codes, const float *scales, float *out,
     const int threads = 256;
     const long long blocks = (n_blocks + threads - 1) / threads;
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         dpct::get_in_order_queue()
             .parallel_for<dpct_kernel_name<class dequant_s2_kernel_bdb833>>(

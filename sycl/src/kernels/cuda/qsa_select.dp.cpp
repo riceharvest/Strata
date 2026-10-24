@@ -1579,8 +1579,7 @@ void qsa_block_scores(const float* pooled, const float* dead, const float* q_idx
         // STRATA_QSA_EARLY_EXIT=0 keeps the old staging (every CTA loads the queries first); the scores are the same bits
         static const bool early = [] { const char* v = std::getenv("STRATA_QSA_EARLY_EXIT"); return v == nullptr || std::atoi(v) != 0; }();
         {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
             strata::q_of(stream)
                 ->submit([&](sycl::handler &cgh) {
@@ -1619,8 +1618,7 @@ void qsa_block_scores(const float* pooled, const float* dead, const float* q_idx
     const dpct::dim3 grid((unsigned)((reach + SCORE_WARPS - 1) / SCORE_WARPS),
                           (unsigned)nq);
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         strata::q_of(stream)
             ->parallel_for<dpct_kernel_name<class block_scores_kernel_925c9d>>(
@@ -1727,8 +1725,7 @@ bool qsa_block_scores_tc(const float *pooled, const float *dead,
     const dpct::dim3 grid((unsigned)((reach + per - 1) / per),
                           (unsigned)((nq + TC_QT - 1) / TC_QT));
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         strata::q_of(stream)
             ->submit([&](sycl::handler &cgh) {
@@ -1749,8 +1746,7 @@ bool qsa_block_scores_tc(const float *pooled, const float *dead,
             });
     }
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         strata::q_of(stream)
             ->parallel_for<
@@ -1794,8 +1790,7 @@ void qsa_block_topk_ref(const float* scores, const int32_t* steps, int64_t nq, i
         std::exit(1);
     }
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         strata::q_of(stream)
             ->parallel_for<dpct_kernel_name<class block_topk_kernel_213104>>(
@@ -2018,8 +2013,7 @@ void qsa_block_topk(const float* scores, const int32_t* steps, int64_t nq, int64
         info::device::max_work_group_size. Adjust the work-group size if needed.
         */
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         strata::q_of(stream)
             ->parallel_for<
@@ -2042,8 +2036,7 @@ void qsa_block_topk(const float* scores, const int32_t* steps, int64_t nq, int64
         info::device::max_work_group_size. Adjust the work-group size if needed.
         */
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         strata::q_of(stream)
             ->parallel_for<dpct_kernel_name<class block_topk_reg_kernel_6ae5f0,
@@ -2064,8 +2057,7 @@ void qsa_block_topk(const float* scores, const int32_t* steps, int64_t nq, int64
     info::device::max_work_group_size. Adjust the work-group size if needed.
     */
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         strata::q_of(stream)
             ->parallel_for<dpct_kernel_name<class block_topk_reg_kernel_10a848,

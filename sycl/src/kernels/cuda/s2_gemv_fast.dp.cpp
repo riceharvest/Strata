@@ -181,8 +181,7 @@ void s2_gemv_fast(const uint16_t *x, const uint8_t *codes, const float *scales,
         */
         c_codes.init();
 
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
         dpct::has_capability_or_fail(dpct::get_in_order_queue().get_device(),
                                      {sycl::aspect::fp16});
 
@@ -213,8 +212,7 @@ void s2_gemv_fast(const uint16_t *x, const uint8_t *codes, const float *scales,
         */
         c_codes.init();
 
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
         dpct::has_capability_or_fail(dpct::get_in_order_queue().get_device(),
                                      {sycl::aspect::fp16});
 

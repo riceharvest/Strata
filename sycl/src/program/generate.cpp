@@ -2078,6 +2078,8 @@ int main(int argc, char **argv) try {
         if (cudaGetDeviceProperties(&ad, 0) == cudaSuccess) strata::core::apply_arch_defaults(ad.gcnArchName);
         else (void) cudaGetLastError();
     }
+#else
+    strata::apply_sycl_arch_defaults();
 #endif
     strata::core::set_coupled_draft(o.coupled_draft);
     {   // --host-core / STRATA_HOST_CORE, before the pool and the session pin any thread

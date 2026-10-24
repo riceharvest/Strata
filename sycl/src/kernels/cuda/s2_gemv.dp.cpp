@@ -61,8 +61,7 @@ void s2_gemv(const uint16_t *x, const uint8_t *codes, const float *scales,
     const int threads = 128;
     const long long blocks = (n_out + threads - 1) / threads;
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         dpct::get_in_order_queue()
             .parallel_for<dpct_kernel_name<class s2_gemv_kernel_163eb8>>(

@@ -499,8 +499,7 @@ void gr_read(const float *R, const float *w_norm, const uint16_t *w_down,
         native_gr_pre_gated(ws.xn, ws.gated, mixed, n_embd, hc, w_inject != nullptr, stream);
     } else if (use_fp32) {
         {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};
             dpct::has_capability_or_fail(st->get_device(),
                                          {sycl::aspect::fp64});
 
@@ -517,8 +516,7 @@ void gr_read(const float *R, const float *w_norm, const uint16_t *w_down,
                     });
         }
         {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
             st->parallel_for<
                 dpct_kernel_name<class gr_down_kernel_6ff92b, float>>(
@@ -533,8 +531,7 @@ void gr_read(const float *R, const float *w_norm, const uint16_t *w_down,
                     });
         }
         {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
             st->parallel_for<
                 dpct_kernel_name<class gr_gate_kernel_abf73c, float>>(
@@ -551,8 +548,7 @@ void gr_read(const float *R, const float *w_norm, const uint16_t *w_down,
         }
     } else {
         {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};
             dpct::has_capability_or_fail(st->get_device(),
                                          {sycl::aspect::fp64});
 
@@ -569,8 +565,7 @@ void gr_read(const float *R, const float *w_norm, const uint16_t *w_down,
                     });
         }
         {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
             st->parallel_for<
                 dpct_kernel_name<class gr_down_kernel_518fbb, uint16_t>>(
@@ -585,8 +580,7 @@ void gr_read(const float *R, const float *w_norm, const uint16_t *w_down,
                     });
         }
         {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
             st->parallel_for<
                 dpct_kernel_name<class gr_gate_kernel_feafeb, uint16_t>>(
@@ -604,8 +598,7 @@ void gr_read(const float *R, const float *w_norm, const uint16_t *w_down,
     }
     if (!use_native)
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         st->parallel_for<dpct_kernel_name<class gr_mean_kernel_f4c4e8>>(
             sycl::nd_range<3>(
@@ -630,8 +623,7 @@ void gr_read(const float *R, const float *w_norm, const uint16_t *w_down,
             needed.
             */
         {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
             st->parallel_for<
                 dpct_kernel_name<class gr_inject_kernel_569ce0, float>>(
@@ -651,8 +643,7 @@ void gr_read(const float *R, const float *w_norm, const uint16_t *w_down,
         needed.
         */
         {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
             st->parallel_for<
                 dpct_kernel_name<class gr_inject_kernel_d9aa02, uint16_t>>(
@@ -744,8 +735,7 @@ void gr_write(const float *R, const float *block_out, const float *inject,
     if (native_mmvf)
         native_gr_post(R, block_out, inject, R_out, (int) s.n_embd, (int) s.hc, stream);
     else {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         strata::q_of(stream)
             ->submit([&](sycl::handler &cgh) {

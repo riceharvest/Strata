@@ -1254,8 +1254,7 @@ void launch(int ww, unsigned grid, const Batch &b, const NativeGeom &g,
                 iq3s_grid.init(*s);
                 kvalues_iq4nl.init(*s);
 
-                auto exp_props = sycl::ext::oneapi::experimental::properties{
-                    sycl::ext::oneapi::experimental::use_root_sync};
+                auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
                 s->submit([&](sycl::handler &cgh) {
                     auto iq2xxs_grid_ptr_ct1 = iq2xxs_grid.get_ptr();
@@ -1303,8 +1302,7 @@ void launch(int ww, unsigned grid, const Batch &b, const NativeGeom &g,
                 iq3s_grid.init(*s);
                 kvalues_iq4nl.init(*s);
 
-                auto exp_props = sycl::ext::oneapi::experimental::properties{
-                    sycl::ext::oneapi::experimental::use_root_sync};
+                auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
                 s->submit([&](sycl::handler &cgh) {
                     auto iq2xxs_grid_ptr_ct1 = iq2xxs_grid.get_ptr();
@@ -1370,8 +1368,7 @@ void quantize_act_native(const float* x, int64_t rows, int64_t cols, void* xa, v
     if (rows <= 0) return;
     const int64_t nblk = rows * (cols / 64);
         {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
             strata::q_of(stream)
                 ->parallel_for<

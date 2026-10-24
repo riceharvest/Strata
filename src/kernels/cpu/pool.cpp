@@ -846,7 +846,7 @@ ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works, PoolAffinity af
     plan_logical_ = plan_in.logical;
     if (n_ < 1) n_ = 1;
     scratch_.resize((size_t) n_);
-    wstate_.reset(new std::atomic<int32_t>[(size_t) n_]);
+    wstate_.reset(new WorkerState[(size_t) n_]);
     for (int i = 0; i < n_; ++i) wstate_[(size_t) i].store(kParked);
     hstate_ms_.store(now_ms());
     g_diag_pool.store(this);

@@ -424,6 +424,21 @@ inline void* range_reserve(size_t bytes) {
 #if defined(_WIN32)
     return VirtualAlloc(nullptr, bytes, MEM_RESERVE, PAGE_READWRITE);
 #else
+    if (bytes == 0) return nullptr;
+    constexpr size_t kHuge = 2ull << 20;
+    if ((bytes & 4095) == 0) {
+        const size_t span = bytes + kHuge;
+        void* raw = ::mmap(nullptr, span, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+        if (raw != MAP_FAILED) {
+            const uintptr_t u = (uintptr_t) raw;
+            const uintptr_t aligned = (u + kHuge - 1) & ~(uintptr_t) (kHuge - 1);
+            const size_t lead = aligned - u;
+            if (lead > 0) ::munmap(raw, lead);
+            const size_t tail = span - lead - bytes;
+            if (tail > 0) ::munmap((void*) (aligned + bytes), tail);
+            return (void*) aligned;
+        }
+    }
     void* m = ::mmap(nullptr, bytes, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
     return m == MAP_FAILED ? nullptr : m;
 #endif
@@ -432,7 +447,9 @@ inline bool range_commit(void* p, size_t bytes) {
 #if defined(_WIN32)
     return VirtualAlloc(p, bytes, MEM_COMMIT, PAGE_READWRITE) != nullptr;
 #else
-    return ::mprotect(p, bytes, PROT_READ | PROT_WRITE) == 0;
+    if (::mprotect(p, bytes, PROT_READ | PROT_WRITE) != 0) return false;
+    ::madvise(p, bytes, MADV_HUGEPAGE);
+    return true;
 #endif
 }
 /// A committed piece of a reserved range given back to the system (its address range stays reserved)

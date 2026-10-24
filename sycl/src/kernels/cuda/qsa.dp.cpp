@@ -869,8 +869,7 @@ void kv_append_step(uint16_t* k_pool, uint16_t* v_pool, const int32_t* page_tabl
     // The grid is the head x dim count, which is a CONSTANT - `kv_append` writes one cell.
     const long long n = s.n_head_kv * s.head_dim;
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         strata::q_of(stream)
             ->submit([&](sycl::handler &cgh) {
@@ -908,8 +907,7 @@ void qsa_index_step(const float* pooled, const float* q_idx, const float* bias, 
     Adjust the work-group size if needed.
     */
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
         dpct::has_capability_or_fail(
             strata::q_of(stream)->get_device(),
             {sycl::aspect::fp64});
@@ -946,8 +944,7 @@ void topk_512_step(const float* cell_scores, const QsaShapes& s, int64_t cap, co
     }
     // One block, so the launch is already constant; the kernel reads `n_kv` and `width` from `step`.
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         strata::q_of(stream)
             ->parallel_for<dpct_kernel_name<class topk_kernel_97d5c9>>(
@@ -971,8 +968,7 @@ void kv_gather_step(const uint16_t* k_pool, const uint16_t* v_pool, const int32_
     // guard leaves the surplus threads idle.
     const long long total = max_ids * s.n_head_kv * (s.head_dim / 4);
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         strata::q_of(stream)
             ->parallel_for<dpct_kernel_name<class kv_gather_kernel_3473e7>>(
@@ -1041,8 +1037,7 @@ void qsa_attend_step(const float *q, const uint16_t *k_scratch,
     Adjust the work-group size if needed.
     */
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         strata::q_of(stream)
             ->submit([&](sycl::handler &cgh) {
@@ -1124,8 +1119,7 @@ void indexer_key_append(const float* raw, const int32_t* pos_dev, int32_t pos_ba
     Adjust the work-group size if needed.
     */
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
         dpct::has_capability_or_fail(
             strata::q_of(stream)->get_device(),
             {sycl::aspect::fp64});
@@ -1228,8 +1222,7 @@ void qsa_gate_apply_f32(const float* attn, const float* q_full, const QsaShapes&
     validate(s, "qsa_gate_apply_f32");
     const long long n = s.n_head * s.head_dim;
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
         dpct::has_capability_or_fail(
             strata::q_of(stream)->get_device(),
             {sycl::aspect::fp64});
@@ -1253,8 +1246,7 @@ void qsa_gate_apply(const float* attn, const float* q_full, const QsaShapes& s, 
     validate(s, "qsa_gate_apply");
     const long long n = s.n_head * s.head_dim;
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
         dpct::has_capability_or_fail(
             strata::q_of(stream)->get_device(),
             {sycl::aspect::fp64});

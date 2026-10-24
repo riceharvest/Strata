@@ -48,19 +48,13 @@ __dpct_inline__ void fwht256_kernel(const float *__restrict__ src,
     for (int i = 0; i < el_w; ++i) reg[i] = row_src[i * warp_size + lane] * scale;
 
     // the low 5 index bits live across lanes
+    auto sg = sycl::ext::oneapi::this_work_item::get_sub_group();
 #pragma unroll
     for (int h = 1; h < warp_size; h *= 2) {
 #pragma unroll
         for (int j = 0; j < el_w; ++j) {
             const float val = reg[j];
-            /*
-            DPCT1108: '__shfl_xor_sync' was migrated with the experimental
-            feature masked sub_group function which may not be supported by all
-            compilers or runtimes. You may need to adjust the code.
-            */
-            const float val2 = dpct::experimental::permute_sub_group_by_xor(
-                0xffffffffu, sycl::ext::oneapi::this_work_item::get_sub_group(),
-                val, h);
+            const float val2 = sycl::permute_group_by_xor(sg, val, h);
             reg[j] = (lane & h) == 0 ? val + val2 : val2 - val;
         }
     }
@@ -89,24 +83,11 @@ __dpct_inline__ void fwht256_kernel(const float *__restrict__ src,
 // so all lanes agree on d (a plain `a > amax` could leave lanes with opposite signs and one block two scales).
 __dpct_inline__ uint16_t q4_group(float x, int lane, uint8_t &byte) {
     float amax = sycl::fabs(x), mval = x;
+    auto sg = sycl::ext::oneapi::this_work_item::get_sub_group();
 #pragma unroll
     for (int o = 16; o > 0; o >>= 1) {
-        /*
-        DPCT1108: '__shfl_xor_sync' was migrated with the experimental
-        feature masked sub_group function which may not be supported by all
-        compilers or runtimes. You may need to adjust the code.
-        */
-        const float a = dpct::experimental::permute_sub_group_by_xor(
-            0xffffffffu, sycl::ext::oneapi::this_work_item::get_sub_group(),
-            amax, o);
-        /*
-        DPCT1108: '__shfl_xor_sync' was migrated with the experimental
-        feature masked sub_group function which may not be supported by all
-        compilers or runtimes. You may need to adjust the code.
-        */
-        const float v = dpct::experimental::permute_sub_group_by_xor(
-            0xffffffffu, sycl::ext::oneapi::this_work_item::get_sub_group(),
-            mval, o);
+        const float a = sycl::permute_group_by_xor(sg, amax, o);
+        const float v = sycl::permute_group_by_xor(sg, mval, o);
         if (a > amax || (a == amax && v > mval)) { amax = a; mval = v; }
     }
     const float d = mval / -8.0f;
@@ -114,14 +95,7 @@ __dpct_inline__ uint16_t q4_group(float x, int lane, uint8_t &byte) {
     int q = sycl::vec<float, 1>{(x * id + 8.5f)}
                 .convert<int, sycl::rounding_mode::rtz>()[0];
     const uint8_t qc = (uint8_t) (q < 0 ? 0 : (q > 15 ? 15 : q));
-    /*
-    DPCT1108: '__shfl_down_sync' was migrated with the experimental feature
-    masked sub_group function which may not be supported by all compilers or
-    runtimes. You may need to adjust the code.
-    */
-    const uint8_t qhi = dpct::experimental::shift_sub_group_left(
-        0xffffffffu, sycl::ext::oneapi::this_work_item::get_sub_group(), qc,
-        16);
+    const uint8_t qhi = sycl::shift_group_left(sg, qc, 16);
     byte = (uint8_t) (qc | (qhi << 4));
     (void) lane;
     return f16_from_f32(d);
@@ -248,8 +222,7 @@ void fwht256_cuda(const float* src, float* dst, int64_t n_rows, void* stream) {
     const int rows_per_block = 4;
     const int64_t num_blocks = (n_rows + rows_per_block - 1) / rows_per_block;
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         strata::q_of(stream)
             ->submit([&](sycl::handler &cgh) {
@@ -278,8 +251,7 @@ void kv_append_q4_steps(uint8_t* k_q4, uint8_t* v_q4, const int32_t* page_table,
     const dpct::dim3 grid((unsigned)s.n_head_kv, (unsigned)(s.head_dim / QK4_0),
                           (unsigned)(n_steps * planes));
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         strata::q_of(stream)
             ->submit([&](sycl::handler &cgh) {
@@ -320,8 +292,7 @@ void kv_append_q4(uint8_t* k_q4, uint8_t* v_q4, const int32_t* page_table, int64
     const KvHostPools h = host ? *host : KvHostPools{}, st = stage ? *stage : KvHostPools{};
     for (int is_v = 0; is_v < 2; ++is_v)
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         cs->parallel_for<
             dpct_kernel_name<class kv_append_q4_batch_kernel_11c37a>>(
@@ -346,8 +317,7 @@ void kv_gather_q4_step(const uint8_t* k_q4, const uint8_t* v_q4, const int32_t* 
     const int rows_per_block = 4;
     const unsigned num_blocks = (unsigned) ((total_blocks + rows_per_block - 1) / rows_per_block);
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         strata::q_of(stream)
             ->parallel_for<dpct_kernel_name<class kv_gather_q4_kernel_300c16>>(
