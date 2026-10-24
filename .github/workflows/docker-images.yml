@@ -1,6 +1,7 @@
 name: Docker images
 
-# Builds the Strata container images of one release from its engine packages and pushes them to ghcr.io.
+# Builds the Strata container image (the Intel Arc / SYCL flavor, the only one) of one release from its engine package and pushes it
+# to ghcr.io.
 # Run by hand only (Actions tab -> Docker images -> Run workflow). Nothing starts it on its own.
 #
 # For each flavor the job downloads the engine package from the release and checks it against the signed update feed
@@ -17,7 +18,7 @@ on:
         required: true
         type: string
       flavors:
-        description: 'Flavors to build, comma separated (empty: every flavor the release has a package for)'
+        description: 'Flavors to build, comma separated (empty: sycl, the only flavor, when the release has a package for it)'
         required: false
         default: ''
         type: string
