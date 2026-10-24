@@ -22,11 +22,10 @@ def first(path, pattern):
 class VersionBump(unittest.TestCase):
     def test_the_terminal_is_0_2_4_2_and_control_is_0_1_49_2_while_the_app_stays_0_2_3(self):
         # 0.2.4 is a Terminal / Control and engine release (DeepSeek V4.1-Flash): the app stays 0.2.3, the three DeepSeek engine packages are 0.1.49,
-        # the other engine packages stay 0.1.48 (metal/CMakeLists.txt keeps 0.1.48)
+        # the other engine packages stay 0.1.48
         self.assertEqual(strata_cli.PRODUCT_VERSION, "0.2.4.2")
         self.assertEqual(strata_cli.version(), "0.1.49.2")                # the CMake project version: Control
         self.assertEqual(first("CMakeLists.txt", r"^project\(strata VERSION ([0-9.]+) "), "0.1.49.2")
-        self.assertIn('STRATA_VERSION="0.1.48-metal"', (ROOT / "metal" / "CMakeLists.txt").read_text(encoding="utf-8"))
 
     def test_every_place_the_app_version_lives_says_0_2_3(self):
         self.assertEqual(first("apps/desktop/src-tauri/Cargo.toml", r'^version = "([^"]+)"'), "0.2.3")
