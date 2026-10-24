@@ -4,16 +4,10 @@
 
 #include <algorithm>
 #include <atomic>
-#include <cstdio>
-#include <cstdlib>
 #include <cstring>
-#include <sstream>
 #include <utility>
 #include <fcntl.h>
 #include <unistd.h>
-#ifdef __linux__
-#include <sys/mman.h>
-#endif
 #include <dpct/dpct.hpp>
 #include <sycl/sycl.hpp>
 #include <thread>
@@ -22,96 +16,6 @@ namespace strata::core {
 
 namespace {
 constexpr size_t kRing = 512;   // blobs alive at once: the prompt path holds a layer's worth of streamed experts
-
-std::string read_small_file(const char* path) {
-    if (!path) return {};
-    FILE* f = std::fopen(path, "r");
-    if (!f) return {};
-    std::string out;
-    char buf[4096];
-    while (size_t n = std::fread(buf, 1, sizeof(buf), f)) out.append(buf, n);
-    std::fclose(f);
-    return out;
-}
-}
-
-BuddyInfoStats parse_buddyinfo(const char* text) {
-    BuddyInfoStats st{};
-    if (!text) return st;
-    std::istringstream iss(text);
-    std::string line;
-    while (std::getline(iss, line)) {
-        std::istringstream ls(line);
-        std::string node_lbl, node_id, zone_lbl, zone_name;
-        if (!(ls >> node_lbl >> node_id >> zone_lbl >> zone_name)) continue;
-        if (zone_lbl != "zone" || zone_name != "Normal") continue;
-        uint64_t ord[11] = {0};
-        int got = 0;
-        for (int i = 0; i < 11; ++i) {
-            if (ls >> ord[i]) ++got;
-            else break;
-        }
-        if (got >= 11) {
-            st.order9 += ord[9];
-            st.order10 += ord[10];
-            st.valid = true;
-        }
-    }
-    st.high_order_blocks = st.order9 + st.order10;
-    st.high_order_bytes = st.order9 * (2ull << 20) + st.order10 * (4ull << 20);
-    return st;
-}
-
-BuddyInfoStats read_buddyinfo(const char* path) {
-    const std::string s = read_small_file(path);
-    return parse_buddyinfo(s.c_str());
-}
-
-std::string parse_thp_mode(const char* text) {
-    if (!text) return {};
-    const char* l = std::strchr(text, '[');
-    if (!l) return {};
-    const char* r = std::strchr(l + 1, ']');
-    if (!r || r <= l + 1) return {};
-    return std::string(l + 1, (size_t) (r - (l + 1)));
-}
-
-std::string read_thp_mode(const char* path) {
-    const std::string s = read_small_file(path);
-    return parse_thp_mode(s.c_str());
-}
-
-uint64_t parse_anon_hugepages_kb(const char* text) {
-    if (!text) return 0;
-    std::istringstream iss(text);
-    std::string line;
-    while (std::getline(iss, line)) {
-        if (line.compare(0, 14, "AnonHugePages:") == 0) {
-            unsigned long long kb = 0;
-            if (std::sscanf(line.c_str() + 14, "%llu", &kb) == 1) return (uint64_t) kb;
-        }
-    }
-    return 0;
-}
-
-uint64_t read_anon_hugepages_kb(const char* path) {
-    const std::string s = read_small_file(path);
-    return parse_anon_hugepages_kb(s.c_str());
-}
-
-bool advise_mirror_hugepage(void* ptr, size_t bytes) {
-    if (!ptr || bytes == 0) return false;
-    const char* env = std::getenv("STRATA_MIRROR_HUGEPAGE");
-    if (env && std::strcmp(env, "0") == 0) return false;
-#if defined(__linux__) && defined(MADV_HUGEPAGE)
-    constexpr uintptr_t kPage = 4096u;
-    const uintptr_t start = reinterpret_cast<uintptr_t>(ptr) & ~(kPage - 1u);
-    const uintptr_t end = (reinterpret_cast<uintptr_t>(ptr) + bytes) & ~(kPage - 1u);
-    if (end <= start) return false;
-    return ::madvise(reinterpret_cast<void*>(start), (size_t) (end - start), MADV_HUGEPAGE) == 0;
-#else
-    return false;
-#endif
 }
 
 GgufExpertSource::~GgufExpertSource() { close(); }
@@ -119,7 +23,7 @@ GgufExpertSource::~GgufExpertSource() { close(); }
 void GgufExpertSource::close() {
     for (uint8_t* c : mirror_chunks_) if (c) sycl::free(c, dpct::get_in_order_queue());
     mirror_chunks_.clear();
-    mirror_bytes_ = 0; mirror_hugepage_bytes_ = 0; mirror_ptr_.clear(); layer_first_.clear();
+    mirror_bytes_ = 0; mirror_ptr_.clear(); layer_first_.clear();
     for (int fd : fds_) if (fd >= 0) ::close(fd);
     fds_.clear(); names_.clear(); layer_fd_.clear(); ring_.clear(); ring_key_.clear(); where_.clear();
     ring_next_ = 0;
@@ -237,7 +141,6 @@ int64_t GgufExpertSource::mirror(const std::vector<std::pair<int64_t, int64_t>>&
         ~ChunkCleanup() { if (armed) for (uint8_t* c : v) if (c) sycl::free(c, dpct::get_in_order_queue()); }
     } cleanup{chunks};
     std::vector<uint8_t*> ptrs(take.size(), nullptr);
-    const uint64_t hp_before_kb = read_anon_hugepages_kb();
     uint64_t placed = 0;
     uint8_t* cur = nullptr;
     uint64_t cur_off = 0, cur_size = 0;
@@ -257,11 +160,6 @@ int64_t GgufExpertSource::mirror(const std::vector<std::pair<int64_t, int64_t>>&
                     err = "mirror: no pinned host memory for " + std::to_string(want >> 20) + " MiB";
                 return -1;
             }
-            // Strata#3681 (Battlemage B70): advise the kernel to back each 2 GiB USM host chunk with 2 MiB PMD
-            // transparent hugepages before the reader threads fault it in. On distributions where THP defaults to
-            // [madvise], omitting MADV_HUGEPAGE backs the 26 GiB mirror with 4 KiB order-0 pages, thrashing the PCIe
-            // IOTLB under xe + IOMMU DMA-FQ (9.6-15.0 GB/s vs 24.0 GB/s, 26.9 vs 42.7 tok/s).
-            advise_mirror_hugepage(nc, (size_t) want);
             chunks.push_back(nc);
             cur = nc; cur_off = 0; cur_size = want;
         }
@@ -289,12 +187,10 @@ int64_t GgufExpertSource::mirror(const std::vector<std::pair<int64_t, int64_t>>&
         err = "mirror: reading an expert from the GGUF failed";
         return -1;
     }
-    const uint64_t hp_after_kb = read_anon_hugepages_kb();
     for (uint8_t* c : mirror_chunks_) if (c) sycl::free(c, dpct::get_in_order_queue());
     mirror_chunks_ = std::move(chunks);
     cleanup.armed = false;                                  // the chunks now belong to the object
     mirror_bytes_ = total;
-    mirror_hugepage_bytes_ = (hp_after_kb > hp_before_kb) ? ((hp_after_kb - hp_before_kb) << 10) : 0;
     mirror_ptr_.assign((size_t) (n_layers_ * n_expert_), nullptr);
     layer_first_.assign((size_t) n_layers_, nullptr);
     for (size_t j = 0; j < take.size(); ++j) {

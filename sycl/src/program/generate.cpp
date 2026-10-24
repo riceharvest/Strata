@@ -2078,8 +2078,6 @@ int main(int argc, char **argv) try {
         if (cudaGetDeviceProperties(&ad, 0) == cudaSuccess) strata::core::apply_arch_defaults(ad.gcnArchName);
         else (void) cudaGetLastError();
     }
-#else
-    strata::apply_sycl_arch_defaults();
 #endif
     strata::core::set_coupled_draft(o.coupled_draft);
     {   // --host-core / STRATA_HOST_CORE, before the pool and the session pin any thread
@@ -5035,28 +5033,10 @@ int main(int argc, char **argv) try {
                              err.c_str());
                 err.clear();
             } else {
-                const auto buddy = strata::core::read_buddyinfo();
-                const std::string thp = strata::core::read_thp_mode();
                 std::fprintf(stderr, "strata generate: %lld of %zu experts missing from VRAM (+ %zu in the prompt loan's slots) mirrored in pinned host memory "
-                                     "(%.2f GiB, %.2f GiB 2M hugepages, %.1f s); the GPU reads them over PCIe\n",
-                             (long long) got, n_true_miss, miss.size() - n_true_miss,
+                                     "(%.2f GiB, %.1f s); the GPU reads them over PCIe\n", (long long) got, n_true_miss, miss.size() - n_true_miss,
                              (double) gguf_src.mirrored_bytes() / 1073741824.0,
-                             (double) gguf_src.mirror_hugepage_bytes() / 1073741824.0,
                              std::chrono::duration<double>(Clock::now() - tm).count());
-                if (gguf_src.mirrored_bytes() >= (1ull << 30) &&
-                    (thp == "never" || (buddy.valid && buddy.high_order_blocks < 64 &&
-                                        gguf_src.mirror_hugepage_bytes() * 2 < gguf_src.mirrored_bytes()))) {
-                    std::fprintf(stderr,
-                                 "strata generate: WARNING: host mirror is fragmented into 4 KiB pages (AnonHugePages=%.2f/%.2f GiB, "
-                                 "THP=%s, Normal order-9/10 blocks=%llu) — PCIe IOTLB thrashing on Battlemage drops decode from ~43 to ~27 tok/s (#3681).\n"
-                                 "strata generate: WARNING: compact host RAM before starting: "
-                                 "echo madvise | sudo tee /sys/kernel/mm/transparent_hugepage/enabled && "
-                                 "echo 3 | sudo tee /proc/sys/vm/drop_caches && echo 1 | sudo tee /proc/sys/vm/compact_memory\n",
-                                 (double) gguf_src.mirror_hugepage_bytes() / 1073741824.0,
-                                 (double) gguf_src.mirrored_bytes() / 1073741824.0,
-                                 thp.empty() ? "unknown" : thp.c_str(),
-                                 (unsigned long long) buddy.high_order_blocks);
-                }
                 // the device-built verify plan's view of it: each (layer, expert) -> its mirror address, 0 = none
                 std::vector<unsigned long long> tab((size_t) (g.n_layers * g.n_expert), 0ull);
                 for (int64_t l = 0; l < g.n_layers; ++l)

@@ -164,49 +164,6 @@ inline IntelGpuGen intel_gpu_gen(const sycl::device& d) {
     }
     return IntelGpuGen::Unknown;
 }
-
-// Apply Battlemage / xe kernel-driver runtime defaults in C++ so running `./build-sycl/strata` or `./build-sycl-aot/strata`
-// directly from the CLI (without `sycl/serve/strata-sycl.sh`) does not hang or corrupt logits on the `xe` driver.
-// User-set environment variables are never overridden; `STRATA_XE_DEFAULTS=0` disables the table.
-inline void apply_sycl_arch_defaults() {
-    const char* off = std::getenv("STRATA_XE_DEFAULTS");
-    if (off != nullptr && off[0] == '0') return;
-    const std::string& drv = intel_gpu_driver();
-    bool is_bmg_or_xe = (drv == "xe");
-    if (!is_bmg_or_xe && drv != "i915") {
-        try {
-            for (const auto& d : sycl::device::get_devices(sycl::info::device_type::gpu)) {
-                if (intel_gpu_gen(d) == IntelGpuGen::Battlemage) {
-                    is_bmg_or_xe = true;
-                    break;
-                }
-            }
-        } catch (...) {
-        }
-    }
-    if (!is_bmg_or_xe) return;
-    static constexpr std::pair<const char*, const char*> kDefaults[] = {
-        {"STRATA_VERIFY_DEVICE_PLAN", "1"},
-        {"STRATA_VERIFY_NO_HOST", "1"},
-        {"STRATA_STAGER_THREADS", "12"},
-    };
-    std::string applied;
-    for (const auto& kv : kDefaults) {
-        if (std::getenv(kv.first) != nullptr) continue;
-#if defined(_WIN32)
-        _putenv_s(kv.first, kv.second);
-#else
-        setenv(kv.first, kv.second, 0);
-#endif
-        if (!applied.empty()) applied += ' ';
-        applied += kv.first;
-        applied += '=';
-        applied += kv.second;
-    }
-    if (!applied.empty()) {
-        std::fprintf(stderr, "strata: Battlemage / xe defaults: %s (STRATA_XE_DEFAULTS=0 turns them off)\n", applied.c_str());
-    }
-}
 }  // namespace strata
 
 #include <cstdint>

@@ -39,22 +39,6 @@ for k in "${!setting[@]}"; do
 done
 shm=()
 if [ "${STRATA_SYCL_SHM:-1}" != 0 ] && [ -d /dev/shm ]; then shm=(-v /dev/shm:/dev/shm); fi
-# Strata#3681 (Battlemage B70): check host RAM high-order buddy blocks (2 MiB / 4 MiB) before launching so the
-# 26 GiB USM host expert mirror can fault in 2 MiB transparent hugepages instead of 4 KiB pages (which thrash the
-# PCIe IOTLB and drop decode from ~43 to ~27 tok/s).
-if [ -r /proc/buddyinfo ]; then
-    high_order=$(awk '$3 == "zone" && $4 == "Normal" { s += $(14) + $(15) } END { print s + 0 }' /proc/buddyinfo 2>/dev/null || echo 0)
-    if [ "${high_order:-0}" -lt 64 ]; then
-        if [ "${STRATA_SYCL_COMPACT_RAM:-0}" = "1" ] && [ -w /proc/sys/vm/drop_caches ] && [ -w /proc/sys/vm/compact_memory ]; then
-            echo "strata-sycl.sh: compacting fragmented host RAM (Normal order-9/10 blocks=${high_order} < 64)..." >&2
-            echo 3 > /proc/sys/vm/drop_caches || true
-            echo 1 > /proc/sys/vm/compact_memory || true
-        else
-            echo "strata-sycl.sh: WARNING: host RAM Normal zone has only ${high_order} free 2M/4M blocks (< 64); USM host mirror may fragment into 4 KiB pages (#3681: 27 vs 43 tok/s)." >&2
-            echo "strata-sycl.sh: WARNING: run: echo 3 | sudo tee /proc/sys/vm/drop_caches && echo 1 | sudo tee /proc/sys/vm/compact_memory" >&2
-        fi
-    fi
-fi
 exec docker run --rm -i --name "$name" --device /dev/dri --oom-score-adj 1000 --stop-timeout 30 --no-healthcheck \
     --ulimit memlock=-1 \
     -v "$root:/work" \
