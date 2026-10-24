@@ -141,8 +141,8 @@ def wait_for(cond, seconds=30.0):
 
 
 FAKE_HW = {"os": "TestOS 1", "ram_gb": 64.0, "cpu": {"name": "Fake CPU", "cores": 12, "avx2": True, "avx512": True},
-           "gpus": [{"index": 0, "name": "NVIDIA GeForce RTX 5070", "vram_gb": 11.9, "arch": "120", "vendor": "nvidia",
-                     "problem": None, "usable": True}]}
+           "gpus": [{"index": 0, "name": "Intel Arc Pro B70", "vram_gb": 32.0, "arch": "xe", "driver": "xe", "devid": "e223",
+                     "vendor": "intel", "problem": None, "usable": True}], "engine_vendor": "intel"}
 
 
 class FakeRoot(unittest.TestCase):
@@ -299,6 +299,8 @@ class Validation(FakeRoot):
         self.assertRejected("strata_install", {"gpu": 0, "gpus": "0,1"}, "not both")
         self.assertRejected("strata_install", {"port": 80}, "between")
         self.assertRejected("strata_install", {"backend": "rocm"}, "backend must be one of")
+        self.assertRejected("strata_install", {"backend": "cuda"}, "backend must be one of")
+        self.assertRejected("strata_install", {"backend": "hip"}, "backend must be one of")
         self.assertRejected("strata_install", {"command": "setup.py --build"}, "unknown argument")
         res, err = self.call("strata_install", {"family": "swift", "model": "IQ3_S"})
         self.assertFalse(err, res)                      # Swift 1.5 got its IQ3_S (same shard layout as its IQ2_XS)
@@ -308,22 +310,27 @@ class Validation(FakeRoot):
         self.assertEqual(res["plan"]["images"], "yes")
         self.assertRejected("strata_install", {"vision": "yes\nrm"}, "control characters")
 
-    def test_amd_vision_follows_the_picture_rule(self):
-        """Owner rule 2026-10-18: pictures are on for AMD too, on Linux and Windows (setup picks the reader: CPU under 24 GB, GPU from 24 GB)."""
-        for win in (False, True):
-            with mock.patch.object(M, "WIN", win):
-                for asked in ("yes", "gpu", "cpu"):
-                    res, err = self.call("strata_install", {"backend": "hip", "vision": asked})
-                    self.assertFalse(err, res)
-                    self.assertEqual(res["plan"]["images"], asked)
-                    self.assertIn("--vision " + asked, res["plan"]["setup_command"])
-                res, err = self.call("strata_install", {"backend": "hip", "vision": "no"})
-                self.assertFalse(err, res)
-                self.assertEqual(res["plan"]["images"], "no")
+    def test_vision_is_passed_as_asked(self):
+        """Owner rule 2026-10-18: pictures as asked (setup picks the reader; an Intel Arc keeps the CPU one)."""
+        for asked in ("yes", "gpu", "cpu", "no"):
+            res, err = self.call("strata_install", {"vision": asked})
+            self.assertFalse(err, res)
+            self.assertEqual(res["plan"]["images"], asked)
+            self.assertIn("--vision " + asked, res["plan"]["setup_command"])
+
+    def test_the_backend_is_the_sycl_engine(self):
+        """One engine: nothing asked or auto gives setup no --backend (sycl is its default); sycl is passed as asked."""
+        for args in ({}, {"backend": "auto"}):
+            res, err = self.call("strata_install", args)
+            self.assertFalse(err, res)
+            self.assertNotIn("--backend", res["plan"]["setup_command"])
+        res, err = self.call("strata_install", {"backend": "sycl"})
+        self.assertFalse(err, res)
+        self.assertIn("--backend sycl", res["plan"]["setup_command"])
 
     def test_pictures_default_on(self):
-        """Nothing asked: pictures are on where the model can read them (any backend), off for a model that cannot."""
-        for backend in (None, "cuda", "hip"):
+        """Nothing asked: pictures are on where the model can read them, off for a model that cannot."""
+        for backend in (None, "sycl"):
             args = {"backend": backend} if backend else {}
             res, err = self.call("strata_install", args)
             self.assertFalse(err, res)
@@ -616,43 +623,10 @@ class Helpers(unittest.TestCase):
         self.assertEqual(by["UD-Q4_K_XL"]["on_this_pc"], "fits (all of its experts in RAM)")
         self.assertIn("read from the SSD", by["Q8_0"]["on_this_pc"])
 
-    def test_qwen36_is_listed_with_its_three_sizes(self):
-        """QA 2026-10-18: the Qwen3.6-35B-A3B page of the first-run setup showed no versions, because setup.py keeps the family
-        in OWN_PATH_FAMILIES (not FAMILIES) and the model list only walked FAMILIES."""
-        s = M.Strata(HERE.parent)
-        self.assertIn("qwen36", s.tables()[1])
-        fam = next(f for f in s.model_table({"ram_gb": 63.7, "gpus": [{"index": 0, "name": "x", "vram_gb": 12.0, "usable": True}]})
-                   if f["family"] == "qwen36")
-        by = {x["model"]: x for x in fam["sizes"]}
-        self.assertEqual(list(by), ["UD-Q4_K_XL", "UD-Q6_K_XL", "Q8_0"])
-        self.assertEqual(by["UD-Q4_K_XL"]["id"], "qwen36-ud-q4_k_xl")          # the tag the install writes its config under
-        self.assertEqual(by["UD-Q4_K_XL"]["download_gb"], 22.9)
-        self.assertTrue(all(x["images"] and x["engine_min"] == "0.1.45" and x["gpu_options"] is None for x in by.values()))
-        self.assertEqual({x["on_this_pc"] for x in by.values()}, {"fits"})
-        small = next(f for f in s.model_table({"ram_gb": 16, "gpus": []}) if f["family"] == "qwen36")
-        self.assertEqual({x["on_this_pc"] for x in small["sizes"]}, {"does not fit"})
-        self.assertEqual(s.sizes_of(s.tables()[0], "unsloth")[-1], "Q8_0")      # the Unsloth Flash-Next sizes are untouched
-
-    def test_qwen36_install_plan(self):
-        s = M.Strata(HERE.parent)
-        s.hardware = lambda fresh=False: {"ram_gb": 64.0, "gpus": [{"index": 0, "name": "x", "vram_gb": 12.0, "usable": True, "vendor": "nvidia"}],
-                                          "cpu": {"avx2": True}}
-        s.disk_free = lambda p: 1000.0
-        plan, args = M.Tools(s).install_plan("qwen36", "UD-Q4_K_XL", 32768, "yes", "int8", None, None, None, "auto", None, None)
-        self.assertEqual((plan["title"], plan["download_gb"], plan["family"]), ("Qwen3.6-35B-A3B UD-Q4_K_XL", 22.9, "qwen36"))
-        self.assertEqual(args[:10], ["--yes", "--no-start", "--family", "qwen36", "--model", "UD-Q4_K_XL", "--context", "32768",
-                                     "--vision", "yes"])
-        for flag in ("--kv", "--low-ram", "--experimental-speed-projection"):      # Flash-Next settings: setup would only warn
-            self.assertNotIn(flag, args)
-        plan, _a = M.Tools(s).install_plan("qwen36", None, 32768, "no", None, None, None, None, None, None, None)
-        self.assertEqual(plan["model"], "UD-Q4_K_XL")
-        with self.assertRaises(M.ToolError):
-            M.Tools(s).install_plan("qwen36", "IQ3_S", 32768, "no", None, None, None, None, None, None, None)
-
     def test_recommendation_follows_ram(self):
         s = M.Strata(HERE.parent)
-        gpu = [{"index": 0, "name": "x", "vram_gb": 24.0, "usable": True, "vendor": "nvidia"}]
-        cases = {96: ("qwen", "IQ3_S", 131072), 48: ("qwen", "IQ3_S", 131072), 32: ("qwen", "IQ3_XXS", 131072), 12: ("coder", "IQ1_M", 131072)}   # the owner's tiers count RAM + VRAM (24 GB card): 120, 72, 56 GB; the Coder where the older rules stand
+        gpu = [{"index": 0, "name": "x", "vram_gb": 24.0, "usable": True, "vendor": "intel"}]
+        cases = {96: ("qwen", "IQ3_S", 32768), 48: ("qwen", "IQ3_S", 32768), 32: ("qwen", "IQ3_XXS", 32768), 12: ("coder", "IQ1_M", 32768)}   # the owner's tiers count RAM + VRAM (24 GB card): 120, 72, 56 GB; the Coder where the older rules stand
         for ram, want in cases.items():
             r = s.recommend({"ram_gb": ram, "gpus": gpu, "cpu": {"avx2": True}})
             self.assertEqual((r["family"], r["model"], r["context"]), want, ram)
@@ -661,12 +635,14 @@ class Helpers(unittest.TestCase):
         r = s.recommend({"ram_gb": 64, "gpus": [], "cpu": {"avx2": True}})
         self.assertIsNone(r["model"])
         r = s.recommend({"ram_gb": 64, "gpus": [{**gpu[0], "vram_gb": 12.0}], "cpu": {"avx2": True}})
-        self.assertEqual(r["context"], 32768)
+        self.assertEqual(r["context"], 16384)                                   # an Arc: the session and the experts share the card's memory
+        r = s.recommend({"ram_gb": 64, "gpus": [{**gpu[0], "vram_gb": 8.0}], "cpu": {"avx2": True}})
+        self.assertEqual(r["context"], 8192)
 
     def test_a_pick_that_reads_from_the_ssd_says_so(self):
         # #3425: 36 GB RAM + 16 GB VRAM - 5 GB is the 48 GB tier; about 8 GB of IQ3_XXS would come from the SSD
         s = M.Strata(HERE.parent)
-        gpu = [{"index": 0, "name": "x", "vram_gb": 15.9, "usable": True, "vendor": "nvidia"}]
+        gpu = [{"index": 0, "name": "x", "vram_gb": 15.9, "usable": True, "vendor": "intel"}]
         r = s.recommend({"ram_gb": 36.0, "gpus": gpu, "cpu": {"avx2": True}})
         self.assertEqual((r["family"], r["model"]), ("qwen", "IQ3_XXS"))
         self.assertTrue(any("read from the SSD" in n for n in r["notes"]), r["notes"])
@@ -674,9 +650,9 @@ class Helpers(unittest.TestCase):
         self.assertFalse(any("read from the SSD" in n for n in roomy["notes"]), roomy["notes"])
 
     def test_3425_the_tiers_leave_5_gb_for_windows(self):
-        # the reporter: RTX 5080 (16 GB) + 32 GB of RAM used to sum to 48 GB and get IQ3_XXS; now the 40 GB tier
+        # the reporter: a 16 GB card + 32 GB of RAM used to sum to 48 GB and get IQ3_XXS; now the 40 GB tier
         s = M.Strata(HERE.parent)
-        gpu = [{"index": 0, "name": "x", "vram_gb": 15.9, "usable": True, "vendor": "nvidia"}]
+        gpu = [{"index": 0, "name": "x", "vram_gb": 15.9, "usable": True, "vendor": "intel"}]
         self.assertEqual(M.TIER_SYSTEM_RESERVE_GB, 5.0)
         r = s.recommend({"ram_gb": 31.9, "gpus": gpu, "cpu": {"avx2": True}})
         self.assertEqual((r["family"], r["model"]), ("swift", "IQ2_XS"))
@@ -709,185 +685,64 @@ class PhysicalCores(unittest.TestCase):
             self.assertEqual(M.physical_cores(), 4)
 
 
-class MacCatalog(unittest.TestCase):
-    """A Mac (Apple Silicon): one pool of unified memory, judged by strata_control/mac_fit.py (the rules metal/setup_mac.py uses)."""
+class IntelCards(unittest.TestCase):
+    """The Intel Arc cards, read from sysfs the way sycl/setup_intel.py reads them: the B70 is a usable 32 GB card of the SYCL engine."""
 
-    def hw(self, ram, macos="27.2", chip="Apple M4"):
-        from strata_control import mac_fit
-        s = M.Strata(HERE.parent)
-        info = {"chip": chip, "ram_gb": float(ram), "macos": macos, "arm64": True, "clt": "", "perf_cores": 4}
-        with mock.patch.object(M.sys, "platform", "darwin"), mock.patch.object(mac_fit, "mac_info", return_value=info):
-            hw = s._hardware()
-        return s, hw
+    def drm(self, base: Path, cards: dict) -> Path:
+        """A fake /sys/class/drm: {name: (vendor, device id, driver, VRAM BAR bytes or None)}."""
+        root = base / "drm"
+        root.mkdir()
+        for name, (vendor, devid, driver, bar) in cards.items():
+            dev = base / "devices" / name
+            dev.mkdir(parents=True)
+            (dev / "vendor").write_text(vendor + "\n")
+            (dev / "device").write_text(devid + "\n")
+            (base / "drivers" / driver).mkdir(parents=True, exist_ok=True)
+            (dev / "driver").symlink_to(base / "drivers" / driver)
+            if bar:
+                (dev / "resource").write_text("0x0 0x0 0x0\n0x0 0x0 0x0\n" + f"0x4000000000 {0x4000000000 + bar - 1:#x} 0x0\n")
+            (root / name).mkdir()
+            (root / name / "device").symlink_to(dev)
+        (root / "card1-DP-1").mkdir()                    # a connector: not a card
+        return root
 
-    def test_the_hardware_is_one_apple_gpu_with_unified_memory(self):
-        s, hw = self.hw(32)
-        self.assertEqual(hw["ram_gb"], 32.0)
-        self.assertEqual(len(hw["gpus"]), 1)
-        g = hw["gpus"][0]
-        self.assertEqual((g["vendor"], g["name"], g["usable"], g["vram_gb"], g["unified_gb"]), ("apple", "Apple M4", True, 0.0, 32.0))
-        self.assertEqual(hw["mac"]["unified_gb"], 32.0)
-        self.assertFalse(hw["nvidia_smi"])
+    def test_the_cards_from_sysfs(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = self.drm(Path(d), {"card0": ("0x8086", "0x4680", "i915", None),       # the CPU's integrated graphics
+                                      "card1": ("0x8086", "0xe223", "xe", None),         # the Arc Pro B70
+                                      "card2": ("0x8086", "0xe2ff", "xe", 16 << 30),     # an xe card not in the table: its VRAM BAR
+                                      "card3": ("0x10de", "0x2684", "nvidia", None)})    # another make: not Intel's
+            cards = M.intel_gpus(str(root))
+        self.assertEqual([(c["index"], c["name"], c["vram_gb"], c["vendor"], c["usable"]) for c in cards],
+                         [(0, "Intel Arc Pro B70", 32.0, "intel", True), (1, "Intel Intel GPU e2ff (xe)", 16.0, "intel", True)])
+        self.assertEqual(M.intel_gpus(str(Path(d) / "nothing")), [])
 
-    def test_recommendation_by_unified_memory(self):
-        cases = {32: ("Q2_0", 32768), 48: ("Q2_0", 32768), 80: ("IQ3_XXS", 32768), 128: ("IQ3_S", 65536)}
-        for ram, (model, ctx) in cases.items():
-            s, hw = self.hw(ram)
-            r = s.recommend(hw)
-            self.assertEqual((r["family"], r["model"], r["context"], r["backend"]), ("qwen", model, ctx, "metal"), ram)
-            self.assertNotIn("NVIDIA", r["why"])
-            self.assertFalse([n for n in r["notes"] if "UD-" in n], "the Unsloth sizes are not offered in the app yet")
-        s, hw = self.hw(32)
-        self.assertIn("read from the SSD", s.recommend(hw)["why"])
-        s, hw = self.hw(128)
-        self.assertIn("stays in memory", s.recommend(hw)["why"])
+    def test_the_table_is_setup_intels(self):
+        import ast
+        tree = ast.parse((HERE.parent / "sycl" / "setup_intel.py").read_text(encoding="utf-8"))
+        node = next(n for n in tree.body if isinstance(n, ast.Assign) and getattr(n.targets[0], "id", "") == "INTEL_ARC")
+        self.assertEqual(ast.literal_eval(node.value), M.INTEL_ARC)
 
-    def test_a_mac_too_small_or_too_old_has_no_recommendation_and_says_why(self):
-        s, hw = self.hw(8)
-        r = s.recommend(hw)
-        self.assertIsNone(r["model"])
-        self.assertIn("8 GB of unified memory", r["why"])
-        s, hw = self.hw(32, macos="14.6")
-        r = s.recommend(hw)
-        self.assertIsNone(r["model"])
-        self.assertIn("macOS 15 or newer", r["why"])
-
-    def test_the_model_list_is_the_macs_sizes_with_unified_memory_verdicts(self):
-        s, hw = self.hw(32)
-        fams = s.model_table(hw)
-        self.assertEqual([f["family"] for f in fams], ["qwen", "gyro"], "no Unsloth, Swift or NVFP4 on a Mac in the app; Gyro after the regular sizes")
-        by = {x["model"]: x for x in fams[0]["sizes"]}
-        self.assertEqual(list(by), ["Q2_0", "IQ3_XXS", "IQ3_S"])
-        gy = {x["model"]: x for x in fams[1]["sizes"]}
-        self.assertEqual(list(gy), ["Gyro-S", "Gyro-M"])
-        self.assertEqual(gy["Gyro-S"]["download_gb"], 58.5)
-        self.assertTrue(all(v["on_this_pc"] and "SSD" in v["on_this_pc"] for v in gy.values()), "32 GB: both stream (said, not refused)")
-        self.assertIn("read from the SSD", by["Q2_0"]["on_this_pc"])
-        self.assertIn("slower", by["Q2_0"]["on_this_pc"])
-        self.assertIn("~14 tok/s", by["Q2_0"]["on_this_pc"])
-        self.assertTrue(by["IQ3_S"]["on_this_pc"].startswith("slow here"))
-        self.assertTrue(all(x["images"] for x in by.values()), "the Mac engine carries the Metal picture reader: pictures are on")
-        s, hw = self.hw(128)
-        self.assertEqual({x["on_this_pc"] for f in s.model_table(hw) for x in f["sizes"]}, {"fits"})
-        s, hw = self.hw(8)
-        self.assertEqual({x["on_this_pc"] for f in s.model_table(hw) for x in f["sizes"]}, {"does not fit"})
-
-    def test_the_install_plan_on_a_mac_has_no_card_kv_or_ram_options(self):
-        s, hw = self.hw(32)
-        s.hardware = lambda fresh=False: hw
-        s.disk_free = lambda p: 1000.0
-        with tempfile.TemporaryDirectory() as own:
-            plan, args = M.Tools(s).install_plan("qwen", "Q2_0", None, "no", "int8", 0, None, None, "auto", None, None, own)
-        self.assertEqual(plan["context"], 32768)
-        self.assertEqual(args[:9], ["--yes", "--no-start", "--family", "qwen", "--model", "Q2_0", "--context", "32768", "--vision"])
-        for flag in ("--kv", "--gpu", "--gpus", "--low-ram", "--backend"):
-            self.assertNotIn(flag, args)
-        self.assertIn("--gguf-dir", args)
-        with tempfile.TemporaryDirectory() as own:      # nothing said about pictures: on, as everywhere (the Mac's reader is the Metal one)
-            _plan, args = M.Tools(s).install_plan("qwen", "Q2_0", None, None, "int8", 0, None, None, "auto", None, None, own)
-        self.assertEqual(args[args.index("--vision") + 1], "yes")
-        with self.assertRaises(M.ToolError):
-            s2, hw2 = self.hw(8)
-            s2.hardware = lambda fresh=False: hw2
-            M.Tools(s2).install_plan(None, None, None, None, None, None, None, None, None, None, None)
-
-    def test_a_pc_is_unchanged(self):
-        s = M.Strata(HERE.parent)
-        r = s.recommend({"ram_gb": 96, "gpus": [{"index": 0, "name": "x", "vram_gb": 24.0, "usable": True, "vendor": "nvidia"}],
-                         "cpu": {"avx2": True}})
-        self.assertEqual((r["family"], r["model"]), ("qwen", "IQ3_S"))
-        self.assertIn("unsloth", [f["family"] for f in s.model_table({"ram_gb": 96, "gpus": []})])
-
-
-class MixedGraphics(unittest.TestCase):
-    def test_an_integrated_amd_gpu_beside_an_nvidia_card_is_not_offered(self):
+    @mock.patch("strata_control.engine_component.status", lambda: {"usable": False})     # no engine installed: the cards decide
+    def test_a_b70_is_the_card_the_catalog_sees(self):
         s = M.Strata(HERE.parent)
         S = s.setup_module()
-        nv = [{"index": 0, "name": "NVIDIA GeForce RTX 5090", "vram_gb": 31.8, "arch": "120", "driver": "580.95"}]
-        igpu = [{"index": 0, "name": "AMD Radeon Graphics", "vram_gb": 0.5, "arch": "gfx1036", "uma": True}]
-        with mock.patch.object(M.sys, "platform", "linux"), mock.patch.object(M, "WIN", False),                 mock.patch.object(S, "gpus", lambda: [dict(g) for g in nv]), mock.patch.object(S, "gpu_problem", lambda g: None),                 mock.patch.object(S, "amd_gpus", lambda: [dict(g) for g in igpu]), mock.patch.object(S, "amd_problem", lambda g: None):
-            hw = s._hardware()
-        by = {g["vendor"]: g for g in hw["gpus"]}
-        self.assertTrue(by["nvidia"]["usable"])
-        self.assertFalse(by["amd"]["usable"])
-        self.assertIn("NVIDIA card", by["amd"]["problem"])
-        rec = s.recommend({**hw, "ram_gb": 92.0})
-        self.assertEqual((rec["backend"], rec["gpu"]["name"]), ("cuda", "NVIDIA GeForce RTX 5090"))
-        # with no NVIDIA card the integrated GPU stays what it was
-        with mock.patch.object(M.sys, "platform", "linux"), mock.patch.object(M, "WIN", False),                 mock.patch.object(S, "gpus", lambda: []), mock.patch.object(S, "amd_gpus", lambda: [dict(g) for g in igpu]),                 mock.patch.object(S, "amd_problem", lambda g: None):
-            self.assertTrue(s._hardware()["gpus"][0]["usable"])
-
-    def test_two_gtx_1080_are_a_working_pc_on_the_cuda_12_engine(self):
-        """#3655: Pascal cards were flagged 'not supported' and both started Off, so the app said no card was usable. When Pascal is all the PC has
-        (and no AMD card), setup runs them with the CUDA 12 engine, and the hardware report now says so; a newer card keeps the old behaviour."""
-        s = M.Strata(HERE.parent)
-        S = s.setup_module()
-        pascal = [{"index": 0, "name": "NVIDIA GeForce GTX 1080", "vram_gb": 8.0, "arch": "61", "driver": "581.15"},
-                  {"index": 1, "name": "NVIDIA GeForce GTX 1080", "vram_gb": 8.0, "arch": "61", "driver": "581.15"}]
-        igpu = [{"index": 0, "name": "AMD Radeon(TM) Graphics", "vram_gb": 0.5, "arch": "gfx90c", "uma": True}]
-        patches = (mock.patch.object(M.sys, "platform", "linux"), mock.patch.object(M, "WIN", False),
-                   mock.patch.object(S, "amd_gpus", lambda: [dict(g) for g in igpu]), mock.patch.object(S, "amd_problem", lambda g: "integrated graphics"),
-                   mock.patch.dict(M.os.environ, {"STRATA_EXPERIMENTAL_SM60": ""}), mock.patch.object(S, "OLD_GPUS", None))
-        with mock.patch.object(S, "gpus", lambda: [dict(g) for g in pascal]):
-            for p in patches:
-                p.start()
-            try:
+        with tempfile.TemporaryDirectory() as d:
+            root = self.drm(Path(d), {"card0": ("0x8086", "0xe223", "xe", None)})
+            with mock.patch.object(M, "DRM_ROOT", str(root)), mock.patch.object(S, "ram_gb", lambda: 64.0):
                 hw = s._hardware()
-            finally:
-                for p in reversed(patches):
-                    p.stop()
-        nv = [g for g in hw["gpus"] if g["vendor"] == "nvidia"]
-        self.assertEqual([(g["usable"], g["problem"], g.get("engine_variant")) for g in nv], [(True, None, "cuda12")] * 2)
-        # a newer card in the PC: Pascal stays an opt-in, the ready-made engine is recommended
-        mixed = [{"index": 0, "name": "NVIDIA GeForce GTX 1080", "vram_gb": 8.0, "arch": "61", "driver": "581.15"},
-                 {"index": 1, "name": "NVIDIA GeForce RTX 3060", "vram_gb": 12.0, "arch": "86", "driver": "581.15"}]
-        with mock.patch.object(S, "gpus", lambda: [dict(g) for g in mixed]):
-            for p in patches:
-                p.start()
-            try:
+        self.assertEqual([(g["name"], g["vram_gb"], g["usable"]) for g in hw["gpus"]], [("Intel Arc Pro B70", 32.0, True)])
+        self.assertEqual(hw["engine_vendor"], "intel")
+        rec = s.recommend(hw)
+        self.assertEqual((rec["backend"], rec["gpu"]["name"], rec["context"]), ("sycl", "Intel Arc Pro B70", 32768))
+        self.assertNotIn("--backend", rec["setup_command"])
+        q = next(f for f in s.model_table(hw) if f["family"] == "qwen")
+        self.assertEqual({x["images_reader"] for x in q["sizes"]}, {"cpu"})       # an Arc keeps the CPU picture reader
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(M, "DRM_ROOT", str(Path(d))), mock.patch.object(S, "ram_gb", lambda: 64.0):
                 hw = s._hardware()
-            finally:
-                for p in reversed(patches):
-                    p.stop()
-        by = {g["name"]: g for g in hw["gpus"] if g["vendor"] == "nvidia"}
-        self.assertFalse(by["NVIDIA GeForce GTX 1080"]["usable"])
-        self.assertTrue(by["NVIDIA GeForce RTX 3060"]["usable"])
-
-    def test_an_amd_card_the_installed_engine_has_no_code_for_is_not_usable(self):
-        """#3203: the engine package lists its GPU code; a card outside it is flagged unusable with the plain reason, so no list offers it."""
-        status = {"usable": True, "engine": {"backend": "hip", "archs": ["gfx1200", "gfx1201"]}}
-        hw = {"gpus": [{"vendor": "amd", "index": 0, "name": "AMD Radeon 760M", "arch": "gfx1103", "usable": False, "problem": "integrated"},
-                       {"vendor": "amd", "index": 1, "name": "AMD Radeon RX 6800 XT", "arch": "gfx1030", "usable": True, "problem": None},
-                       {"vendor": "amd", "index": 2, "name": "AMD Radeon RX 9070 XT", "arch": "gfx1201", "usable": True, "problem": None},
-                       {"vendor": "nvidia", "index": 0, "name": "NVIDIA GeForce RTX 3060", "arch": "86", "usable": True, "problem": None}]}
-        with mock.patch("strata_control.engine_component.status", lambda: status):
-            M.Strata._engine_code(hw)
-        by = {g["name"]: g for g in hw["gpus"]}
-        self.assertFalse(by["AMD Radeon RX 6800 XT"]["usable"])
-        self.assertIn("no code for gfx1030", by["AMD Radeon RX 6800 XT"]["problem"])
-        self.assertEqual(by["AMD Radeon 760M"]["problem"], "integrated", "an earlier reason stays")
-        self.assertTrue(by["AMD Radeon RX 9070 XT"]["usable"])
-        self.assertTrue(by["NVIDIA GeForce RTX 3060"]["usable"])
-        # no engine package that lists archs (a source build, no engine yet): nothing is judged
-        for other in ({"usable": False}, {"usable": True, "engine": {"backend": "cuda", "archs": ["sm_86"]}}):
-            again = {"gpus": [{"vendor": "amd", "index": 1, "name": "x", "arch": "gfx1030", "usable": True, "problem": None}]}
-            with mock.patch("strata_control.engine_component.status", lambda other=other: other):
-                M.Strata._engine_code(again)
-            self.assertTrue(again["gpus"][0]["usable"])
-
-    @mock.patch("strata_control.engine_component.status", lambda: {"usable": False})   # not this PC's installed (CUDA) engine
-    def test_windows_lists_an_amd_card_and_not_the_integrated_radeon(self):
-        s = M.Strata(HERE.parent)
-        S = s.setup_module()
-        cards = [{"index": 0, "name": "AMD Radeon RX 9070 XT", "vram_gb": 15.9, "arch": "gfx1201", "driver": "32.0.1"},
-                 {"index": 1, "name": "AMD Radeon(TM) Graphics", "vram_gb": 0.5, "arch": "unknown (PCI 164E)", "driver": "32.0.1"}]
-        with mock.patch.object(M, "WIN", True), mock.patch.object(S, "gpus", lambda: []),                 mock.patch.object(S, "amd_gpus", lambda: [dict(g) for g in cards]),                 mock.patch.object(M, "windows_video_controllers", lambda: [{"name": "AMD Radeon RX 9070 XT", "driver": "32"}]),                 mock.patch.object(S, "ram_gb", lambda: 64.0), mock.patch.object(S, "page_file_gb", lambda: 10.0):
-            hw = s._hardware()
-            by = {g["name"]: g for g in hw["gpus"]}
-            self.assertTrue(by["AMD Radeon RX 9070 XT"]["usable"])
-            self.assertFalse(by["AMD Radeon(TM) Graphics"]["usable"])
-            rec = s.recommend({**hw, "ram_gb": 64.0})
-            self.assertEqual((rec["backend"], rec["gpu"]["name"]), ("hip", "AMD Radeon RX 9070 XT"))
+        self.assertEqual(hw["gpus"], [])
+        self.assertIn("no Intel Arc", s.recommend(hw)["why"])
 
 
 if __name__ == "__main__":

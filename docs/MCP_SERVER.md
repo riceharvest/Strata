@@ -109,9 +109,9 @@ The command is `python <Strata folder>/tools/strata_mcp.py`. The transport is st
 
 | Tool | What it does | Arguments (all optional) |
 | --- | --- | --- |
-| `strata_status` | Whether a model is running: the model, engine version, context, busy or idle, VRAM and RAM in use. What is installed: models, start scripts, engine version, data folder, downloads. An install in progress. This PC's hardware: OS, CPU, RAM, GPUs, page file, free disk. The model and context setup recommends for this PC. | `port`, `hardware` (true/false) |
+| `strata_status` | Whether a model is running: the model, engine version, context, busy or idle, VRAM and RAM in use. What is installed: models, start scripts, engine version, data folder, downloads. An install in progress. This PC's hardware: OS, CPU, RAM, the Intel Arc cards the kernel lists (name, VRAM), page file, free disk. The model and context setup recommends for this PC. | `port`, `hardware` (true/false) |
 | `strata_models` | Every family and size setup offers, with download size, RAM needed, whether it fits this PC, and whether it is installed. Also the context lengths and the recommendation. | - |
-| `strata_install` | Runs setup without questions, in the background (see below). Without `confirm: true` it only returns the plan. A second call shows the progress. `cancel: true` stops the install. | `family` (qwen, swift, coder, unsloth), `model` (Q2_0, IQ2_XS, IQ3_XXS, IQ3_S, IQ1_M, UD-IQ4_XS, UD-Q4_K_XL), `context` (8192 ... 524288), `vision` (no, yes, gpu, cpu), `kv` (int8, q4_0, k8v4), `gpu` (a number) or `gpus` ("0,2", "all"), `backend` (auto, cuda, hip), `low_ram`, `port`, `data_dir`, `confirm`, `cancel` |
+| `strata_install` | Runs setup without questions, in the background (see below). Without `confirm: true` it only returns the plan. A second call shows the progress. `cancel: true` stops the install. | `family` (qwen, swift, coder, unsloth), `model` (Q2_0, IQ2_XS, IQ3_XXS, IQ3_S, IQ1_M, UD-IQ4_XS, UD-Q4_K_XL), `context` (8192 ... 524288), `vision` (no, yes, gpu, cpu), `kv` (int8, q4_0, k8v4), `gpu` (a number) or `gpus` ("0,2", "all"), `backend` (auto, sycl), `low_ram`, `port`, `data_dir`, `confirm`, `cancel` |
 | `strata_start` | Starts an installed model in the background and waits until it answers. If it is not ready after `wait_seconds` (default 50), it returns "loading". | `model` (an id from `strata_status`, e.g. `q2_0`, `coder-iq1_m`; default: the most recently used), `port`, `gpu`, `wait_seconds` (0-600) |
 | `strata_stop` | Unloads the model through the server's own API, then ends the server it started. | `port`, `force` |
 | `strata_logs` | The last lines of the server log, the engine log or the setup log. | `source` (server, engine, setup), `model`, `lines` (1-500) |
@@ -127,8 +127,8 @@ Every result is JSON with a one-line `summary`. It is sent both as text and as M
 
 - the size setup itself would pick: IQ3_XXS from 60 GB of RAM, Q2_0 from about 44 GB, the Coder from about 28 GB,
   and the Coder in the low-RAM mode below that when the GPU makes up for the RAM;
-- the context setup recommends for the GPU's VRAM;
-- pictures on where the model can read them (the reader runs on the CPU under 24 GB of VRAM and on the GPU from 24 GB, on NVIDIA and AMD cards; a Mac reads on its GPU).
+- the context for the Intel Arc card's VRAM (8K under 10 GB, 16K under 20 GB, else 32K: the same rule as `strata launch`);
+- pictures on where the model can read them (on an Intel Arc the picture reader runs on the CPU).
 
 The first call returns the plan: the download size (58-111 GB), the free disk space, the RAM check, and the exact
 setup command. The assistant should show you the plan and call again with `confirm: true` once you agree.

@@ -87,15 +87,6 @@ FALLBACK_MODELS = {
                "engine": (0, 1, 45, 1),
                "download_gb": 92.0, "ram_gb": 35.0, "arena_gb": 32.1, "families": ("gyro",), "mem_total": True,
                "vision": True},
-    "NVFP4": {"about": "4-bit NVFP4 experts, GPTQ (sergqwer's strata-nvfp4 pack); RTX 50 has FP4 tensor cores, other "
-                       "NVIDIA cards run it at 8-bit precision", "download_gb": 128.0, "ram_gb": 80, "arena_gb": 68.0,
-              "families": ("nvfp4",), "vision": True},
-    "NVFP4-NVIDIA": {"about": "NVIDIA's own NVFP4 checkpoint (plain rounding), converted by sergqwer; the same size "
-                              "and speed as NVFP4", "download_gb": 128.0, "ram_gb": 80, "arena_gb": 68.0,
-                     "families": ("nvfp4",), "vision": True},
-    "NVFP4-QAD": {"about": "NVIDIA's FP4, trained for FP4 - slightly faster on short prompts; a 102 GB download "
-                           "that this PC turns into a Strata pack once; it reads pictures",
-                  "download_gb": 102.2, "ram_gb": 80, "arena_gb": 68.0, "families": ("nvfp4",), "vision": True},
 }
 FALLBACK_FAMILIES = {
     "qwen": {"title": "Qwen3.8-Flash-Next", "about": "the original model", "tag": ""},
@@ -112,11 +103,7 @@ FALLBACK_FAMILIES = {
                                                               "sizes, for PCs with little memory; 58 and 92 GB "
                                                               "downloads (the files include the n-gram table)",
              "tag": "gyro-"},
-    "nvfp4": {"title": "Qwen3.8-Flash-Next (NVFP4)", "about": "4-bit NVFP4 experts, NVIDIA cards; a 128 GB download, "
-                                                              "~80 GB of RAM to keep every expert in RAM",
-              "tag": "nvfp4-"},
 }
-OWN_PATH_ENGINE = (0, 1, 45)   # the first engine that runs Qwen3.6-35B-A3B with pictures and parallel requests (setup.py MIN_ENGINE note)
 MEMORY_TIERS = ((62.0, "qwen", "IQ3_S"), (46.0, "qwen", "IQ3_XXS"), (38.0, "swift", "IQ2_XS"))   # as setup.py's: RAM + VRAM floors of the owner's 64 / 48 / 40 GB tiers
 # #3425 (owner's rule, same as setup.py's TIER_SYSTEM_RESERVE_GB): the floors count RAM + VRAM less the 5 GB Windows and the system keep
 TIER_SYSTEM_RESERVE_GB = 5.0
@@ -538,14 +525,11 @@ class Strata:
         return FALLBACK_MODELS, FALLBACK_FAMILIES, FALLBACK_CONTEXTS, "built-in table (setup.py not importable)"
 
     def own_families(self) -> dict:
-        """setup.py's OWN_PATH_FAMILIES (Qwen3.6-35B-A3B): families with an engine path of their own.  They are not in FAMILIES
-        (whose entries are Flash-Next files with packs), so the model list used to leave them out and the app's Qwen3.6 page
-        showed no versions at all.  Each is returned as a family entry (title, about, tag, license) of this server's table."""
+        """setup.py's MULTI_FILE_FAMILIES (DeepSeek-V4.1-Flash): families with an engine path of their own.  They are not in FAMILIES
+        (whose entries are Flash-Next files with packs).  Each is returned as a family entry (title, about, tag, license) of this
+        server's table."""
         s = self.setup_module()
         out = {}
-        for f, d in (getattr(s, "OWN_PATH_FAMILIES", None) or {}).items():
-            out[f] = {"title": d["title"], "about": d.get("about"), "tag": d["tag"], "license": d.get("license"),
-                      "vision": bool(d.get("vision", True)), "own_path": True}
         for f, d in (getattr(s, "MULTI_FILE_FAMILIES", None) or {}).items():     # DeepSeek-V4.1-Flash: nine shards, its own engine
             out[f] = {"title": d["title"], "about": d.get("about"), "tag": d["tag"], "license": d.get("license"),
                       "vision": bool(d.get("vision", False)), "own_path": True, "multi_file": True}
@@ -556,8 +540,8 @@ class Strata:
         return (getattr(self.setup_module(), "MULTI_FILE_FAMILIES", None) or {}).get(family)
 
     def own_size(self, family, model) -> dict | None:
-        """One size of an own-path family as a model-table row for install_plan / model_table (None: not an own-path size).
-        The download is the GGUF; the picture reader (mmproj, ~0.9 GB) is counted by the plan when pictures are on."""
+        """One size of an own-path family (DeepSeek-V4.1-Flash) as a model-table row for install_plan / model_table (None: not an
+        own-path size)."""
         big = self.multi_family(family)
         if big and model in big["models"]:
             # nine shards; the memory the weights need is VRAM + RAM together WITHOUT the n-gram table (it stays on the SSD)
@@ -565,18 +549,11 @@ class Strata:
             return {"about": big["models"][model]["about"], "download_gb": round(gb, 1), "ram_gb": big["models"][model]["ram_gb"],
                     "arena_gb": round(float(big["models"][model]["ram_gb"]) - 17.0, 1), "mem_total": True, "vision": False,
                     "engine": None, "families": (family,), "multi_file": True}
-        d = (getattr(self.setup_module(), "OWN_PATH_FAMILIES", None) or {}).get(family)
-        if not d or model not in d["models"]:
-            return None
-        size_gb = d["sha256"][d["file"].format(q=model)][0] / 1e9
-        return {"about": d["models"][model]["about"], "download_gb": round(size_gb, 1), "ram_gb": d["models"][model]["ram_gb"],
-                # the routed experts are ~93% of the file (setup.own_path_parallel_fits_all); the dense part and buffers ~1 GB more
-                "arena_gb": round(size_gb * 0.93, 1), "vision": bool(d.get("vision", True)),
-                "engine": OWN_PATH_ENGINE, "families": (family,)}
+        return None
 
     def sizes_of(self, models, family) -> list:
         """The family's sizes as setup lists them: an experimental one last (never the default)."""
-        own = (getattr(self.setup_module(), "OWN_PATH_FAMILIES", None) or {}).get(family) or self.multi_family(family)
+        own = self.multi_family(family)
         if own:
             return list(own["models"])
         return sorted((m for m in models if family in models[m].get("families", ("qwen", "swift"))),
@@ -909,89 +886,23 @@ class Strata:
             hw["cpu"] = {"name": name, "cores": physical_cores(), "threads": os.cpu_count(), "avx2": avx2, "avx512": avx512}
         except Exception:                               # noqa: BLE001
             hw["cpu"] = {"name": platform.processor(), "cores": physical_cores(), "threads": os.cpu_count()}
-        if sys.platform == "darwin":                    # a Mac: one pool of unified memory, the Metal engine (strata_control/mac_fit.py)
-            return self._mac_hardware(hw)
-        nv = []
+        # The Intel Arc cards, read from sysfs the way sycl/setup_intel.py's intel_gpus() reads them (the cards setup's Intel path offers).
         try:
-            nv = S.gpus() if S else own_nvidia_gpus()
-        except Exception:                               # noqa: BLE001
-            nv = own_nvidia_gpus()
-        for g in nv:
-            g["vendor"] = "nvidia"
-            g["vram_gb"] = round(g["vram_gb"], 1)
-            try:
-                g["problem"] = S.gpu_problem(g) if S else (None if int(g["arch"]) >= 75 else "older than RTX 20")
-            except Exception:                           # noqa: BLE001
-                g["problem"] = None
-            g["usable"] = g["problem"] is None
-        amd = []
-        try:                                            # Linux: the kernel's KFD topology; Windows: the display adapters' PCI ids + registry (setup.amd_gpus_win)
-            amd = S.amd_gpus() if S else []
-            for g in amd:
-                g["vendor"] = "amd"
-                g["vram_gb"] = round(g["vram_gb"], 1)
-                g["problem"] = S.amd_problem(g)
-                g["usable"] = g["problem"] is None
-        except Exception:                               # noqa: BLE001
-            amd = []
-        if not WIN and not amd and shutil.which("rocm-smi"):
-            amd = rocm_smi_gpus()
-        # A PC whose only NVIDIA cards are Pascal / Volta (two GTX 1080s) and that has no AMD card Strata can use: setup runs them with the
-        # CUDA 12 engine (old_gpus_opt_in), so the app must not call it "no supported graphics card" and start both cards Off (#3655).
-        # A PC with a newer card keeps recommending that one; naming an old card is still the opt-in.
-        try:
-            if S and nv and S.old_gpus_opt_in(nv, (), None, any(g.get("usable") for g in amd)):
-                for g in nv:
-                    if S.sm60_card(g["arch"]) and g.get("problem") and "older than the RTX 20" in str(g["problem"]):
-                        g["problem"], g["usable"], g["engine_variant"] = None, True, "cuda12"
+            hw["gpus"] = intel_gpus()
         except Exception:                               # noqa: BLE001 - the hardware page never breaks over this
-            pass
-        if any(g.get("usable") for g in nv):
-            for g in amd:                             # a Ryzen's integrated graphics beside an NVIDIA card: the engine runs on the NVIDIA card
-                if g.get("uma") and g.get("usable"):
-                    g["usable"], g["problem"] = False, "integrated graphics: Strata uses the NVIDIA card in this computer"
-        try:                                            # does the card drive a display?  (the app keeps less VRAM free on one that does not, #3215)
-            mark_display(nv + amd, nvidia_display_active() if nv else {}, windows_desktop_adapters() if WIN and amd else [])
-        except Exception:                               # noqa: BLE001 - unknown stays unknown: the app then keeps its safety default
-            pass
-        hw["gpus"] = nv + amd
+            hw["gpus"] = []
         try:                                            # how fast each card is (SMs x clock): the app and the Terminal pick the Main card by it
             from strata_control import gpu_roles
             gpu_roles.add_speeds(hw["gpus"])
         except Exception:                               # noqa: BLE001 - unknown speed: the card with the most memory is Main
             pass
-        self._engine_code(hw)
         self._engine_vendor(hw)
-        if WIN:
-            hw["display_adapters"] = windows_video_controllers()
-        hw["nvidia_smi"] = bool(shutil.which("nvidia-smi"))
         return hw
 
     @staticmethod
-    def _engine_code(hw: dict) -> None:
-        """An AMD card the installed engine package has no code for is not one Strata can run on (the engine would stop on it, #3203): flag it
-        unusable with the plain reason, so the card lists and "Automatic" leave it out.  Only a package that lists its archs speaks here."""
-        amd = [g for g in hw.get("gpus", []) if g.get("vendor") == "amd" and g.get("arch")]
-        if not amd:
-            return
-        try:
-            from strata_control import engine_component as ec
-            rep = ec.status()
-            eng = rep.get("engine") or {}
-            built = [a for a in eng.get("archs") or [] if str(a).startswith("gfx")]
-            if not rep.get("usable") or eng.get("backend") != "hip" or not built:
-                return
-        except Exception:                               # noqa: BLE001 - never break the hardware page over this
-            return
-        for g in amd:
-            if g["arch"] not in built and g.get("usable") is not False:
-                g["usable"] = False
-                g["problem"] = (ec.no_package_note([g["arch"]]) or f"this Strata engine has no code for {g['arch']} (it is built for {', '.join(built)})")
-
-    @staticmethod
     def _engine_vendor(hw: dict) -> None:
-        """One engine drives the cards of ONE make (CUDA: NVIDIA, HIP: AMD, ...): note which one for this PC (the installed engine's, else the one
-        setup fetches first) and, when the other make has the bigger card, the one plain line that says so. The model list below only counts
+        """One engine drives the cards of ONE make (SYCL: Intel): note which one for this PC (the installed engine's, else the make of the
+        cards that count) and, when another make has the bigger card, the one plain line that says so. The model list below only counts
         the cards this engine can drive; a model is never split across makes (strata_control/gpu_fit.py)."""
         try:
             from strata_control import gpu_fit
@@ -1017,120 +928,20 @@ class Strata:
         vendor = hw.get("engine_vendor")
         return [g for g in hw.get("gpus", []) if g.get("usable") and (not vendor or not g.get("vendor") or g.get("vendor") == vendor)]
 
-    # ---- a Mac (Apple Silicon): unified memory, the Metal engine.  The rules are strata_control/mac_fit.py's (the same module
-    # metal/setup_mac.py uses), so the app, the Terminal and a Mac that builds the engine itself judge a model the same way.
-    def mac(self):
-        """strata_control/mac_fit.py, or None when this Strata folder does not carry it."""
-        try:
-            if str(self.src) not in sys.path:
-                sys.path.insert(0, str(self.src))
-            from strata_control import mac_fit
-            return mac_fit
-        except Exception as e:                          # noqa: BLE001
-            log(f"strata_control/mac_fit.py could not be imported ({e})")
-            return None
-
-    def _mac_hardware(self, hw: dict) -> dict:
-        mf = self.mac()
-        info = mf.mac_info() if mf else {"chip": platform.processor() or "Apple silicon", "ram_gb": hw.get("ram_gb") or 0.0,
-                                         "macos": platform.mac_ver()[0], "arm64": platform.machine() == "arm64", "clt": "x"}
-        problems = mf.mac_problems(info, need_compiler=False) if mf else []
-        ram = round(float(info.get("ram_gb") or hw.get("ram_gb") or 0.0), 1)
-        hw["ram_gb"] = ram
-        hw["cpu"] = {"name": info["chip"], "cores": os.cpu_count(), "avx2": None, "avx512": None}
-        # The graphics memory IS the RAM here: vram_gb stays 0 so nothing is counted twice (the pages that fit RAM + VRAM add them up).
-        hw["gpus"] = [{"index": 0, "name": info["chip"], "vendor": "apple", "vram_gb": 0.0, "unified_gb": ram, "arch": "apple-gpu",
-                       "problem": problems[0] if problems else None, "usable": not problems}]
-        hw["mac"] = {"chip": info["chip"], "macos": info.get("macos"), "unified_gb": ram}
-        hw["nvidia_smi"] = False
-        return hw
-
-    def _mac_sizes(self, models: dict, family: str = "qwen") -> list:
-        """The sizes the app offers on a Mac: the GSQ-RCO files of the Qwen family (two shards, no repack) and agentionai's Gyro files (one
-        file, no repack). Unsloth's many-shard files need metal/tools/metal_repack.py, which the Terminal's setup uses; the app does not
-        offer them yet."""
-        mf = self.mac()
-        return [m for m, d in mf.MAC_MODELS.items() if d.get("family", "qwen") == family and m in models] if mf else []
-
-    def _mac_verdict(self, model: str, ram: float) -> str:
-        mf = self.mac()
-        if ram < mf.MIN_STREAM_RAM_GB:
-            return "does not fit"
-        if not mf.streams(model, ram):
-            return "fits"
-        speed = mf.STREAM_MEASURED.get(model)
-        if speed:
-            return (f"part of its experts in memory, the rest read from the SSD (slower: {speed} measured on a 32 GB Mac mini)")
-        return "slow here: part of its experts read from the SSD (slower, not measured on a Mac of this size)"
-
-    def _mac_recommend(self, hw: dict, models: dict, families: dict) -> dict:
-        mf = self.mac()
-        ram = float(hw.get("ram_gb") or 0)
-        usable = [g for g in hw.get("gpus", []) if g.get("usable")]
-        if not mf or not usable:
-            why = (hw.get("gpus") or [{}])[0].get("problem") or "this Mac cannot run the Metal engine"
-            return {"family": None, "model": None, "why": why}
-        if ram < mf.MIN_STREAM_RAM_GB:
-            return {"family": None, "model": None,
-                    "why": f"{ram:.0f} GB of unified memory: Strata needs {mf.MIN_STREAM_RAM_GB:.0f} GB or more on a Mac (32 GB or more is what it was tested on)"}
-        model, notes = mf.recommend_model(ram)
-        notes = [n for n in notes if "UD-Q4_K_XL" not in n]          # the app does not offer the Unsloth files yet
-        if model not in self._mac_sizes(models):
-            model = "Q2_0"
-        if mf.streams(model, ram):
-            speed = mf.STREAM_MEASURED.get(model)
-            why = (f"{ram:.0f} GB of unified memory: no size fits whole, so {model}'s experts are read from the SSD as it answers"
-                   + (f" ({speed} measured on a 32 GB Mac mini)" if speed else ""))
-        else:
-            why = f"{ram:.0f} GB of unified memory: {model} stays in memory (the best size that does)"
-        ctx = mf.recommend_context(ram)
-        return {"family": "qwen", "model": model, "title": families["qwen"]["title"] + " " + model, "context": ctx,
-                "backend": "metal", "gpu": {k: usable[0].get(k) for k in ("index", "name", "vram_gb")},
-                "download_gb": models[model]["download_gb"], "why": why, "notes": notes,
-                "setup_command": f"./setup.sh --setup --yes --family qwen --model {model} --context {ctx}"}
-
-    def _mac_model_table(self, hw: dict) -> list:
-        models, families, _ctx, _src = self.tables()
-        ram = float(hw.get("ram_gb") or 0)
-        have = {c.stem[len("strata-"):] for c in self.configs()}
-        out = []
-        for family in ("qwen", "gyro"):                # Gyro after the regular sizes, as on a PC: never the default
-            fd = families.get(family)
-            if fd is None:
-                continue
-            sizes = []
-            for m in self._mac_sizes(models, family):
-                d = models[m]
-                tag = (fd.get("tag", "") + m).lower()
-                sizes.append({"model": m, "about": d["about"], "download_gb": d["download_gb"], "experimental": False,
-                              "images": d.get("vision", fd.get("vision", True)) is not False,   # the Mac engine carries the picture reader (Metal)
-                              "ram_needed_gb": d["ram_gb"], "experts_gb": d.get("arena_gb"), "mem_total": False,
-                              "memory_gb": round(float(d.get("arena_gb") or d["ram_gb"]) + 1.0, 1),
-                              "on_this_pc": self._mac_verdict(m, ram) if ram else None, "installed": tag in have, "id": tag})
-            if sizes:
-                out.append({"family": family, "title": fd["title"], "about": fd.get("about"), "experimental": False,
-                            "images": any(x["images"] for x in sizes), "sizes": sizes})
-        return out
-
     def recommend(self, hw: dict) -> dict:
         """setup.py's own rules: the size it preselects (IQ3_XXS from 60 GB of RAM, else the first, Q2_0), the
         Coder below the full model's RAM (setup's RAM table), the low-RAM mode when the GPU makes up for the RAM, and
-        the context it preselects for the card's VRAM (32K under 14 GB, 64K under 20 GB, else 128K)."""
+        the context preselected for an Intel Arc card's VRAM (default_context)."""
         models, families, _ctx, _src = self.tables()
-        if hw.get("mac"):
-            return self._mac_recommend(hw, models, families)
         S = self.setup_module()
         usable = self.engine_gpus(hw)
         ram = hw.get("ram_gb") or 0
         if not usable:
-            why = ("no NVIDIA RTX 20-series-or-newer GPU found (nvidia-smi did not list one)"
-                   + ("; the AMD graphics in this PC is not a card Strata supports (an RX 7000 or 9000 series card, or a Ryzen AI Max, is needed)" if WIN and any(
-                       "amd" in str(a.get("name", "")).lower() or "radeon" in str(a.get("name", "")).lower()
-                       for a in hw.get("display_adapters", [])) else ""))
-            return {"family": None, "model": None, "why": why}
+            return {"family": None, "model": None,
+                    "why": "no Intel Arc graphics card found (the kernel's device list, /sys/class/drm, names none under the xe or i915 driver)"}
         best = max(usable, key=lambda g: (round(g["vram_gb"]), -g.get("index", 0)))
         vram = best["vram_gb"]
-        backend = "hip" if best.get("vendor") == "amd" else "cuda"
+        backend = "sycl"
 
         def low_fits(m):
             try:
@@ -1139,8 +950,8 @@ class Strata:
                 return False
         notes = []
         # 0.2.0, the owner's memory tiers (README "The other sizes"; setup.py MEMORY_TIERS holds the same floors): RAM + VRAM
-        # together.  An APU's shared memory is the RAM itself, so only its BIOS carve-out counts as VRAM.
-        tvram = float(best.get("dedicated_gb", 0.0)) if best.get("uma") else float(vram)
+        # together.
+        tvram = float(vram)
         tier = next(((f, n) for lo, f, n in MEMORY_TIERS if ram + tvram - TIER_SYSTEM_RESERVE_GB >= lo), None)
         if tier and tier[1] in models and tier[0] in families:
             fam, model = tier
@@ -1148,7 +959,7 @@ class Strata:
             if model == "IQ2_XS":
                 why = (f"{total}, the 40 GB tier: Swift 1.5's IQ2_XS (thinks for a shorter time)"
                        + ("; Gyro-M (35 GB) is the other choice there, close to IQ3_XXS in quality but 16-21% slower at "
-                          "writing answers than Q2_0" if "Gyro-M" in models and best.get("vendor") in ("nvidia", "amd", "intel") else ""))
+                          "writing answers than Q2_0" if "Gyro-M" in models else ""))
             elif model == "IQ3_XXS":
                 why = f"{total}, the 48 GB tier: IQ3_XXS (better quality, slower)"
             else:
@@ -1176,7 +987,7 @@ class Strata:
             return {"family": None, "model": None, "why": f"{ram:.0f} GB of RAM: Strata needs 32 GB or more "
                                                           "(the smallest model, the Coder, keeps ~23 GB of experts in "
                                                           "RAM)"}
-        ctx = 32768 if vram < 14 else 65536 if vram < 20 else 131072
+        ctx = default_context(vram)
         # #3425: the tiers count RAM + VRAM together, but the desktop keeps about 10 GB of the RAM and the card keeps ~6 GB for
         # its dense weights, so a PC at the floor of its tier reads part of the experts from the SSD at every answer.  Said
         # plainly beside the pick (the same arithmetic as the app's "This computer" card); the pick itself stays the owner's tier.
@@ -1191,17 +1002,13 @@ class Strata:
         if hw.get("cpu", {}).get("avx2") is False:      # #623: a warning, not a stop (setup compiles for it)
             notes.append("this CPU has no AVX2: EXPERIMENTAL and slow - setup compiles the engine on this PC for the "
                          "older CPU (10-20 minutes), and the CPU's share of the experts runs a few times slower")
-        if backend == "hip":
-            notes.append("AMD (experimental): pictures are on; the reader runs on the CPU under 24 GB of VRAM and on the GPU from 24 GB")
         cmd = (("START-HERE.bat --setup" if WIN else "./setup.sh --setup") +
-               f" --yes --family {fam} --model {model} --context {ctx}" + (" --backend hip" if backend == "hip" else ""))
+               f" --yes --family {fam} --model {model} --context {ctx}")
         return {"family": fam, "model": model, "title": families[fam]["title"] + " " + model, "context": ctx,
                 "backend": backend, "gpu": {k: best.get(k) for k in ("index", "name", "vram_gb")},
                 "download_gb": models[model]["download_gb"], "why": why, "notes": notes, "setup_command": cmd}
 
     def model_table(self, hw: dict | None) -> list:
-        if (hw or {}).get("mac"):
-            return self._mac_model_table(hw)
         models, families, _ctx, _src = self.tables()
         S = self.setup_module()
         ram = (hw or {}).get("ram_gb")
@@ -1222,8 +1029,6 @@ class Strata:
                     try:
                         if own and own.get("multi_file"):       # DeepSeek-V4.1-Flash: strata_control/dsv41_fit.py (cards + RAM, the n-gram table on the SSD)
                             verdict = self.dsv41_words(hw, m, installed=tag in have)
-                        elif own:                       # its own engine path: no budget or low-RAM mode of Flash-Next's to judge by
-                            pass
                         elif d.get("budget") and S and hasattr(S, "unsloth_budget") and not S.unsloth_budget(m, ram):
                             verdict = ("experimental: " if d.get("experimental") else "") + "fits (all of its experts in RAM)"
                         elif d.get("budget"):
@@ -1240,8 +1045,8 @@ class Strata:
                               "experimental": bool(d.get("experimental")),
                               "images": d.get("vision", fd.get("vision", True)) is not False,
                               # which picture reader "pictures on" gets on this PC (strata_control/vision_reader.py, the one rule: the CPU reader
-                              # under 24 GB of graphics memory, the GPU reader from 24 GB; the person can switch it per model)
-                              "images_reader": self.images_reader(vram),
+                              # under 24 GB of graphics memory, the GPU reader from 24 GB, an Intel Arc the CPU reader; the person can switch it per model)
+                              "images_reader": self.images_reader(vram, (hw or {}).get("engine_vendor")),
                               "ram_needed_gb": d["ram_gb"], "experts_gb": d.get("arena_gb"),
                               # RAM + VRAM the weights need together, WITHOUT the n-gram table (that stays on the SSD): Gyro states it
                               # (mem_total), for the rest the experts plus ~1 GB for the dense part (Swift IQ2_XS: 35.5 + 1 = 36.5)
@@ -1254,7 +1059,7 @@ class Strata:
                               # which graphics cards to use for it (strata_control/gpu_fit.py, the one rule app / Terminal / setup share):
                               # only with two or more cards that count; "recommended" names the pre-selected option
                               "gpu_options": (self.dsv41_options(hw, m) if own and own.get("multi_file")
-                                              else None if own else self.gpu_options(d, ram, hw))})   # Qwen3.6 runs on one card so far
+                                              else self.gpu_options(d, ram, hw))})
             out.append({"family": f, "title": fd["title"], "about": fd.get("about"),
                         "experimental": bool(fd.get("experimental")),
                         "images": any(x["images"] for x in sizes) if sizes else fd.get("vision", True) is not False,
@@ -1348,10 +1153,10 @@ class Strata:
             return None
 
     @staticmethod
-    def images_reader(vram) -> str:
+    def images_reader(vram, vendor=None) -> str:
         try:
             from strata_control import vision_reader
-            return vision_reader.default_mode(vram) if vram else "cpu"
+            return vision_reader.default_mode(vram, vendor or "") if vram else "cpu"
         except Exception:                                  # noqa: BLE001
             return "cpu"
 
@@ -1504,22 +1309,10 @@ def expected_files(S, family: str, model: str, models_dir: Path, vision: bool) -
             shared = Path(models_dir) / (big["tag"] + "shared")        # the Engram, the drafter and the metadata shard of the official sets
             return ([{"path": str(folder / n), "bytes": big["sha256"][n][0], "role": "model"} for n in big["models"][model]["shards"]]
                     + [{"path": str(shared / n), "bytes": big["sha256"][n][0], "role": "model"} for n in big["models"][model].get("shared", [])])
-        own = (getattr(S, "OWN_PATH_FAMILIES", None) or {}).get(family)
-        if own:                                         # Qwen3.6: the GGUF and the picture reader in the model's folder
-            folder = Path(models_dir) / (own["tag"] + model)
-            name = own["file"].format(q=model)
-            out.append({"path": str(folder / name), "bytes": own["sha256"][name][0], "role": "model"})
-            if vision:
-                out.append({"path": str(folder / own["mmproj"]), "bytes": own["sha256"][own["mmproj"]][0], "role": "vision"})
-            return out
-        fam, d = S.FAMILIES[family], S.MODELS[model]
-        if d.get("repo"):                               # NVFP4: a ready-made pack, many files with pinned sizes
-            for f in S.ready_needed(model, Path(models_dir)):
-                out.append({"path": str(S.ready_where(Path(models_dir), f)), "bytes": f[4], "role": "model"})
-        else:
-            folder = Path(models_dir) / (fam.get("tag", "") + model)
-            for i in range(1, S.model_shards(fam, model) + 1):
-                out.append({"path": str(folder / S.model_file(fam, model, i)), "bytes": None, "role": "model"})
+        fam = S.FAMILIES[family]
+        folder = Path(models_dir) / (fam.get("tag", "") + model)
+        for i in range(1, S.model_shards(fam, model) + 1):
+            out.append({"path": str(folder / S.model_file(fam, model, i)), "bytes": None, "role": "model"})
         if vision:                                      # beside the model folders, not inside them (setup step 5)
             size = (fam.get("mmproj_sha256") or (None,))[0] or DEFAULT_MMPROJ_BYTES
             out.append({"path": str(Path(models_dir) / fam.get("mmproj", S.MMPROJ)), "bytes": size, "role": "vision"})
@@ -1709,86 +1502,53 @@ def own_ram_gb() -> float:
     return 0.0
 
 
-def own_nvidia_gpus() -> list:
-    s = run_quiet(["nvidia-smi", "--query-gpu=index,name,memory.total,compute_cap,driver_version",
-                   "--format=csv,noheader,nounits"])
+# The Intel Arc cards by PCI device id -> (name, VRAM in GB): sycl/setup_intel.py's INTEL_ARC (tools/test_strata_mcp.py checks that they match).
+# A copy, not an import: sycl/ is not in the Terminal bundle, and setup_intel.py imports setup.py a second time.
+INTEL_ARC = {"e223": ("Arc Pro B70", 32.0), "e222": ("Arc Pro B65", 32.0), "e221": ("Arc Pro B60", 24.0), "e211": ("Arc Pro B60", 24.0),
+             "e20b": ("Arc B580", 12.0),
+             "e20c": ("Arc B570", 10.0), "e212": ("Arc B50", 16.0),
+             "56a0": ("Arc A770", 16.0), "56a1": ("Arc A750", 8.0), "56a2": ("Arc A580", 8.0),
+             "56a5": ("Arc A380", 6.0), "56a6": ("Arc A310", 4.0), "5690": ("Arc A770M", 16.0)}
+DRM_ROOT = "/sys/class/drm"
+
+
+def intel_gpus(root: str | None = None) -> list:
+    """The Intel cards setup's Intel path offers, read the way sycl/setup_intel.py's intel_gpus() reads them: vendor 0x8086 under the xe or
+    i915 driver in the kernel's device list, named and sized by the PCI id (an xe card that is not in the table by the size of its VRAM BAR);
+    an i915 device of another id is integrated graphics and left out.  Empty where there is no such list."""
     found = []
-    for line in s.strip().splitlines():
-        try:
-            idx, name, mem, cc, drv = [x.strip() for x in line.split(",")]
-            found.append({"index": int(idx), "name": name, "vram_gb": float(mem) / 1024.0,
-                          "arch": cc.replace(".", ""), "driver": drv})
-        except ValueError:
+    for card in sorted(Path(root or DRM_ROOT).glob("card[0-9]*")):
+        if "-" in card.name:                            # connectors (card0-DP-1) share the card's device
             continue
+        dev = card / "device"
+        try:
+            vendor = (dev / "vendor").read_text().strip().lower()
+            devid = (dev / "device").read_text().strip().lower().replace("0x", "")
+            driver = os.path.basename(os.path.realpath(dev / "driver")) if (dev / "driver").exists() else ""
+        except OSError:
+            continue
+        if vendor != "0x8086" or driver not in ("xe", "i915"):
+            continue
+        name, vram = INTEL_ARC.get(devid, (None, 0.0))
+        if name is None:
+            if driver != "xe":
+                continue
+            name = f"Intel GPU {devid} (xe)"
+        if not vram:                                    # resource line 2 (BAR 2) is the VRAM aperture on xe cards
+            try:
+                start, end, _ = (dev / "resource").read_text().splitlines()[2].split()
+                vram = (int(end, 16) - int(start, 16) + 1) / 2**30
+            except (OSError, IndexError, ValueError):
+                vram = 0.0
+        found.append({"index": len(found), "name": f"Intel {name}", "vram_gb": round(vram, 1), "arch": driver, "driver": driver,
+                      "devid": devid, "vendor": "intel", "usable": True, "problem": None})
     return found
 
 
-def nvidia_display_active() -> dict:
-    """{GPU index: True when a display is attached to the card} from nvidia-smi (display_active Enabled); {} when it says nothing."""
-    found = {}
-    for line in run_quiet(["nvidia-smi", "--query-gpu=index,display_active", "--format=csv,noheader"]).strip().splitlines():
-        idx, _, state = line.partition(",")
-        if idx.strip().isdigit() and state.strip().lower() in ("enabled", "disabled"):
-            found[int(idx)] = state.strip().lower() == "enabled"
-    return found
-
-
-def windows_desktop_adapters() -> list:
-    """The PNPDeviceIDs of the Windows display adapters that have a desktop resolution (a monitor is attached to them)."""
-    out = []
-    for line in run_quiet(["powershell", "-NoProfile", "-NonInteractive", "-Command",
-                           "Get-CimInstance Win32_VideoController | ForEach-Object { $_.PNPDeviceID + '|' + $_.CurrentHorizontalResolution }"]
-                          ).splitlines():
-        pnp, _, res = line.strip().rpartition("|")
-        if pnp and res.strip().isdigit() and int(res) > 0:
-            out.append(pnp)
-    return out
-
-
-def mark_display(gpus: list, nvidia_active: dict, desktop_pnp: list) -> None:
-    """Sets g["drives_display"] (True / False) on the cards that can be told, from nvidia-smi (NVIDIA) and the Windows adapters that have a desktop
-    resolution (AMD and Intel, matched by PCI device id; two cards of one model are not told apart: left unknown).  A card left without the key is
-    unknown, and the app treats an unknown card as one that drives a display."""
-    desk = [str(p).upper() for p in desktop_pnp]
-    for g in gpus:
-        if g.get("vendor") == "nvidia" and g.get("index") in nvidia_active:
-            g["drives_display"] = nvidia_active[g["index"]]
-        elif g.get("vendor") == "amd" and isinstance(g.get("pci_id"), int) and desktop_pnp is not None and desktop_pnp:
-            tag = f"DEV_{g['pci_id']:04X}"
-            twins = [x for x in gpus if x.get("vendor") == "amd" and x.get("pci_id") == g["pci_id"]]
-            if len(twins) == 1:
-                g["drives_display"] = any(tag in p and "VEN_1002" in p for p in desk)
-
-
-def windows_video_controllers() -> list:
-    s = run_quiet(["powershell", "-NoProfile", "-NonInteractive", "-Command",
-                   "Get-CimInstance Win32_VideoController | Select-Object Name,DriverVersion | ConvertTo-Json -Compress"])
-    try:
-        d = json.loads(s) if s.strip() else []
-    except ValueError:
-        return []
-    d = [d] if isinstance(d, dict) else d
-    return [{"name": x.get("Name"), "driver": x.get("DriverVersion")} for x in d if isinstance(x, dict)]
-
-
-def rocm_smi_gpus() -> list:
-    s = run_quiet(["rocm-smi", "--showproductname", "--showmeminfo", "vram", "--json"])
-    try:
-        d = json.loads(s)
-    except ValueError:
-        return []
-    out = []
-    for i, (card, v) in enumerate(sorted(d.items())):
-        if not isinstance(v, dict) or not card.lower().startswith("card"):
-            continue
-        total = next((v[k] for k in v if "total" in k.lower() and "vram" in k.lower()), 0)
-        try:
-            vram = int(total) / 2**30
-        except (TypeError, ValueError):
-            vram = 0.0
-        out.append({"index": i, "name": v.get("Card Series") or v.get("Card SKU") or card, "vram_gb": round(vram, 1),
-                    "vendor": "amd", "usable": None, "problem": "listed by rocm-smi (setup checks the card itself)"})
-    return out
+def default_context(vram_gb: float) -> int:
+    """The context preselected for an Intel Arc card with this much VRAM: the session and the streamed experts share the card's memory, so
+    8K under 10 GB, 16K under 20 GB, else 32K (strata_cli/launch/catalog.py max_context's rule: the app, the Terminal and this agree)."""
+    return 8192 if vram_gb < 10 else 16384 if vram_gb < 20 else 32768
 
 
 # ------------------------------------------------------------------------------------------------ the tools
@@ -1851,17 +1611,16 @@ def tool_defs(models: dict, families: dict, contexts: list) -> list:
                                         f"{', '.join(str(c) for c in contexts)}"},
              "vision": {"type": "string", "enum": ["no", "yes", "gpu", "cpu"],
                         "description": "let the model read images (~0.9 GB more download). Default yes where the model can "
-                                       "read them (not on a Mac): yes = the best reader for this card (the CPU "
-                                       "under 24 GB of VRAM, the GPU from 24 GB, any make), gpu / cpu = that "
-                                       "reader, no = text only"},
+                                       "read them: yes = the reader for this card (on an Intel Arc the CPU), "
+                                       "gpu / cpu = that reader, no = text only"},
              "kv": {"type": "string", "enum": ["int8", "q4_0", "k8v4"],
                     "description": "KV cache precision above 8K context (default int8)"},
              "gpu": {"type": "integer", "minimum": 0, "maximum": 63,
-                     "description": "one GPU, as nvidia-smi numbers them (default: the one with the most VRAM)"},
+                     "description": "one GPU, as setup numbers them (default: the one with the most VRAM)"},
              "gpus": {"type": "string", "pattern": GPUS_PATTERN, "maxLength": 40,
                       "description": "several GPUs sharing the model: '0,2' or 'all' (experimental)"},
-             "backend": {"type": "string", "enum": ["auto", "cuda", "hip"],
-                         "description": "auto (default), cuda = NVIDIA, hip = AMD on Linux (experimental)"},
+             "backend": {"type": "string", "enum": ["auto", "sycl"],
+                         "description": "auto (default) or sycl: the Intel Arc engine, the only one"},
              "low_ram": {"type": "string", "enum": ["auto", "on", "off", "resident", "mmap"],
                          "description": "setup's low-RAM mode (default auto)"},
              "port": {**port, "description": "the port the model will listen on (default 8080)"},
@@ -1886,7 +1645,7 @@ def tool_defs(models: dict, families: dict, contexts: list) -> list:
          "inputSchema": {"type": "object", "additionalProperties": False, "properties": {
              "model": installed_model, "port": port,
              "gpu": {"type": "integer", "minimum": 0, "maximum": 63,
-                     "description": "run on this GPU for this start (as nvidia-smi numbers them)"},
+                     "description": "run on this GPU for this start (as setup numbers them)"},
              "wait_seconds": {"type": "integer", "minimum": 0, "maximum": 600,
                               "description": "how long to wait for it to be ready (default 50: some AI apps end "
                                              "a tool call after 60 s)"}}},
@@ -2157,19 +1916,13 @@ class Tools:
         sizes = s.sizes_of(models, family)
         if model not in sizes:
             raise ToolError(f"{families[family]['title']} has no {model}; its sizes: {', '.join(sizes)}")
-        md = s.own_size(family, model) or models[model]   # Qwen3.6-35B-A3B: its sizes are not in setup's MODELS
-        mac = bool(hw.get("mac"))
-        if mac:                                         # a Mac: no card to pick, no KV choice, no RAM mode: unified memory decides
-            if rec.get("model") is None and model is not None and s.mac() and hw.get("ram_gb", 0) < s.mac().MIN_STREAM_RAM_GB:
-                raise ToolError(f"{model} does not fit this Mac: {rec['why']}")
-            gpu = gpus = kv = low_ram = None
-            context = context or (s.mac().recommend_context(hw.get("ram_gb") or 0) if s.mac() else 32768)
+        md = s.own_size(family, model) or models[model]   # DeepSeek-V4.1-Flash: its sizes are not in setup's MODELS
         if context is None and md.get("multi_file"):
             context = getattr(s.setup_module(), "DSV41_CONTEXT", 8192)      # the context the engine was checked at
         if context is None:
             usable = s.engine_gpus(hw)
             vram = max((g["vram_gb"] for g in usable), default=12)
-            context = 32768 if vram < 14 else 65536 if vram < 20 else 131072
+            context = default_context(vram)
             if md.get("budget") and (not hasattr(s.setup_module(), "unsloth_budget") or
                                                 s.setup_module().unsloth_budget(model, hw.get("ram_gb") or 0.0)):
                 context = 8192 if vram < 14 else 32768
@@ -2177,7 +1930,7 @@ class Tools:
             raise ToolError(f"images are not available with {families[family]['title']} {model} yet: use vision=no")
         if vision is None:
             # owner rule (2026-10-18): pictures are on by default wherever the model can read them and the engine has a reader; setup picks
-            # the reader (strata_control/vision_reader.py: the CPU under 24 GB, the GPU from 24 GB, every make of card; a Mac reads on its GPU).
+            # the reader (strata_control/vision_reader.py: the CPU under 24 GB, the GPU from 24 GB; an Intel Arc keeps the CPU reader).
             can_read = md.get("vision", families[family].get("vision")) is not False
             vision = "yes" if can_read else "no"
         target = self.check_data_dir(data_dir) if data_dir else s.data_dir()
@@ -2197,7 +1950,7 @@ class Tools:
         own = bool(s.own_families().get(family))
         for flag, v in (("--kv", kv), ("--gpu", gpu), ("--gpus", gpus), ("--low-ram", low_ram), ("--port", port),
                         ("--data-dir", str(target) if data_dir else None)):
-            if own and flag in ("--kv", "--low-ram"):      # Flash-Next settings: Qwen3.6's engine path does not use them (setup would warn)
+            if own and flag in ("--kv", "--low-ram"):      # Flash-Next settings: DeepSeek's engine path does not use them (setup would warn)
                 continue
             if v is not None:
                 args += [flag, str(v)]
@@ -2206,8 +1959,8 @@ class Tools:
             if not local.is_absolute() or not local.is_dir() or ".." in local.parts:
                 raise ToolError("gguf_dir must be an existing absolute folder")
             args += ["--gguf-dir", str(local)]
-        if backend in ("cuda", "hip"):
-            args += ["--backend", backend]
+        if backend == "sycl":
+            args += ["--backend", "sycl"]
         fit = None
         ram = hw.get("ram_gb")
         if ram is not None and md.get("multi_file"):
