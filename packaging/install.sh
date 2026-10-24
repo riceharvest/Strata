@@ -1,5 +1,5 @@
 #!/bin/sh
-# Strata Terminal: one-line installer for Linux and macOS.
+# Strata Terminal: one-line installer for Linux (x86_64, Intel Arc).
 #
 #     curl -fsSL https://github.com/Niko1221/Strata/releases/latest/download/install.sh -o install.sh && sh install.sh
 #
@@ -54,21 +54,12 @@ main() {
   os=$(uname -s); arch=$(uname -m)
   case "$os-$arch" in
     Linux-x86_64|Linux-amd64) platform=linux-x86_64 ;;
-    Darwin-arm64|Darwin-aarch64) platform=macos-arm64 ;;
-    Linux-aarch64|Linux-arm64) die "this computer ($os $arch) has an ARM processor. Strata needs an NVIDIA or AMD graphics card and has no engine for ARM Linux, so it could not run a model here. Use a Linux PC with an Intel or AMD processor (x86_64) and one of those cards." ;;
-    Darwin-x86_64) die "this Mac has an Intel processor. Strata for Mac needs Apple silicon (M1 or newer), so it could not run a model here." ;;
-    *) die "this computer ($os $arch) has no Strata Terminal. Supported: Linux x86_64 with an NVIDIA or AMD card, macOS on Apple silicon (Windows: use install.ps1)." ;;
+    Linux-aarch64|Linux-arm64) die "this computer ($os $arch) has an ARM processor. Strata needs an Intel Arc graphics card and has no engine for ARM Linux, so it could not run a model here. Use a Linux PC with an x86_64 processor and an Intel Arc card." ;;
+    *) die "this computer ($os $arch) has no Strata Terminal. Supported: Linux x86_64 with an Intel Arc card." ;;
   esac
   gpu=""
-  if command -v nvidia-smi >/dev/null 2>&1; then
-    gpu=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 || true)
-    [ -n "$gpu" ] && gpu="NVIDIA $gpu"
-  fi
-  if [ -z "$gpu" ] && [ "$os" = Linux ] && command -v lspci >/dev/null 2>&1; then
+  if command -v lspci >/dev/null 2>&1; then
     gpu=$(lspci 2>/dev/null | grep -iE 'vga|3d|display' | head -1 | sed 's/^[^:]*: *//' || true)
-  fi
-  if [ -z "$gpu" ] && [ "$os" = Darwin ]; then
-    gpu=$(system_profiler SPDisplaysDataType 2>/dev/null | sed -n 's/^ *Chipset Model: //p' | head -1 || true)
   fi
   say "Strata Terminal installer"
   say "  This computer: $os $arch ($platform)${gpu:+, graphics: $gpu}"

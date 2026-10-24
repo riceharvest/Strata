@@ -7,7 +7,7 @@ version and the SHA-256 of the wheel(s) accepted for it, so a build can only eve
 The lock is made here, from `requirements.txt` + `requirements-monitor.txt` (the direct, version-pinned runtime
 packages) by letting pip resolve and download the wheels for the target's tags and hashing what it fetched.
 
-    python packaging/lock_wheels.py --target windows-x86_64          # writes packaging/locks/...
+    python packaging/lock_wheels.py --target linux-x86_64            # writes packaging/locks/...
     python packaging/lock_wheels.py --target linux-x86_64 --check    # fails when the committed lock differs
     python packaging/lock_wheels.py --target linux-x86_64 --download wheelhouse/   # exactly the locked wheels
 
@@ -30,14 +30,9 @@ INPUTS = ("requirements.txt", "requirements-monitor.txt")
 
 #: pip's tags for each target, and the environment markers evaluate under for it.
 TARGETS = {
-    "windows-x86_64": {"platforms": ["win_amd64"], "env": {"sys_platform": "win32", "platform_system": "Windows",
-                                                            "os_name": "nt"}},
     "linux-x86_64": {"platforms": ["manylinux2014_x86_64", "manylinux_2_17_x86_64", "manylinux_2_28_x86_64",
                                    "manylinux_2_34_x86_64", "linux_x86_64"],
                      "env": {"sys_platform": "linux", "platform_system": "Linux", "os_name": "posix"}},
-    "darwin-arm64": {"platforms": ["macosx_11_0_arm64", "macosx_12_0_arm64", "macosx_13_0_arm64",
-                                   "macosx_14_0_arm64"],
-                     "env": {"sys_platform": "darwin", "platform_system": "Darwin", "os_name": "posix"}},
 }
 PYTHON = "3.12"
 ABI = "cp312"

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build the self-contained Strata Terminal distribution for Windows x64, Linux x86_64 or macOS arm64.
+"""Build the self-contained Strata Terminal distribution for Linux x86_64 (the Intel Arc / B70 host).
 
 The requirement this exists for (checklist P04, and the owner's rule that starting or serving never fetches Python
 packages from the internet): a user installs the terminal without Desktop, and needs no development checkout, no
@@ -9,8 +9,7 @@ the `strata` launchers prefer them.
 What goes in
 ------------
 * a pinned **standalone CPython 3.12.15** (python-build-standalone 20261009, `install_only`), downloaded at BUILD
-  time and SHA-256-verified against the pin below (the digests are the ones in that release's SHA256SUMS, the Mac one
-  is also what `setup.sh` pins), so the terminal and the installer cannot drift apart;
+  time and SHA-256-verified against the pin below (the digest is the one in that release's SHA256SUMS);
 * the runtime wheels from the target's lock, `packaging/locks/runtime-<target>-cp312.txt` (made by
   `packaging/lock_wheels.py`), installed into that interpreter with
   `pip install --require-hashes --no-deps --only-binary=:all:` at BUILD time only: every package, direct or
@@ -21,7 +20,7 @@ What goes in
 * the read-only tooling under `tools/` that the terminal paths import. Everything else under `tools/` is engine
   installation and preparation work and is deliberately excluded: the serving import graph must not pull it in
   (tests/terminal/test_no_acquisition.py checks that);
-* launchers: `bin/strata.cmd` and `bin/strata.ps1` (Windows), `bin/strata` (Linux, macOS).
+* the launcher: `bin/strata`.
 
 What does NOT go in
 -------------------
@@ -53,7 +52,6 @@ import sys
 import tarfile
 import tempfile
 import urllib.request
-import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -63,30 +61,16 @@ PBS_RELEASE = "20261009"
 PYTHON_VERSION = "3.12.15"
 PBS_BASE = f"https://github.com/astral-sh/python-build-standalone/releases/download/{PBS_RELEASE}/"
 
-#: The standalone CPython pins, one per target, from the release's SHA256SUMS. `darwin-arm64` is also what
-#: `setup.sh` pins: a terminal built from one and an installer built from the other are the same interpreter.
+#: The standalone CPython pin per target, from the release's SHA256SUMS (one target: linux-x86_64).
 PYTHON_PINS = {
-    "windows-x86_64": {
-        "file": f"cpython-{PYTHON_VERSION}+{PBS_RELEASE}-x86_64-pc-windows-msvc-install_only.tar.gz",
-        "sha256": "194c8f0d9e0de6f1c4576e5dfa67819a48c764be87608b74b8ad43387a57b93b",
-        "python": "python/python.exe", "archive": "zip",
-    },
     "linux-x86_64": {
         "file": f"cpython-{PYTHON_VERSION}+{PBS_RELEASE}-x86_64-unknown-linux-gnu-install_only.tar.gz",
         "sha256": "5864001bf969db329fadc2b654c4878c6027d170c6bd77e28f88666260bcaf63",
         "python": "python/bin/python3", "archive": "tar.gz",
     },
-    "darwin-arm64": {
-        "file": f"cpython-{PYTHON_VERSION}+{PBS_RELEASE}-aarch64-apple-darwin-install_only.tar.gz",
-        "sha256": "83dcb04777c798bd95f3687acf9ae84b09860272ee6bdfb05be8bcf9447f75b8",
-        "python": "python/bin/python3", "archive": "tar.gz",
-    },
 }
 for _pin in PYTHON_PINS.values():
     _pin["url"] = PBS_BASE + _pin["file"].replace("+", "%2B")
-
-#: Kept for callers of the Mac-only script: the macOS pin.
-PYTHON_PIN = {**PYTHON_PINS["darwin-arm64"], "target": "darwin-arm64"}
 
 #: The application, as paths relative to ROOT (copied to the same place in the archive).
 PAYLOAD = (
@@ -123,9 +107,9 @@ INSTALLER_TOOLS = ("strata_mcp", "iq_pack", "strata_pack", "pack_index", "mtp_fe
                    "strata_tokenizer", "gguf_reader", "calibrate")
 #: tools run BY PATH (`python tools/.../x.py`) by setup.py, strata_cli or strata_control: no import names them, so setup_tool_imports() cannot find
 #: them.  DeepSeek's setup and launch run dsv41/pack_gguf.py (the model folder), dsv41/smoke.py (the engine's first answer) and dsv41/tune.py
-#: (the short tune); setup.py's other by-path tools (nvfp4_local_pack, strata_bench, strata_inspect) were missing from the bundle the same way.
+#: (the short tune); setup.py's other by-path tools (strata_bench, strata_inspect) were missing from the bundle the same way.
 #: tests/terminal/test_bundle_tools_paths.py reads the by-path references out of the source and fails when one is missing from the bundle.
-INSTALLER_SCRIPTS = ("dsv41/pack_gguf", "dsv41/smoke", "dsv41/tune", "nvfp4_local_pack", "strata_bench", "strata_inspect")
+INSTALLER_SCRIPTS = ("dsv41/pack_gguf", "dsv41/smoke", "dsv41/tune", "strata_bench", "strata_inspect")
 INSTALLER_DATA = "data"           # draft vocabularies, expert profiles: 2 MB
 
 #: packages the bundle must import after the install (the API server's and the CLI's).
@@ -134,12 +118,8 @@ PROBE = "import jinja2, yaml, regex, psutil, requests, numpy, PIL, tqdm; print('
 
 def host_target() -> str:
     machine = platform.machine().lower()
-    if sys.platform == "win32" and machine in ("amd64", "x86_64"):
-        return "windows-x86_64"
     if sys.platform.startswith("linux") and machine in ("x86_64", "amd64"):
         return "linux-x86_64"
-    if sys.platform == "darwin" and machine in ("arm64", "aarch64"):
-        return "darwin-arm64"
     raise SystemExit(f"no terminal target for {sys.platform}/{machine}")
 
 
@@ -217,13 +197,6 @@ def drop_build_path_launchers(root: Path, staging: Path, target: str) -> list[st
     """pip writes console-script launchers that name the build-time interpreter by absolute path: they break the
     moment the archive is extracted elsewhere. `python -m <module>` and the `strata` launchers replace them."""
     gone = []
-    if target.startswith("windows"):
-        scripts = root / "python" / "Scripts"
-        if scripts.is_dir():
-            for f in sorted(scripts.iterdir()):
-                gone.append(f.name)
-            shutil.rmtree(scripts)
-        return gone
     needle = str(staging).encode()
     bindir = root / "python" / "bin"
     for f in sorted(bindir.iterdir()):
@@ -296,14 +269,8 @@ def add_installer(folder: Path, source: Path = ROOT) -> dict:
 
 
 def write_archive(root: Path, name: str, out_dir: Path, kind: str) -> Path:
-    if kind == "zip":
-        path = out_dir / f"{name}.zip"
-        with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
-            for p in sorted(root.rglob("*")):
-                if p.is_dir():
-                    continue
-                zf.write(p, Path(name, p.relative_to(root)).as_posix())
-        return path
+    if kind != "tar.gz":
+        raise SystemExit(f"unknown archive kind {kind!r}")
     path = out_dir / f"{name}.tar.gz"
     with tarfile.open(path, "w:gz") as tf:
         tf.add(root, arcname=name)
@@ -333,7 +300,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--out", required=True, help="directory to write the archive into")
     ap.add_argument("--target", choices=sorted(PYTHON_PINS), default=None,
-                    help="windows-x86_64, linux-x86_64 or darwin-arm64 (default: this machine's)")
+                    help="linux-x86_64 (default: this machine's)")
     ap.add_argument("--version", default=None, help="version label (default: read from the source)")
     ap.add_argument("--skip-deps", action="store_true",
                     help="skip the locked install (layout checks only; the result is NOT distributable)")
@@ -408,11 +375,8 @@ def main() -> int:
 
         bin_dir = root / "bin"
         bin_dir.mkdir(exist_ok=True)
-        launchers = ["strata.cmd", "strata.ps1"] if target.startswith("windows") else ["strata"]
-        for launcher in launchers:
-            shutil.copy2(ROOT / "bin" / launcher, bin_dir / launcher)
-            if launcher == "strata":
-                (bin_dir / launcher).chmod(0o755)
+        shutil.copy2(ROOT / "bin" / "strata", bin_dir / "strata")
+        (bin_dir / "strata").chmod(0o755)
 
         installed: dict[str, str] = {}
         removed: list[str] = []
@@ -480,20 +444,8 @@ def _source_version() -> str:
 
 
 def _readme(version: str, target: str) -> str:
-    win = target.startswith("windows")
-    ext = "zip" if win else "tar.gz"
     stem = f"strata-terminal-{version}-{target}"
-    if win:
-        install = f"""    Expand-Archive {stem}.zip .
-    cd {stem}
-    .\\bin\\strata.cmd --help
-
-Put `bin\\` on your PATH to get the `strata` command everywhere (cmd.exe and PowerShell):
-
-    setx PATH "%PATH%;%CD%\\bin"
-"""
-    else:
-        install = f"""    tar xzf {stem}.tar.gz
+    install = f"""    tar xzf {stem}.tar.gz
     cd {stem}
     ./bin/strata --help
 
@@ -501,10 +453,7 @@ Put `bin/` on your PATH to get the `strata` command everywhere:
 
     echo "export PATH=\\"$PWD/bin:$PATH\\"" >> ~/.profile
 """
-    ram = ("    Task Manager > Performance > Memory > Available, or in PowerShell:\n"
-           "    [math]::Round((Get-CimInstance Win32_OperatingSystem).FreePhysicalMemory / 1MB, 1)   # GB free" if win else
-           "    free -g" if not target.startswith("darwin") else
-           "    Activity Monitor > Memory, or:  vm_stat   (free + inactive pages x 16 KB)")
+    ram = "    free -g"
     return f"""Strata Terminal {version} ({target})
 {'=' * (len(version) + len(target) + 18)}
 

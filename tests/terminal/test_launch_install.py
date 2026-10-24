@@ -1,4 +1,4 @@
-"""The one-line installers and the local test feed: syntax, the placeholder guard, the feed builder, and (POSIX) a real install.sh run against a feed."""
+"""The one-line installer and the local test feed: syntax, the placeholder guard, the feed builder, and (POSIX) a real install.sh run against a feed."""
 
 from __future__ import annotations
 
@@ -35,25 +35,11 @@ class Scripts(unittest.TestCase):
         self.assertIn("Installed. Run: ", text)
         self.assertNotIn("\r", text)
 
-    def test_install_ps1_parses_and_guard(self):
-        text = (ROOT / "packaging" / "install.ps1").read_text(encoding="utf-8")
-        self.assertNotIn("__FEED__", text)
-        self.assertIn("else { '" + mlf.RELEASE_FEED + "' }", text)
-        self.assertIn("Installed. Run: strata launch", text)
-        ps = shutil.which("powershell") or shutil.which("pwsh")
-        if not ps:
-            self.skipTest("no PowerShell")
-        cmd = ("$e=$null; $t=$null; [System.Management.Automation.Language.Parser]::ParseFile('%s',[ref]$t,[ref]$e) | Out-Null; "
-               "if ($e.Count) { $e | ForEach-Object { $_.Message }; exit 1 } else { 'ok' }" % str(ROOT / "packaging" / "install.ps1").replace("'", "''"))
-        r = subprocess.run([ps, "-NoProfile", "-Command", cmd], capture_output=True, text=True)
-        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
-
     def test_the_built_in_address_is_the_default_feed(self):
-        """install.sh / install.ps1 and `strata update` use the same GitHub Releases folder; STRATA_FEED stays an override."""
+        """install.sh and `strata update` use the same GitHub Releases folder; STRATA_FEED stays an override."""
         from strata_cli import update_cmd
         self.assertEqual(update_cmd.DEFAULT_FEED, mlf.RELEASE_FEED + "/strata-feed.json")
         self.assertIn(":-" + mlf.RELEASE_FEED + "}", (ROOT / "packaging" / "install.sh").read_text(encoding="utf-8"))
-        self.assertIn("$env:STRATA_FEED", (ROOT / "packaging" / "install.ps1").read_text(encoding="utf-8"))
 
 
 class Feed(unittest.TestCase):
@@ -81,7 +67,7 @@ class Feed(unittest.TestCase):
             feed = work / "feed"
             rc = make_local_feed.main(["--out", str(feed), "--terminal", str(archive), "--keys", str(work / "keys"), "--url", "http://127.0.0.1:1"])
             self.assertEqual(rc, 0)
-            for name in ("strata-feed.json", "strata-feed.json.sig", "install-manifest.txt", "install.sh", "install.ps1", "test-trust.json"):
+            for name in ("strata-feed.json", "strata-feed.json.sig", "install-manifest.txt", "install.sh", "test-trust.json"):
                 self.assertTrue((feed / name).is_file(), name)
             line = (feed / "install-manifest.txt").read_text().split()
             self.assertEqual(line[0], "linux-x86_64")
@@ -92,7 +78,6 @@ class Feed(unittest.TestCase):
             sh_text = (feed / "install.sh").read_text()
             self.assertIn("http://127.0.0.1:1", sh_text)
             self.assertNotIn(mlf.RELEASE_FEED, sh_text)                  # the GitHub address was replaced everywhere by the local one
-            self.assertIn("Installed. Run:", (feed / "install.ps1").read_text())
             doc = json.loads((feed / "strata-feed.json").read_text())
             self.assertEqual(doc["control"]["packages"][0]["sha256"], line[3])
             self.assertNotIn("seed", (feed / "test-trust.json").read_text())      # only the public key is published
@@ -158,7 +143,7 @@ class Feed(unittest.TestCase):
             line = (release / "install-manifest.txt").read_text().split()
             self.assertEqual(line, ["linux-x86_64", "9.9.9", entry["url"], entry["sha256"], str(entry["size"])])
             self.assertEqual(json.loads((release / "strata-feed.json").read_text())["control"]["packages"][0]["sha256"], entry["sha256"])
-            bad = work / "bad"                           # a Windows pack that is not a zip cannot be installed by install.ps1: left out of the manifest
+            bad = work / "bad"                           # feed_tool still leaves a Windows pack that is not a zip out of the manifest
             feed_tool.build_feed(bad, key=key, sequence=1, control_dir=self._windows_tar_pack(folder, work))
             self.assertFalse((bad / "install-manifest.txt").exists())
             shutil.copy2(ROOT / "packaging" / "install.sh", release / "install.sh")                   # uploaded unchanged

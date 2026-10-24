@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
-"""Build a LOCAL, TEST-SIGNED release folder (a feed) from a Terminal archive and engine packages, to try `install.sh`, `install.ps1`,
+"""Build a LOCAL, TEST-SIGNED release folder (a feed) from a Terminal archive and engine packages, to try `install.sh`,
 `strata update` and `strata launch` end to end without any hosting. Nothing is uploaded.
 
     python packaging/make_local_feed.py --out FEED --terminal strata-terminal-0.1.45-linux-x86_64.tar.gz \
-        --engine /path/to/components/engine/0.1.45-linux-x86_64-cuda [--engine ...] \
+        --engine /path/to/components/engine/0.1.45-linux-x86_64-sycl [--engine ...] \
         [--keys KEYDIR] [--url http://127.0.0.1:8099] [--sequence 1]
     python -m http.server 8099 --bind 127.0.0.1 --directory FEED         # serve it (foreground; stop it with Ctrl+C)
 
 What it writes into FEED (the folder a person would host):
     strata-feed.json + .sig        the signed feed (Ed25519, the key in KEYDIR, made once, never inside a git checkout)
     control/*, engine/*            the Terminal (as a "control" package) and each engine package, archived
-    install-manifest.txt           one line per platform for install.sh / install.ps1: platform version url sha256 size (written by feed_tool build-feed)
-    install.sh, install.ps1        the one-line installers with this feed's address filled in (--url)
+    install-manifest.txt           one line per platform for install.sh: platform version url sha256 size (written by feed_tool build-feed)
+    install.sh                     the one-line installer with this feed's address filled in (--url)
     test-trust.json                the PUBLIC test key: `STRATA_UPDATE_TRUSTED_KEYS=<this file>` lets this build trust the feed
                                    (the real key goes into strata_control/update_keys.json at release; this one never does)
 
@@ -30,7 +30,7 @@ import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-RELEASE_FEED = "https://github.com/Niko1221/Strata/releases/latest/download"      # the address built into install.sh / install.ps1; a local feed bakes its own in its place
+RELEASE_FEED = "https://github.com/Niko1221/Strata/releases/latest/download"      # the address built into install.sh; a local feed bakes its own in its place
 sys.path.insert(0, str(ROOT / "packaging"))
 sys.path.insert(0, str(ROOT))
 
@@ -58,7 +58,7 @@ def main(argv=None) -> int:
     ap.add_argument("--terminal", type=Path, action="append", default=[], help="a terminal archive (.tar.gz or .zip); repeat per platform")
     ap.add_argument("--engine", type=Path, action="append", default=[], help="an engine package folder (with engine-component.json)")
     ap.add_argument("--keys", type=Path, default=None, help="folder for the test key (default: <out>/../feed-test-keys)")
-    ap.add_argument("--url", default="http://127.0.0.1:8099", help="the address this feed will be served at (baked into install.sh/.ps1)")
+    ap.add_argument("--url", default="http://127.0.0.1:8099", help="the address this feed will be served at (baked into install.sh)")
     ap.add_argument("--sequence", type=int, default=1)
     ap.add_argument("--version", default=None, help="control version label (default: from the first terminal archive's VERSION)")
     ap.add_argument("--channel", default="stable")
@@ -81,10 +81,8 @@ def main(argv=None) -> int:
             folder = extract_terminal(term.resolve(), work)
             v = version or (folder / "VERSION").read_text(encoding="utf-8").strip()
             version = v
-            platform = ("windows-x86_64" if (folder / "python" / "python.exe").exists() else
-                        "macos-arm64" if ("darwin" in term.name or "macos" in term.name) else "linux-x86_64")      # the feed's own platform names
-            fmt = "zip" if platform.startswith("windows") else "tar.gz"
-            entry = ft.pack_control(folder, out / "control", version=v, platform=platform, fmt=fmt)
+            platform = "linux-x86_64"                    # the only Terminal platform (the feed's own platform name)
+            entry = ft.pack_control(folder, out / "control", version=v, platform=platform, fmt="tar.gz")
             print(f"control {platform} {v}: {entry['size'] // 1048576} MB")
         for n, pkg in enumerate(a.engine):
             copy = tmpdir / f"e{n}" / pkg.name
@@ -96,9 +94,8 @@ def main(argv=None) -> int:
     ft.build_feed(out, key=key, sequence=a.sequence, channel=a.channel, engine_dir=out / "engine" if a.engine else None,
                   control_dir=out / "control" if a.terminal else None)
     base = a.url.rstrip("/")
-    for name in ("install.sh", "install.ps1"):
-        text = (ROOT / "packaging" / name).read_text(encoding="utf-8").replace(RELEASE_FEED, base)
-        (out / name).write_text(text, encoding="utf-8", newline="\n" if name.endswith(".sh") else None)
+    text = (ROOT / "packaging" / "install.sh").read_text(encoding="utf-8").replace(RELEASE_FEED, base)
+    (out / "install.sh").write_text(text, encoding="utf-8", newline="\n")
     (out / "test-trust.json").write_text((keys / "feed-key.pub.json").read_text(encoding="utf-8"), encoding="utf-8")
     print(f"feed written to {out}\n  serve it:  python -m http.server {base.rsplit(':', 1)[-1]} --bind 127.0.0.1 --directory {out}\n"
           f"  trust it:  STRATA_UPDATE_TRUSTED_KEYS={out / 'test-trust.json'}")

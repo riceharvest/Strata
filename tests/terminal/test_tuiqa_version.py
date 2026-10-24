@@ -41,7 +41,7 @@ class Readme(unittest.TestCase):
         return package_terminal._readme("0.2.3", target)
 
     def test_it_does_not_say_nothing_downloads_and_then_that_launch_fetches(self):
-        text = " ".join(self.readme("windows-x86_64").split())
+        text = " ".join(self.readme("linux-x86_64").split())
         self.assertNotIn("Starting and serving never install or download anything", text)
         self.assertIn("Serving and watching", text)
         self.assertIn("Only two commands fetch files", text)
@@ -53,12 +53,9 @@ class Readme(unittest.TestCase):
         self.assertTrue((ROOT / "docs" / "TERMINAL_LAUNCH.md").is_file())
 
     def test_free_memory_guidance_fits_the_system(self):
-        win, lin, mac = (self.readme(t) for t in ("windows-x86_64", "linux-x86_64", "darwin-arm64"))
-        self.assertNotIn("free -g", win)
-        self.assertIn("FreePhysicalMemory", win)
-        self.assertIn("Task Manager", win)
+        lin = self.readme("linux-x86_64")
         self.assertIn("free -g", lin)
-        self.assertNotIn("free -g", mac)
+        self.assertIn("tar xzf strata-terminal-0.2.3-linux-x86_64.tar.gz", lin)
 
 
 if __name__ == "__main__":

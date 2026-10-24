@@ -19,7 +19,7 @@ def norm(name):
 
 class InterpreterPins(unittest.TestCase):
     def test_every_target_has_a_digest_and_a_matching_url(self):
-        self.assertEqual(sorted(pt.PYTHON_PINS), ["darwin-arm64", "linux-x86_64", "windows-x86_64"])
+        self.assertEqual(sorted(pt.PYTHON_PINS), ["linux-x86_64"])
         for target, pin in pt.PYTHON_PINS.items():
             with self.subTest(target):
                 self.assertRegex(pin["sha256"], r"^[0-9a-f]{64}$")
@@ -27,12 +27,6 @@ class InterpreterPins(unittest.TestCase):
                 self.assertIn(pt.PBS_RELEASE, pin["url"])
                 self.assertTrue(pin["url"].startswith("https://github.com/astral-sh/python-build-standalone/"))
                 self.assertTrue(pin["url"].endswith("install_only.tar.gz"))
-        self.assertEqual(len({p["sha256"] for p in pt.PYTHON_PINS.values()}), 3)
-
-    def test_the_mac_pin_is_the_one_setup_sh_downloads(self):
-        text = (ROOT / "setup.sh").read_text(encoding="utf-8")
-        self.assertIn(pt.PYTHON_PINS["darwin-arm64"]["sha256"], text)
-        self.assertIn(pt.PYTHON_PINS["darwin-arm64"]["url"].split("/")[-1], text)
 
     def test_fetch_refuses_a_download_that_does_not_match_its_pin(self):
         with tempfile.TemporaryDirectory() as d:
@@ -47,8 +41,7 @@ class InterpreterPins(unittest.TestCase):
 class WheelLocks(unittest.TestCase):
     def locks(self):
         found = sorted((ROOT / "packaging" / "locks").glob("runtime-*-cp312.txt"))
-        self.assertEqual([p.name for p in found], ["runtime-darwin-arm64-cp312.txt", "runtime-linux-x86_64-cp312.txt",
-                                                    "runtime-windows-x86_64-cp312.txt"])
+        self.assertEqual([p.name for p in found], ["runtime-linux-x86_64-cp312.txt"])
         return found
 
     def test_every_entry_is_pinned_and_hashed_and_nothing_else_is_in_the_file(self):
@@ -83,7 +76,7 @@ class WheelLocks(unittest.TestCase):
             with self.subTest(lock.name):
                 for pkg, versions in pins.items():
                     if pkg == "colorama":
-                        self.assertEqual(pkg in names, "windows" in lock.name)
+                        self.assertNotIn(pkg, names)          # a Windows-only package (sys_platform marker)
                         continue
                     if pkg == "numpy":                       # python_version markers: the 3.12 line applies
                         self.assertEqual(names[pkg], "2.5.3")
@@ -100,15 +93,10 @@ class WheelLocks(unittest.TestCase):
 
 
 class Launchers(unittest.TestCase):
-    def test_wrappers_prefer_the_bundled_runtime(self):
-        cmd = (ROOT / "bin" / "strata.cmd").read_text(encoding="utf-8")
-        ps1 = (ROOT / "bin" / "strata.ps1").read_text(encoding="utf-8")
+    def test_wrapper_prefers_the_bundled_runtime(self):
         sh = (ROOT / "bin" / "strata").read_text(encoding="utf-8")
-        self.assertLess(cmd.index("python\\python.exe"), cmd.index("py -3"))
-        self.assertLess(ps1.index("python\\python.exe"), ps1.index("'py', '-3'"))
         self.assertLess(sh.index("python/bin/python3"), sh.index("command -v python3"))
-        for text in (cmd, ps1, sh):
-            self.assertIn("PYTHONNOUSERSITE", text)
+        self.assertIn("PYTHONNOUSERSITE", sh)
 
     def test_setup_and_update_use_it(self):
         sh = (ROOT / "setup.sh").read_text(encoding="utf-8")
