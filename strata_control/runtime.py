@@ -481,6 +481,17 @@ def _engine_preflight(plan: dict) -> None:
         raise ProfileError(str(exc), exc.exit_code) from None
 
 
+def _server_command(source_bytes: bytes) -> list[str]:
+    """What the host runs after the interpreter: sycl/serve/server_intel.py for a run config of the SYCL engine (backend "sycl", as
+    sycl/setup_intel.py writes it and as its run-<model>.sh starts it), else the shared server module. Same arguments either way."""
+    from strata_control import sycl_build
+    try:
+        cfg = json.loads(source_bytes.decode("utf-8-sig"))
+    except (UnicodeDecodeError, ValueError):
+        cfg = None
+    return sycl_build.server_command(cfg)
+
+
 def _ready_pid_is_child(ready_pid, child_pid: int) -> bool:
     """Is the process named in the ready file the one this host started?
 
@@ -868,7 +879,7 @@ class Host:
                     from serve import winjob
                     winjob.contain(self.child)
                 else:
-                    self.child = subprocess.Popen([sys.executable, "-m", "serve.server", *server_args],
+                    self.child = subprocess.Popen([sys.executable, *_server_command(source_bytes), *server_args],
                                                   cwd=ROOT, stdin=subprocess.DEVNULL, stdout=stream,
                                                   stderr=subprocess.STDOUT, close_fds=True,
                                                   pass_fds=(reader,), start_new_session=True, env=child_env)
