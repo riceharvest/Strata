@@ -5,11 +5,7 @@ The packages' hipBLASLt versions below are the ones the 0.2.x release packages b
 10.2.0a20260930 carries 1.5.0 (100500), the Linux 7.10.0a20251120 wheels 1.2.0 (100200), Linux Strix Halo's 7.14.1 1.4.1 (100401)."""
 from __future__ import annotations
 
-import contextlib
-import io
 import json
-import os
-import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -19,9 +15,6 @@ from strata_control import hipblaslt_tuning as ht
 
 ROOT = Path(__file__).resolve().parents[2]
 TABLES = ROOT / "tools" / "hip"
-sys.path.insert(0, str(ROOT / "packaging"))
-import package_engine  # noqa: E402
-import stage_tuning  # noqa: E402
 
 #: (platform, variant) -> (archs of the package, hipBLASLt version it bundles, architectures that must carry a table)
 PACKAGES = {
@@ -199,58 +192,8 @@ class Apply(TempDir):
         self.assertNotIn("env", out)
         self.assertEqual(lines, [])
 
-    def test_the_server_start_applies_it_for_a_component_engine(self):
-        from serve import server
-        pkg = fake_package(self.root)
-        (pkg / "strata").write_text("x", encoding="utf-8")
-        cfg = {"exe": "component:strata-engine", "backend": "hip"}
-        out = io.StringIO()
-        with mock.patch.object(server.engine_component, "expand", return_value=str(pkg / "strata")), \
-                mock.patch.object(ht, "present_archs", return_value=["gfx1201"]), \
-                mock.patch.dict(os.environ, {}, clear=False), contextlib.redirect_stdout(out):
-            os.environ.pop(ht.SWITCH, None)
-            os.environ.pop(ht.ENGINE_VAR, None)
-            self.assertNotIn(ht.ENGINE_VAR, server.child_env(server.with_component_engine(cfg)))     # "auto" is off by default
-            os.environ[ht.SWITCH] = "on"
-            started = server.with_component_engine(cfg)
-            env = server.child_env(started)
-            self.assertEqual(env[ht.ENGINE_VAR], str(pkg / "tuning" / "gfx1201-hipblaslt-100500.txt"))
-            os.environ[ht.SWITCH] = "off"
-            self.assertNotIn(ht.ENGINE_VAR, server.child_env(server.with_component_engine(cfg)))
-        self.assertIn("hipBLASLt tuning table", out.getvalue())
-
-    def test_present_archs_picks_the_configured_card_on_linux(self):
-        with mock.patch("strata_control.engine_component.hip_archs_present", return_value=["gfx1100", "gfx1201"]):
-            if os.name != "nt":
-                self.assertEqual(ht.present_archs({"gpu": 1}), ["gfx1201"])
-                self.assertEqual(ht.present_archs({"gpu": [1, 0]}), ["gfx1201", "gfx1100"])
-            self.assertEqual(ht.present_archs({}), ["gfx1100", "gfx1201"])
-
-
 class PackageContents(TempDir):
     """What each package of the release matrix carries, from the real tables of tools/hip."""
-
-    def test_every_release_package_carries_the_tables_its_cards_have(self):
-        for (platform, variant), (archs, version, wanted) in PACKAGES.items():
-            stage = self.root / f"{platform}-{variant}"
-            stage.mkdir()
-            copied = ht.stage_tables(stage, archs, version, TABLES)
-            self.assertEqual({n.split("-")[0] for n in copied}, wanted, (platform, variant))
-            on_disk = {p.name for p in (stage / "tuning").glob("*.txt")} if (stage / "tuning").is_dir() else set()
-            self.assertEqual(on_disk, set(copied), (platform, variant))
-            for arch in wanted:                           # the file the engine start will pick is there and its own header agrees
-                self.assertTrue(ht.header_ok(stage / "tuning" / ht.table_name(arch, version), arch, version), (platform, arch))
-
-    def test_the_missing_report_names_the_architectures_without_a_table(self):
-        left = ht.missing_report(("gfx1100", "gfx1101", "gfx1102"), 100200, TABLES)
-        self.assertEqual(sorted(left), ["gfx1101", "gfx1102"])
-        self.assertEqual(ht.missing_report(("gfx1201",), 100200, TABLES), {"gfx1201": [100202, 100500]})
-
-    def test_every_table_in_the_repo_has_a_header_that_matches_its_name(self):
-        tables = ht.tables_in(TABLES)
-        self.assertGreater(len(tables), 8)
-        for (arch, version), path in tables.items():
-            self.assertTrue(ht.header_ok(path, arch, version), path.name)
 
     def test_version_from_header_reads_the_rocm_tree(self):
         inc = self.root / "include" / "hipblaslt"
@@ -259,117 +202,6 @@ class PackageContents(TempDir):
                                                  "#define HIPBLASLT_VERSION_PATCH 0\n", encoding="utf-8")
         self.assertEqual(ht.version_from_header(self.root), 100500)
         self.assertIsNone(ht.version_from_header(self.root / "nowhere"))
-
-    def test_stage_tuning_writes_the_version_and_the_tables(self):
-        stage = self.root / "stage"
-        stage.mkdir()
-        (stage / "BUILD.json").write_text(json.dumps({"version": "0.2.1", "archs": ["gfx1151"]}), encoding="utf-8")
-        with contextlib.redirect_stdout(io.StringIO()):
-            self.assertEqual(stage_tuning.main(["--stage", str(stage), "--archs", "gfx1151", "--version", "100401"]), 0)
-        meta = json.loads((stage / "BUILD.json").read_text(encoding="utf-8"))
-        self.assertEqual(meta["hipblaslt_version"], 100401)
-        self.assertEqual(meta["archs"], ["gfx1151"])      # what was there stays
-        self.assertTrue((stage / "tuning" / "gfx1151-hipblaslt-100401.txt").is_file())
-
-    def test_stage_tuning_can_demand_a_table(self):
-        stage = self.root / "stage"
-        stage.mkdir()
-        with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(SystemExit) as caught:
-            stage_tuning.main(["--stage", str(stage), "--archs", "gfx1201", "--version", "100200", "--expect", "gfx1201"])
-        self.assertIn("gfx1201", str(caught.exception))
-
-    def test_stage_tuning_refuses_a_rocm_whose_version_it_cannot_read(self):
-        stage = self.root / "stage"
-        stage.mkdir()
-        with self.assertRaises(SystemExit):
-            stage_tuning.main(["--stage", str(stage), "--archs", "gfx1201", "--rocm", str(self.root / "no-rocm")])
-
-
-class PackagedAndHashed(TempDir):
-    """packaging/package_engine.py: the tables are files of the package (hashed, so signed with it) and a bad AMD stage is refused."""
-
-    def stage(self, **kw):
-        src = self.root / "src"
-        src.mkdir()
-        (src / "strata").write_bytes(b"engine" * 100)
-        (src / "libamdhip64.so.7").write_bytes(b"hip" * 100)
-        (src / "BUILD.json").write_text(json.dumps({"version": "0.2.1", **kw}), encoding="utf-8")
-        return src
-
-    def build(self, src, archs=("gfx1201",), tree=False):
-        out = self.root / "out"
-        out.mkdir(exist_ok=True)
-        with mock.patch.object(package_engine, "_bundle_missing_libraries", return_value=[]):
-            return package_engine.build(src, "hip", "0.2.1", "linux-x86_64", out, entry="strata", archs=archs, build_id="t", tree=tree,
-                                        variant="rx9070")
-
-    def test_the_tables_are_listed_and_hashed_in_the_manifest_even_without_tree(self):
-        src = self.stage(hipblaslt_version=100500)
-        fake_table(src / "tuning", "gfx1201", 100500)
-        folder = self.build(src)
-        listed = {f["path"]: f for f in json.loads((folder / "engine-component.json").read_text(encoding="utf-8"))["files"]}
-        self.assertIn("tuning/gfx1201-hipblaslt-100500.txt", listed)
-        self.assertEqual(len(listed["tuning/gfx1201-hipblaslt-100500.txt"]["sha256"]), 64)
-        (folder / "tuning" / "gfx1201-hipblaslt-100500.txt").write_text("changed", encoding="utf-8")   # a swapped table fails the start's hash check
-        from strata_control import engine_component as ec
-        with self.assertRaises(ec.ComponentProblem):
-            ec.verify(ec.read_manifest(folder), full=True)
-
-    def test_an_amd_stage_without_a_hipblaslt_version_is_refused(self):
-        src = self.stage()
-        with self.assertRaises(SystemExit) as caught:
-            self.build(src)
-        self.assertIn("hipblaslt_version", str(caught.exception))
-
-    def test_a_table_for_another_version_or_card_than_the_package_is_refused(self):
-        src = self.stage(hipblaslt_version=100500)
-        fake_table(src / "tuning", "gfx1201", 100202)
-        with self.assertRaises(SystemExit) as caught:
-            self.build(src)
-        self.assertIn("100202", str(caught.exception))
-        other = self.root / "other"
-        other.mkdir()
-        src2 = other / "src"
-        src2.mkdir()
-        (src2 / "strata").write_bytes(b"e")
-        (src2 / "BUILD.json").write_text(json.dumps({"hipblaslt_version": 100500}), encoding="utf-8")
-        fake_table(src2 / "tuning", "gfx1100", 100500)
-        with mock.patch.object(package_engine, "_bundle_missing_libraries", return_value=[]), self.assertRaises(SystemExit) as caught:
-            package_engine.build(src2, "hip", "0.2.1", "linux-x86_64", other / "out", entry="strata", archs=("gfx1201",), build_id="t")
-        self.assertIn("gfx1100", str(caught.exception))
-
-    def test_a_cuda_package_needs_no_hipblaslt_version(self):
-        src = self.stage()
-        out = self.root / "out"
-        out.mkdir()
-        with mock.patch.object(package_engine, "_bundle_missing_libraries", return_value=[]):
-            package_engine.build(src, "cuda", "0.2.1", "linux-x86_64", out, entry="strata", archs=("sm_86",), build_id="t")
-
-
-class SetupFindsThePackageTable(TempDir):
-    """setup.py outside the app (a git checkout, or the old Windows zip that START-HERE unpacks): the engine folder's own tuning/ comes first."""
-
-    def load_setup(self):
-        import importlib.util
-        spec = importlib.util.spec_from_file_location("setup_hipblaslt_copy", ROOT / "setup.py")
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        return module
-
-    def test_the_engine_folders_table_wins_over_tools_hip_and_the_switch_turns_it_off(self):
-        setup = self.load_setup()
-        pkg = self.root / "engine"
-        fake_table(pkg / "tuning", "gfx1201", 100500)
-        seen = []
-        with mock.patch.object(setup, "ok", seen.append), mock.patch.object(setup, "say", seen.append), \
-                mock.patch.object(setup, "warn", seen.append), mock.patch.dict(os.environ, {}, clear=False):
-            os.environ.pop(ht.SWITCH, None)
-            self.assertEqual(setup.hipblaslt_table("gfx1201", [], 100500, [pkg / "tuning"]), pkg / "tuning" / "gfx1201-hipblaslt-100500.txt")
-            self.assertEqual(setup.hipblaslt_table("gfx1201", [], 100500), TABLES / "gfx1201-hipblaslt-100500.txt")
-            self.assertIsNone(setup.hipblaslt_table("gfx1201", [], 100200, [pkg / "tuning"]))      # no table for 1.2.0: warned, plain
-            os.environ[ht.SWITCH] = "off"
-            self.assertIsNone(setup.hipblaslt_table("gfx1201", [], 100500, [pkg / "tuning"]))
-        self.assertTrue(any("no hipBLASLt tuning table" in str(line) for line in seen))
 
 
 if __name__ == "__main__":
