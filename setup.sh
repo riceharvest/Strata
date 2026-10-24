@@ -1,6 +1,7 @@
 #!/bin/sh
-# Strata for Linux: the first run installs everything and starts the model; later runs just start it.
-# Needs only an NVIDIA driver (or, for an AMD Radeon card, the kernel's amdgpu driver: see docs/AMD_HIP.md).
+# Strata for the Intel Arc Pro B70 on Linux: the first run installs everything and starts the model; later runs just
+# start it. setup.py hands every run to sycl/setup_intel.py (--backend sycl is the default and may be given); the SYCL
+# engine itself is built from sycl/ (docs/B70.md).
 # Python (with venv) is installed through apt/dnf if it is missing (asks for sudo).
 # NixOS (or STRATA_UV=1) with uv installed: uv makes the project venv; every other Linux uses the standard venv.
 cd "$(dirname "$0")" || exit 1
