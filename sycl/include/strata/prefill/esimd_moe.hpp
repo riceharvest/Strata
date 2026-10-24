@@ -17,6 +17,10 @@
 namespace strata::prefill::i8 {
 
 constexpr int kMaxGroup = 16;
+/// The kernels' revision: the prompt path's measured int8 / FP16 crossover is cached per device, driver and format, and a cached
+/// value measured on slower kernels would keep sending groups to the FP16 chain, so the cache key carries this.  Bump it when a
+/// kernel's speed changes.  2: IQ2_S / IQ2_XS without spills, computed signs, 2-dword gathers (2026-10-24).
+constexpr int kKernelRev = 2;
 
 /// Per group: the experts' row counts and where their (8-row padded) tiles start.
 struct Layout {

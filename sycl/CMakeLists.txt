@@ -415,6 +415,13 @@ if(STRATA_SYCL_PARITY)
   add_executable(esimd_moe_parity ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/esimd_moe_parity.cpp)   # 151-b70: fused int8 expert products vs dequant+oneMKL and FP64
   target_link_libraries(esimd_moe_parity PRIVATE strata_kernels strata_prefill)
   add_test(NAME esimd_moe_parity COMMAND esimd_moe_parity 60 8 2)   # 151-b70: skips (exit 0) on a device without the s8 8x16x32 DPAS
+  # the other tile heights (mean 8 rows -> MT 2, 24 -> MT 4) and the non-work-group kernels in both register modes
+  add_test(NAME esimd_moe_parity_mt2 COMMAND esimd_moe_parity 8 16 2)
+  add_test(NAME esimd_moe_parity_mt4 COMMAND esimd_moe_parity 24 16 2)
+  add_test(NAME esimd_moe_parity_nowg COMMAND esimd_moe_parity 60 8 2)
+  set_tests_properties(esimd_moe_parity_nowg PROPERTIES ENVIRONMENT "STRATA_I8_WG=0")
+  add_test(NAME esimd_moe_parity_grf128 COMMAND esimd_moe_parity 60 8 2)
+  set_tests_properties(esimd_moe_parity_grf128 PROPERTIES ENVIRONMENT "STRATA_I8_WG=0;STRATA_I8_GRF=128")
   add_executable(esimd_moe_mode_test ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/esimd_moe_mode_test.cpp)   # 151-b70: the default choice of the expert chain (no GPU)
   target_include_directories(esimd_moe_mode_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
   add_test(NAME esimd_moe_mode_test COMMAND esimd_moe_mode_test)

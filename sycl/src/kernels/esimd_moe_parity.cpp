@@ -5,7 +5,8 @@
 //       activation quantization: only the float accumulation order differs),
 // for every gate/up x down type pair the kernels handle, and times both paths per expert.
 //   esimd_moe_parity [mean_rows=80] [experts=16] [reps=10] [seed=1] [gate_up_type down_type]
-//   types: gate/up 21 IQ3_S, 18 IQ3_XXS, 22 IQ2_S; down 20 IQ4_NL, 42 Q2_0.
+//   types: gate/up 21 IQ3_S, 18 IQ3_XXS, 22 IQ2_S, 17 IQ2_XS, 16 IQ2_XXS, 23 IQ4_XS; down 20 IQ4_NL, 42 Q2_0, 8 Q8_0.
+//   STRATA_PARITY_REF=<dir> [STRATA_PARITY_REF_WRITE=1]: compare (write) the outputs bit for bit against a reference build's.
 // Exit status 1 when (c) is off by more than 2e-5 of the largest value or (b) exceeds the int8 activation error budget.
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/iq_dequant_expert.hpp"
@@ -275,6 +276,34 @@ static Result run_case(sycl::queue* q, dpct::blas::descriptor_ptr hd, int gt, in
         ok = ok && ok2;
         std::printf("  down type %2d   : exact-int8 ref max err %.2e of %.2e (%.1e)  vs FP64 true rms rel err %.2e, swiglu scale mismatches %.0f (%d samples)  %s\n",
                     dt, ec, mc, ec / mc, std::sqrt(eb / rb), hq_bad, smp, ok2 ? "OK" : "FAIL");
+        // STRATA_PARITY_REF=<dir>: the chain's gate/up and down outputs, bit for bit, against the ones a reference build wrote there
+        // with STRATA_PARITY_REF_WRITE=1 (a missing file is a failure otherwise).  A kernel change that keeps the arithmetic must
+        // leave every bit as it was.
+        if (const char* dir = std::getenv("STRATA_PARITY_REF"); dir != nullptr && dir[0] != 0) {
+            char path[512];
+            std::snprintf(path, sizeof path, "%s/gu%d_dn%d_mean%d_n%d_seed%d.bin", dir, gt, dt, mean, n, seed);
+            std::vector<float> cur(hGU);
+            cur.insert(cur.end(), hDm.begin(), hDm.end());
+            const char* wr = std::getenv("STRATA_PARITY_REF_WRITE");
+            if (wr != nullptr && wr[0] == '1') {
+                if (FILE* w = std::fopen(path, "wb")) {
+                    std::fwrite(cur.data(), 4, cur.size(), w);
+                    std::fclose(w);
+                    std::printf("  bitwise reference written: %s\n", path);
+                }
+            } else if (FILE* f = std::fopen(path, "rb")) {
+                std::vector<float> refv(cur.size());
+                const size_t got = std::fread(refv.data(), 4, refv.size(), f);
+                std::fclose(f);
+                size_t diff = got == refv.size() ? 0 : cur.size();
+                for (size_t i = 0; i < got && i < cur.size(); ++i) diff += std::memcmp(&refv[i], &cur[i], 4) != 0;
+                std::printf("  bitwise vs %s: %s (%zu of %zu values differ)\n", path, diff ? "DIFFERENT" : "identical", diff, cur.size());
+                if (diff) ok = false;
+            } else {
+                std::printf("  bitwise reference %s missing: FAIL\n", path);
+                ok = false;
+            }
+        }
     }
     ref(); q->wait();
     {
