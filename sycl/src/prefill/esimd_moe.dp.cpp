@@ -562,6 +562,18 @@ template <int F, int MT, int G> struct TagDnW;
 
 template <int F, int MT, int G>
 void launch_gu_wg(sycl::queue& q, const GArgs a, int nrowblocks) {
+// IQ2_S / IQ2_XS gate/up: the next chunk is prefetched into L1 at the top of a chunk and loaded + stored to local memory at its
+// end, so the staging registers are live only there, not across the decode and the DPAS.  At MT 8 they were 36 of the registers
+// the IQ2_S kernel spilled (1344 B; none left): 28.5 -> 16.9 us per expert on the B70.  The other formats did not spill and keep
+// the load at the top (prefetching cost them 2-4%).
+constexpr auto kPfL1 = sycl::ext::oneapi::experimental::properties{cache_hint_L1<cache_hint::cached>, cache_hint_L2<cache_hint::cached>};
+#define PREFETCH_CHUNK(CC)                                                                                                     \
+    if (s_tile < nvalid) {                                                                                                     \
+        const int* src_ = Xi + ((size_t) (tbase + s_tile) * a.nkb + (CC) * 4) * 64 + s_part * (L::PART / 4);                  \
+        prefetch<int, L::PART / 64>(src_, simd<uint32_t, L::PART / 64>(0, 64), kPfL1);                                        \
+        if (s_part == 0) prefetch<float, 2>(a.dx + ((size_t) (tbase + s_tile) * a.nkb + (CC) * 4) * 8, simd<uint32_t, 2>(0, 64), kPfL1); \
+    }
+
     using L = WgLayout<F, MT>;
     auto props = sycl::ext::oneapi::experimental::properties{sycl::ext::intel::experimental::grf_size<G>};
     constexpr int NS = (F == T_IQ2S || F == T_IQ2XS) ? 2 : 1;
@@ -610,7 +622,9 @@ void launch_gu_wg(sycl::queue& q, const GArgs a, int nrowblocks) {
             for (int c = 0; c < nchunks; ++c) {
                 const int sb = c >> 1;
                 const int stage_off = L::TB + (c & 1) * L::STAGE;
-                if (c + 1 < nchunks) { LOAD_CHUNK(c + 1); }
+                if (c + 1 < nchunks) {
+                    if constexpr (NS == 2) { PREFETCH_CHUNK(c + 1); } else { LOAD_CHUNK(c + 1); }
+                }
                 if ((c & 1) == 0) {   // new superblock: its scale and the fields shared by its 8 steps
                     const uint32_t P = (uint32_t) sb * blk_bytes<F>();
                     d = half_of(ld16(We, ro + P));
@@ -776,7 +790,10 @@ void launch_gu_wg(sycl::queue& q, const GArgs a, int nrowblocks) {
                         }
                     }
                 }
-                if (c + 1 < nchunks) { STORE_CHUNK((c + 1) & 1); }
+                if (c + 1 < nchunks) {
+                    if constexpr (NS == 2) { LOAD_CHUNK(c + 1); }
+                    STORE_CHUNK((c + 1) & 1);
+                }
                 barrier();
             }
 #pragma unroll
