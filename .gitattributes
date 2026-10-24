@@ -19,7 +19,6 @@ LICENSE text eol=lf
 
 # container scripts run in Linux: always LF
 docker/*.sh text eol=lf
-Dockerfile text eol=lf
 docker/Dockerfile text eol=lf
 docker/compose/* text eol=lf
 
