@@ -1,4 +1,4 @@
-"""Setup's MTP download, the Gyro low-RAM pack and the FP4-Local conversion packages (#3193 #3214 #3257 #3227): the draft layer's download is run again when it stops, every tool
+"""Setup's MTP download, and the Gyro low-RAM pack (#3193 #3214 #3257): the draft layer's download is run again when it stops, every tool
 setup runs ends with setup, and Gyro's low-RAM pack gets --compat-bf16 like its first pack.  Everything mocked; nothing downloaded.
 
     python -m unittest tools.test_setup_dl_fix
@@ -74,57 +74,6 @@ class GyroLowRam(U.Base):
         self.assertTrue(packs, (code, out[-1500:]))
         self.assertTrue(all("--compat-bf16" in r for r in packs), packs)
         self.assertTrue(any("--experts-bin" in r for r in packs), "the low-RAM pack ran")
-
-
-class Fp4LocalPackages(unittest.TestCase):
-    """#3227: torch, transformers and safetensors come from a pinned requirements file, right before a prepare that runs."""
-
-    def test_the_requirements_file_pins_what_the_converter_imports(self):
-        pkgs = setup.nvfp4_local_packages()
-        self.assertEqual(sorted({p.split("==")[0] for p in pkgs}), sorted(setup.NVFP4_LOCAL_MODULES))
-        self.assertTrue(all("==" in p for p in pkgs), pkgs)
-
-    def test_missing_packages_are_installed_once_with_the_pins(self):
-        calls = []
-        with mock.patch("importlib.util.find_spec", lambda name: None), mock.patch.object(setup, "CONTROL", False), \
-                mock.patch.object(setup, "say", lambda *a, **k: None), \
-                mock.patch.object(setup, "pip_install", lambda pkgs, what, extra=(): calls.append((list(pkgs), list(extra)))):
-            setup.ensure_nvfp4_local_packages()
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(calls[0][0], setup.nvfp4_local_packages())
-        self.assertEqual(bool(calls[0][1]), not setup.WIN)               # the CPU wheel index only on Linux
-
-    def test_nothing_is_installed_when_they_are_there(self):
-        with mock.patch("importlib.util.find_spec", lambda name: object()), \
-                mock.patch.object(setup, "pip_install", side_effect=AssertionError("pip ran")):
-            setup.ensure_nvfp4_local_packages()
-
-    def test_the_app_says_so_instead_of_installing(self):
-        with mock.patch("importlib.util.find_spec", lambda name: None), mock.patch.object(setup, "CONTROL", True), \
-                mock.patch.object(setup, "say", lambda *a, **k: None), \
-                mock.patch.object(setup, "pip_install", side_effect=AssertionError("pip ran")), \
-                self.assertRaises(SystemExit):
-            setup.ensure_nvfp4_local_packages()
-
-    def test_the_tool_names_the_missing_package_when_run_by_hand(self):
-        import nvfp4_local_pack as P
-        with mock.patch("importlib.util.find_spec", lambda name: None if name == "transformers" else object()):
-            with self.assertRaises(SystemExit) as cm:
-                P.require_packages()
-        self.assertIn("transformers", str(cm.exception))
-        self.assertIn("requirements-nvfp4-local.txt", str(cm.exception))
-        self.assertNotIn("torch,", str(cm.exception))
-
-
-class Fp4LocalOrder(unittest.TestCase):
-    def test_the_packages_come_before_the_prepare_run(self):
-        import test_setup_golden as G
-        import test_setup_nvfp4 as N
-        events = []
-        with mock.patch.object(setup, "ensure_nvfp4_local_packages", lambda: events.append("packages")):
-            ram, found = G.PROFILES["128GB-1x24GB"]
-            _ = G.install(ram, found, ["--family", "nvfp4", "--no-start", "--model", "NVFP4-QAD"])
-        self.assertEqual(events, ["packages"])
 
 
 if __name__ == "__main__":
