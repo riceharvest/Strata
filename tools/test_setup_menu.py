@@ -1,5 +1,4 @@
-"""Tests for setup.py's model menu (0.1.44): the family order, the Unsloth sizes in order with images on, and the prebuilt
-install removing a stale strata_kq library.
+"""Tests for setup.py's model menu (0.1.44): the family order, the Unsloth sizes in order with images on.
 
     python -m unittest tools.test_setup_menu
 """
@@ -7,7 +6,6 @@ from __future__ import annotations
 
 import re
 import sys
-import tempfile
 import unittest
 from pathlib import Path
 
@@ -137,56 +135,6 @@ class EnginePlaceholders(unittest.TestCase):
         tree = tuple(int(n) for n in re.search(r"project\(strata VERSION ([0-9.]+)", text).group(1).split("."))
         for what, minimum in [("MIN_ENGINE", setup.MIN_ENGINE)] + [(m, setup.MODELS[m]["engine"]) for m in setup.MODELS if "engine" in setup.MODELS[m]]:
             self.assertLessEqual(tuple(minimum), tree[:len(minimum)], f"{what} {minimum} is ahead of the tree {tree}")
-
-
-class KqLibrary(unittest.TestCase):
-    def test_a_zip_without_strata_kq_does_not_leave_an_old_one(self):
-        with tempfile.TemporaryDirectory() as d:
-            eng, tmp = Path(d) / "engine", Path(d) / "new"
-            eng.mkdir()
-            tmp.mkdir()
-            (eng / setup.EXE).write_bytes(b"old")
-            (eng / setup.KQ_LIB).write_bytes(b"old kq")
-            (tmp / setup.EXE).write_bytes(b"new")
-            setup.install_unpacked(tmp, eng)
-            self.assertEqual((eng / setup.EXE).read_bytes(), b"new")
-            self.assertFalse((eng / setup.KQ_LIB).exists())
-            self.assertEqual((eng / setup.PREVIOUS_ENGINE / setup.KQ_LIB).read_bytes(), b"old kq")   # a rollback gets it back
-
-    def test_a_zip_with_strata_kq_replaces_it(self):
-        with tempfile.TemporaryDirectory() as d:
-            eng, tmp = Path(d) / "engine", Path(d) / "new"
-            eng.mkdir()
-            tmp.mkdir()
-            (eng / setup.KQ_LIB).write_bytes(b"old kq")
-            (tmp / setup.EXE).write_bytes(b"new")
-            (tmp / setup.KQ_LIB).write_bytes(b"new kq")
-            setup.install_unpacked(tmp, eng)
-            self.assertEqual((eng / setup.KQ_LIB).read_bytes(), b"new kq")
-
-
-class ImageEncoderDefault(unittest.TestCase):
-    """#2406: "images: yes" gets the CPU encoder on an NVIDIA card under 24 GB (the GPU encoder cost 3-5% of text speed on
-    16 GB cards, 35-60% on an RTX 4080 SUPER under Windows); --vision gpu is kept with a note."""
-
-    def test_yes_follows_the_card(self):
-        f = setup.flash_vision_encoder
-        self.assertEqual(f("yes", {"vram_gb": 12.0}), "cpu")
-        self.assertEqual(f("yes", {"vram_gb": 15.9}), "cpu")
-        self.assertEqual(f("yes", {"vram_gb": 24.0}), "gpu")
-        self.assertEqual(f("yes", {"vram_gb": 32.0}), "gpu")
-        self.assertEqual(f("yes", {}), "gpu")                    # unknown VRAM: the old default
-        self.assertEqual(f("cpu", {"vram_gb": 32.0}), "cpu")
-        self.assertEqual(f("none", {"vram_gb": 16.0}), "none")
-
-    def test_gpu_asked_is_kept_with_a_note(self):
-        import contextlib, io
-        out = io.StringIO()
-        with contextlib.redirect_stdout(out):
-            self.assertEqual(setup.flash_vision_encoder("gpu", {"vram_gb": 16.0}), "gpu")
-            self.assertEqual(setup.flash_vision_encoder("gpu", {"vram_gb": 32.0}), "gpu")
-        self.assertEqual(out.getvalue().count("kept as you chose"), 1)
-        self.assertIn("#2406", out.getvalue())
 
 
 if __name__ == "__main__":

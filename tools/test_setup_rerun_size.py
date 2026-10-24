@@ -19,7 +19,7 @@ sys.path.insert(0, str(ROOT / "tools"))
 import setup  # noqa: E402
 import test_setup_golden as g  # noqa: E402
 
-PC64 = (63.7, [g.card(0, "NVIDIA GeForce RTX 5070", 11.9, "120")])
+PC64 = (63.7, [g.card(0, "Intel Arc card", 11.9)])
 
 
 def earlier(model: str, family_tag: str = "") -> tuple:

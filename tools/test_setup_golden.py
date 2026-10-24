@@ -1,10 +1,11 @@
-"""The owner's rule for setup (#403 #406 #364 #384): setup RECOMMENDS, it never forces - and the recommended answers
-stay exactly what they were.  setup.main() with --yes (and with Enter for every question) on a few PCs writes the same
-run config, byte for byte, as 0.1.32 plus the fixes on top of it did (tools/test_setup_golden.json, written by that
-setup).  Every outside effect is mocked: no GPU, no downloads, nothing written outside a temp folder.
+"""setup.main() on a mocked PC, the way sycl/setup_intel.py runs it (--backend hip, the Intel Arc cards in setup's card
+list): install() is the harness the other tools/test_setup_*.py files use.  Every outside effect is mocked: no GPU, no
+downloads, nothing written outside a temp folder.
+
+The byte-for-byte comparison against the 0.1.32 CUDA configs (test_setup_golden.json) is gone with the CUDA path; the
+owner's rule (setup recommends, it never forces) is tested in test_setup_risk.py and test_setup_choices.py.
 
     python -m unittest tools.test_setup_golden
-    python tools/test_setup_golden.py --write      (only to record a new baseline on purpose)
 """
 from __future__ import annotations
 
@@ -23,20 +24,19 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 import setup  # noqa: E402
 
-GOLDEN = Path(__file__).with_name("test_setup_golden.json")
+def card(i, name, vram, arch="xe"):
+    """A card as sycl/setup_intel.py's intel_gpus() lists it (`arch` is the driver there: xe or i915)."""
+    return {"index": i, "name": name, "vram_gb": vram, "arch": arch, "driver": arch, "vendor": "intel", "usable": True,
+            "problem": None}
 
 
-def card(i, name, vram, arch):
-    return {"index": i, "name": name, "vram_gb": vram, "arch": arch, "driver": "580.97"}
-
-
-# the PCs: total RAM as ram_gb() reads it (a little under the label), the cards as nvidia-smi lists them
+# the PCs: total RAM as ram_gb() reads it (a little under the label), the cards as setup_intel lists them
 PROFILES = {
-    "64GB-1x32GB": (63.7, [card(0, "NVIDIA GeForce RTX 5090", 31.8, "120")]),                  # #406
-    "32GB-2x24GB": (31.9, [card(i, "NVIDIA GeForce RTX 3090", 24.0, "86") for i in range(2)]),  # #364
-    "47GB-2x16GB": (47.0, [card(i, "NVIDIA GeForce RTX 5060 Ti", 15.9, "120") for i in range(2)]),   # #384
-    "96GB-1x16GB": (95.8, [card(0, "NVIDIA GeForce RTX 5080", 15.9, "120")]),
-    "128GB-1x24GB": (127.8, [card(0, "NVIDIA GeForce RTX 4090", 24.0, "89")]),
+    "64GB-1x32GB": (63.7, [card(0, "Intel Arc Pro B70", 31.8)]),                              # #406
+    "32GB-2x24GB": (31.9, [card(i, "Intel Arc Pro B60", 24.0) for i in range(2)]),            # #364
+    "47GB-2x16GB": (47.0, [card(i, "Intel Arc A770", 15.9) for i in range(2)]),               # #384
+    "96GB-1x16GB": (95.8, [card(0, "Intel Arc Pro B50", 15.9)]),
+    "128GB-1x24GB": (127.8, [card(0, "Intel Arc Pro B60", 24.0)]),
 }
 # (family, model): None = the recommended size
 MODELS = [("qwen", None), ("qwen", "Q2_0"), ("qwen", "IQ3_XXS"), ("qwen", "IQ3_S"), ("unsloth", "UD-Q4_K_XL")]
@@ -71,7 +71,8 @@ def install(ram, found, argv, answers=None, extra=(), avx512=False, configs=()):
         (t / "data" / "mtp" / "rt" / "experts.bin").write_bytes(b"")
         eng = t / "engine"
         eng.mkdir()
-        (eng / "BUILD.json").write_text(json.dumps({"version": "0.1.32", "source": "local", "cuda_dirs": ["<cuda>"]}))
+        (eng / "BUILD.json").write_text(json.dumps({"version": "0.1.32", "source": "local", "lib_dirs": []}))
+        (eng / setup.VEXE).write_bytes(b"")              # the CPU picture reader setup_intel's build step puts there
         for name, c in configs:
             (t / name).write_text(json.dumps(c))
         asked = []
@@ -93,13 +94,11 @@ def install(ram, found, argv, answers=None, extra=(), avx512=False, configs=()):
 
         patches = [
             mock.patch.object(setup, "ROOT", t),
-            mock.patch.object(setup, "GPU_PICK", None),
             mock.patch.object(setup, "data_folder", lambda d, *a, **k: (t / "data", [])),
             mock.patch.object(setup, "load_settings", lambda: {}),
             mock.patch.object(setup, "save_settings", lambda s: None),
-            mock.patch.object(setup, "gpus", lambda: found),
-            mock.patch.object(setup, "card_speeds", lambda: {}),
-            mock.patch.object(setup, "amd_gpus", lambda: []),
+            mock.patch.object(setup, "gpus", lambda: []),
+            mock.patch.object(setup, "amd_gpus", lambda: found),
             mock.patch.object(setup, "ram_gb", lambda: ram),
             mock.patch.object(setup, "cpu_info", lambda: ("Test CPU", True, avx512)),
             mock.patch.object(setup, "cpu_cores", lambda: None),   # #642: not a hybrid CPU
@@ -110,8 +109,7 @@ def install(ram, found, argv, answers=None, extra=(), avx512=False, configs=()):
             mock.patch.object(setup, "free_gb", lambda p: 900.0),
             mock.patch.object(setup, "pip_install", lambda *a, **k: None),
             mock.patch.object(setup, "get_llama_cpp", lambda: t / "llama.cpp"),
-            mock.patch.object(setup, "get_prebuilt", lambda *a, **k: eng),
-            mock.patch.object(setup, "update_installed_engine", lambda *a, **k: None),
+            mock.patch.object(setup, "build_engine_hip", lambda *a, **k: eng),
             mock.patch.object(setup, "download", fake_download),
             mock.patch.object(setup, "check_shards", lambda shards: None),
             mock.patch.object(setup, "verify_sha256", lambda *a, **k: None),
@@ -122,7 +120,7 @@ def install(ram, found, argv, answers=None, extra=(), avx512=False, configs=()):
             mock.patch.object(setup, "saved_calibration", lambda cfg: None),
             mock.patch.object(setup, "calibrate_config", mock.Mock(side_effect=AssertionError("calibrated"))),
             mock.patch.dict(sys.modules, {"gguf_reader": types.SimpleNamespace(GGUFFile=FakeGGUF)}),
-            mock.patch.object(sys, "argv", ["setup.py", "--models-dir", str(t / "models"), *argv]
+            mock.patch.object(sys, "argv", ["setup.py", "--backend", "hip", "--models-dir", str(t / "models"), *argv]
                               + (["--yes"] if answers is None else [])),
             mock.patch("builtins.input", fake_input),
             *extra,
@@ -150,68 +148,19 @@ def argv_for(family, model):
     return ["--family", family, "--no-start"] + (["--model", model] if model else [])
 
 
-def record() -> dict:
-    """Every profile x model with --yes: the exit code and the config (the baseline this test compares against)."""
-    res = {}
-    for prof, (ram, found) in PROFILES.items():
-        for family, model in MODELS:
-            code, out, cfg, _ = install(ram, found, argv_for(family, model))
-            res[f"{prof} {family} {model or 'recommended'}"] = {"code": code, "config": cfg}
-    return res
-
-
-class Golden(unittest.TestCase):
-    """--yes and Enter: the same config as the baseline wherever the baseline wrote one."""
-
-    @classmethod
-    def setUpClass(cls):
-        cls.golden = json.loads(GOLDEN.read_text(encoding="utf-8"))
-
-    def cases(self):
+class Harness(unittest.TestCase):
+    def test_the_recommended_install_on_every_profile(self):
+        """--yes on each PC writes a config through setup's card path (the one sycl/setup_intel.py drives)."""
         for prof, (ram, found) in PROFILES.items():
-            for family, model in MODELS:
-                key = f"{prof} {family} {model or 'recommended'}"
-                if self.golden[key]["code"] == 0:
-                    yield key, ram, found, family, model
-
-    def test_the_baseline_covers_every_kind_of_pc(self):
-        written = [k for k, v in self.golden.items() if v["code"] == 0]
-        self.assertGreaterEqual(len(written), 20)
-        lowram_multi = self.golden["32GB-2x24GB qwen IQ3_XXS"]["config"]   # #364 -> #642: low-RAM, two cards -> both
-        self.assertIn("--resident-experts" if "--resident-experts" in lowram_multi["args"] else "--mmap-experts",
-                      lowram_multi["args"])
-        self.assertEqual(lowram_multi.get("gpu"), [0, 1])                   # 0.1.40 (#642): resident on both cards; roles: Main 1 goes last, as before
-
-    def test_yes(self):
-        for key, ram, found, family, model in self.cases():
-            with self.subTest(key):
-                code, out, cfg, asked = install(ram, found, argv_for(family, model))
-                self.assertEqual(code, 0, out[-3000:])
-                self.assertEqual(cfg, self.golden[key]["config"], out[-3000:])
+            with self.subTest(prof):
+                code, out, cfg, asked = install(ram, found, argv_for("qwen", None))
+                if code != 0:                       # a PC below every size's RAM floor stops (--yes alone is no consent)
+                    self.assertIn("RAM", out)
+                    continue
+                self.assertEqual(cfg["backend"], "hip", out[-2000:])
                 self.assertEqual(asked, [])
-
-    def test_enter_for_every_question(self):
-        for key, ram, found, family, model in self.cases():
-            if "UD-Q4_K_XL" in key and ram < 48:               # --yes consents to the risk; Enter declines it (the
-                continue                                       # "Install it anyway? [n]" question), by design
-            with self.subTest(key):
-                code, out, cfg, asked = install(ram, found, argv_for(family, model), answers="")
-                self.assertEqual(code, 0, out[-3000:])
-                self.assertEqual(cfg, self.golden[key]["config"], out[-3000:])
-
-    def test_the_refusals_with_yes_alone_stay(self):
-        """A size the baseline refused with --yes and no explicit --model still stops (--yes alone is no consent)."""
-        for prof, (ram, found) in PROFILES.items():
-            for family, model in MODELS:
-                key = f"{prof} {family} {model or 'recommended'}"
-                if self.golden[key]["code"] != 0 and model is None:
-                    with self.subTest(key):
-                        self.assertNotEqual(install(ram, found, argv_for(family, model))[0], 0)
+                self.assertEqual(cfg["lib_dirs"], [])
 
 
 if __name__ == "__main__":
-    if "--write" in sys.argv:
-        GOLDEN.write_text(json.dumps(record(), indent=1, sort_keys=True) + "\n", encoding="utf-8")
-        print(f"wrote {GOLDEN}")
-    else:
-        unittest.main()
+    unittest.main()

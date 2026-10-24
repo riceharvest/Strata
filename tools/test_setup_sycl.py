@@ -52,9 +52,24 @@ class SyclBackend(unittest.TestCase):
         _, _, call = run(["--backend=sycl", "--check"], win=False)
         self.assertEqual(call.call_args[0][0][2:], ["--check"])
 
-    def test_the_parser_accepts_sycl(self):
-        src = (ROOT / "setup.py").read_text(encoding="utf-8")
-        self.assertRegex(src, r'"--backend", choices=\["cuda", "hip", "sycl"\]')
+    def test_every_run_goes_to_the_intel_setup(self):
+        """No --backend and --backend sycl both hand over to sycl/setup_intel.py (sycl_setup); --backend hip is the
+        setup_intel's own re-entry and goes on in main() (no loop)."""
+        for argv in (["--check"], ["--backend", "sycl", "--check"], ["--backend=sycl", "--model", "IQ3_S"]):
+            with self.subTest(argv=argv), mock.patch.object(setup, "sycl_setup", return_value=7) as sy, \
+                    mock.patch.object(sys, "argv", ["setup.py", *argv]):
+                self.assertEqual(setup.main(), 7)
+                sy.assert_called_once_with(argv)
+        with mock.patch.object(setup, "sycl_setup", side_effect=AssertionError("looped")), \
+                mock.patch.object(setup, "installed_configs", side_effect=RuntimeError("main went on")), \
+                mock.patch.object(sys, "argv", ["setup.py", "--backend", "hip", "--check"]), contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaisesRegex(RuntimeError, "main went on"):
+                setup.main()
+
+    def test_the_intel_sizes_are_offered(self):
+        for m in ("IQ2_XS", "IQ3_S"):
+            self.assertIn(m, setup.MODELS)
+            self.assertIn("qwen", setup.MODELS[m].get("families", ("qwen", "swift")))
 
     def test_setup_intel_finds_the_setup_functions_it_replaces(self):
         """sycl/setup_intel.py swaps these steps; setup.py must still have them (it stops with a message otherwise)."""
@@ -97,14 +112,6 @@ class SyclBackend(unittest.TestCase):
         src = (ROOT / "sycl" / "setup_intel.py").read_text(encoding="utf-8")
         self.assertIn('"e211": ("Arc Pro B60", 24.0)', src)
         self.assertIn('"e221": ("Arc Pro B60", 24.0)', src)
-
-
-class CMakeOption(unittest.TestCase):
-    def test_sycl_is_off_by_default_and_exclusive(self):
-        src = (ROOT / "CMakeLists.txt").read_text(encoding="utf-8-sig")
-        self.assertIn('option(STRATA_ENABLE_SYCL "EXPERIMENTAL', src)
-        self.assertRegex(src, r'option\(STRATA_ENABLE_SYCL "[^"]*" OFF\)')
-        self.assertIn("add_subdirectory(sycl)", src)
 
 
 class SyclVersion(unittest.TestCase):

@@ -275,7 +275,7 @@ class Install(unittest.TestCase):
         rc, out = self.install(engine=False)
         self.assertEqual(rc, 1, out)
         self.assertIn("DeepSeek's engine is not available for this computer yet", out)
-        self.assertIn("RTX 30", out)
+        self.assertIn("strata-dsv41", out)
         self.assertNotIn("cmake", out)
         self.assertNotIn("STRATA_DSV41_EXE", out)
         self.assertIn("Nothing has been downloaded", out)

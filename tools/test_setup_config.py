@@ -115,16 +115,8 @@ class CarryOver(unittest.TestCase):
             self.assertEqual(json.loads(p.read_text(encoding="utf-8")), {"exe": "e", "args": [], "args_written": []})
             self.assertEqual((Path(d) / "strata-x.json.bak").read_text(encoding="utf-8"), "{cut off")
 
-    def test_display_tip_and_typed_ahead_flush(self):
-        # #779: the tip only when nvidia-smi says the card drives a display; #841: typed-ahead keys are dropped on a tty
-        with unittest.mock.patch.object(setup, "out", lambda cmd: "Enabled\n"):
-            self.assertTrue(setup.gpu_drives_display({"index": 0}))
-        with unittest.mock.patch.object(setup, "out", lambda cmd: "Disabled\n"), unittest.mock.patch.object(setup, "out") as o:
-            o.return_value = "Disabled\n"
-            self.assertFalse(setup.gpu_drives_display({"index": 1}))
-            self.assertIn("1", o.call_args[0][0])
-        with unittest.mock.patch.object(setup, "out", lambda cmd: ""):
-            self.assertFalse(setup.gpu_drives_display({"index": 0}))
+    def test_typed_ahead_flush(self):
+        # #841: typed-ahead keys are dropped on a tty
         with unittest.mock.patch.object(setup.sys, "stdin") as stdin:
             stdin.isatty.return_value = False
             setup.flush_typed_ahead()                      # a pipe: nothing touched
@@ -215,9 +207,8 @@ class NoBrowser(unittest.TestCase):
             p = Path(d) / "strata-q2_0.json"
             p.write_text(json.dumps({"exe": str(exe), "args": ["--kv", "int8"], "gpu": 0, "gpus_asked": True, **cfg}))
             call = unittest.mock.Mock(return_value=0)
-            with unittest.mock.patch.object(setup, "gpus", lambda: self.found), \
+            with unittest.mock.patch.object(setup, "amd_gpus", lambda: self.found), \
                     unittest.mock.patch.object(setup, "is_wsl", lambda: False), \
-                    unittest.mock.patch.object(setup, "ensure_engine_for", lambda cards, path, c, yes: c), \
                     unittest.mock.patch.object(setup.subprocess, "call", call):
                 _, out = quiet(setup.start, p, None, None, True, True, None, keep)
             return call.call_args[0][0], out, json.loads(p.read_text())
@@ -271,8 +262,6 @@ class VisionTokens(unittest.TestCase):
         self.assertEqual(cfg["vision"]["max_tokens"], 768)
         code, out, cfg, _ = self.run_setup("--vision", "cpu", "--vision-tokens", "300", configs=old)
         self.assertEqual(cfg["vision"]["max_tokens"], 300)               # given again: the new value
-        code, out, cfg, _ = self.run_setup("--vision", "gpu", configs=old)
-        self.assertEqual(cfg["vision"]["max_tokens"], 1024)              # another device: its own default
 
     def test_refused_and_unused(self):
         with contextlib.redirect_stderr(io.StringIO()) as err:

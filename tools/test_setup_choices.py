@@ -28,68 +28,16 @@ def quiet(fn, *args, **kw):
         return fn(*args, **kw), out.getvalue()
 
 
-class PrebuiltVision(unittest.TestCase):
-    """#331: the 0.1.30/0.1.31 zip's encoder has no sm_75 code: an RTX 20 card gets the CPU encoder, not a compile."""
-    META = {"version": "0.1.31", "archs": [75, 86, 89, 120], "ptx": True, "vision_archs": [86, 89, 120]}
-
-    def test_a_card_the_encoder_has_no_code_for_gets_the_cpu_encoder(self):
-        got, out = quiet(setup.prebuilt_vision, self.META, {"arch": 75}, "gpu")
-        self.assertEqual(got, "cpu")
-        self.assertIn("runs on the CPU instead", out)
-
-    def test_covered_cards_keep_the_gpu_encoder(self):
-        for arch in (86, 89, 120):
-            self.assertEqual(quiet(setup.prebuilt_vision, self.META, {"arch": arch}, "gpu")[0], "gpu")
-        # a newer card than the newest encoder code: only with PTX in the zip
-        self.assertEqual(quiet(setup.prebuilt_vision, {**self.META, "vision_archs": [86, 89]}, {"arch": 120}, "gpu")[0],
-                         "gpu")
-        self.assertEqual(quiet(setup.prebuilt_vision, {**self.META, "vision_archs": [86, 89], "ptx": False},
-                               {"arch": 120}, "gpu")[0], "cpu")
-        # 0.1.32's zip: the encoder built with 75-real too
-        self.assertEqual(quiet(setup.prebuilt_vision, {**self.META, "vision_archs": [75, 86, 89, 120]},
-                               {"arch": 75}, "gpu")[0], "gpu")
-
-    def test_other_choices_are_left_alone(self):
-        for v in ("cpu", "none"):
-            self.assertEqual(quiet(setup.prebuilt_vision, self.META, {"arch": 75}, v), (v, ""))
-        # an older BUILD.json without vision_archs: the engine's archs
-        self.assertEqual(quiet(setup.prebuilt_vision, {"archs": [75, 86]}, {"arch": 75}, "gpu")[0], "gpu")
-
-
-class VisionArchsAsAString(unittest.TestCase):
-    """#3810: the packaging recipes write BUILD.json `vision_archs` as ONE string ("75;86;89;120"); 0.2.3 iterated it character by
-    character and setup stopped with int(';') on the released Windows CUDA package.  A string and a list mean the same."""
-    RELEASED = {"version": "0.2.3", "archs": [75, 86, 89, 120], "ptx": True, "cuda": "13.0", "vision": "gpu-cuda13",
-                "vision_archs": "75;86;89;120", "portable": True}
-
-    def test_the_released_package_manifest_is_read(self):
-        for arch in (75, 86, 89, 120):
-            self.assertEqual(quiet(setup.prebuilt_vision, self.RELEASED, {"arch": arch}, "gpu")[0], "gpu")
-
-    def test_a_card_the_string_does_not_list_gets_the_cpu_reader(self):
-        meta = {**self.RELEASED, "vision_archs": "86;89;120", "ptx": False}
-        got, out = quiet(setup.prebuilt_vision, meta, {"arch": 75}, "gpu")
-        self.assertEqual(got, "cpu")
-        self.assertIn("runs on the CPU instead", out)
-        self.assertEqual(quiet(setup.prebuilt_vision, {**meta, "ptx": True}, {"arch": 120}, "gpu")[0], "gpu")
+class ReaderArchs(unittest.TestCase):
+    """#3810: a BUILD.json `archs` / `vision_archs` value is a list or ONE ";"-separated string; both mean the same."""
 
     def test_a_string_and_a_list_agree(self):
-        for value in ("75;86;89;120", [75, 86, 89, 120], ["sm_75", "86-real", "89", "compute_120"], "75,86 89;120"):
-            self.assertEqual(setup.arch_numbers(value), [75, 86, 89, 120], value)
-        self.assertEqual(setup.arch_numbers(None), [])
-        self.assertEqual(setup.arch_numbers(""), [])
         self.assertEqual(setup.arch_names("gfx1100;gfx1201"), ["gfx1100", "gfx1201"])
         self.assertEqual(setup.arch_names(["gfx1100"]), ["gfx1100"])
         self.assertEqual(setup.arch_names(None), [])
 
-    def test_the_other_readers_of_the_manifest_take_a_string_too(self):
-        import tempfile
-        from pathlib import Path
-        from unittest import mock
+    def test_the_reader_folder_takes_a_string_too(self):
         with tempfile.TemporaryDirectory() as d:
-            (Path(d) / "BUILD.json").write_text('{"archs": "60;61;70", "ptx": true}', encoding="utf-8")
-            with mock.patch.object(setup, "engine_dir", return_value=Path(d)):
-                self.assertEqual(setup.engine_archs(), ([60, 61, 70], True))
             (Path(d) / "BUILD.json").write_text('{"backend": "hip", "archs": ["gfx1100"], "vision_archs": "gfx1100;gfx1201"}', encoding="utf-8")
             self.assertEqual(setup.reader_archs(Path(d)), ["gfx1100", "gfx1201"])
             (Path(d) / "BUILD.json").write_text('{"backend": "hip", "archs": ["gfx1100", "gfx1201"]}', encoding="utf-8")
@@ -225,137 +173,6 @@ class ReadOnlyGgufDir(unittest.TestCase):
             self.assertFalse(setup.done(Path(tmp) / "x.gguf"))
 
 
-class VsRange(unittest.TestCase):
-    """#985: Visual Studio 2026 (version 18) is looked for only with CUDA 13.3 or newer."""
-
-    def asked(self, cuda_v):
-        seen = []
-        with mock.patch.object(setup.Path, "exists", lambda self: True),                 mock.patch.object(setup, "out", lambda cmd, *a, **k: seen.append(cmd) or "C:/VS"):
-            setup.find_vcvars(cuda_v)
-        return seen[0][seen[0].index("-version") + 1] if "-version" in seen[0] else None
-
-    def test_the_range_follows_the_toolkit(self):
-        self.assertIsNone(self.asked(None))      # #881: without CUDA vswhere gets no version range
-        self.assertEqual(self.asked((13, 0)), "[16.0,18.0)")
-        self.assertEqual(self.asked((13, 2)), "[16.0,18.0)")
-        self.assertEqual(self.asked((13, 3)), "[16.0,19.0)")
-        self.assertEqual(self.asked((14, 0)), "[16.0,19.0)")
-
-
-    def test_vcvars_by_hand(self):
-        """#881: STRATA_VCVARS names a vcvars64.bat directly, for an install vswhere cannot use."""
-        import tempfile
-        with tempfile.TemporaryDirectory() as d:
-            bat = Path(d) / "vcvars64.bat"
-            bat.write_text("rem")
-            with mock.patch.dict(os.environ, {"STRATA_VCVARS": str(bat)}):
-                self.assertEqual(setup.find_vcvars(), bat)
-            with mock.patch.dict(os.environ, {"STRATA_VCVARS": str(Path(d) / "missing.bat")}):
-                self.assertIsNone(setup.find_vcvars())
-
-class ExperimentalSm60(unittest.TestCase):
-    """#295: Pascal (6.x) and Volta (7.0) only with STRATA_EXPERIMENTAL_SM60=1, built with -DSTRATA_EXPERIMENTAL_SM60=ON
-    and a CUDA 12.x toolkit; nothing changes without the variable."""
-
-    def card(self, arch):
-        return {"arch": arch, "vram_gb": 11.0, "index": 0, "name": "card"}
-
-    def test_the_gate(self):
-        with mock.patch.dict(os.environ, {"STRATA_EXPERIMENTAL_SM60": ""}):
-            for arch in ("60", "61", "70"):
-                p = setup.gpu_problem(self.card(arch))
-                self.assertIn("not supported", p)
-                self.assertIn("choose it with --gpu 0", p)              # the CUDA 12 engine (docs/OLDER_GPUS.md)
-            self.assertNotIn("--gpu", setup.gpu_problem(self.card("52")))
-            self.assertIsNone(setup.gpu_problem(self.card("75")))
-        with mock.patch.dict(os.environ, {"STRATA_EXPERIMENTAL_SM60": "1"}):
-            for arch in ("60", "61", "70", "75", "120"):
-                self.assertIsNone(setup.gpu_problem(self.card(arch)), arch)
-            for arch in ("52", "72"):
-                self.assertIsNotNone(setup.gpu_problem(self.card(arch)), arch)
-
-    def test_the_build_flag(self):
-        self.assertEqual(setup.engine_defs([61]), ["-DSTRATA_EXPERIMENTAL_SM60=ON"])
-        self.assertEqual(setup.engine_defs([70, 86]), ["-DSTRATA_EXPERIMENTAL_SM60=ON"])
-        self.assertEqual(setup.engine_defs([75, 86, 120]), [])
-
-    def test_find_nvcc_below(self):
-        with tempfile.TemporaryDirectory() as d:
-            new, old = Path(d) / "13" / "nvcc", Path(d) / "12" / "bin" / "nvcc"
-            for p in (new, old):
-                p.parent.mkdir(parents=True)
-                p.write_bytes(b"")
-            versions = {str(new): "Cuda compilation tools, release 13.0, V13.0.88",
-                        str(old): "Cuda compilation tools, release 12.9, V12.9.86"}
-            with mock.patch.object(setup, "WIN", False), mock.patch.object(setup.shutil, "which", lambda n: str(new)), \
-                    mock.patch.dict(os.environ, {"CUDA_PATH": str(Path(d) / "12")}), \
-                    mock.patch.object(setup, "out", lambda cmd: versions.get(cmd[0], "")):  # #414
-                self.assertEqual(setup.find_nvcc(), (str(new), (13, 0)))
-                self.assertEqual(setup.find_nvcc(below=(13, 0)), (str(old), (12, 9)))
-                # #601: STRATA_NVCC is the only one considered; CUDA_HOME is a candidate like CUDA_PATH
-                with mock.patch.dict(os.environ, {"STRATA_NVCC": str(old)}):
-                    self.assertEqual(setup.find_nvcc(), (str(old), (12, 9)))
-                with mock.patch.dict(os.environ, {"STRATA_NVCC": str(new)}):
-                    got, text = quiet(setup.find_nvcc, below=(13, 0))
-                    self.assertEqual(got, (None, None))
-                    self.assertIn("needs one older than 13.0", text)
-                with mock.patch.dict(os.environ, {"STRATA_NVCC": str(Path(d) / "missing")}):
-                    got, text = quiet(setup.find_nvcc)
-                    self.assertEqual(got, (str(new), (13, 0)))
-                    self.assertIn("no such file", text)
-            with mock.patch.object(setup, "WIN", False), mock.patch.object(setup.shutil, "which", lambda n: None), \
-                    mock.patch.dict(os.environ, {"CUDA_HOME": str(Path(d) / "12")}), \
-                    mock.patch.object(setup, "out", lambda cmd: versions.get(cmd[0], "")):
-                os.environ.pop("CUDA_PATH", None)
-                got = setup.find_nvcc(below=(13, 0))
-                self.assertEqual(got, (str(old), (12, 9)))
-
-    def tools(self, archs, nvcc):
-        seen = []
-
-        def find(below=None):
-            seen.append(below)
-            return nvcc(below)
-
-        with mock.patch.object(setup, "find_nvcc", find), mock.patch.object(setup, "find_vcvars", lambda cuda_v=None: "vcvars"), \
-                mock.patch.object(setup.shutil, "which", lambda n: "/usr/bin/" + n):
-            got, _ = quiet(setup.install_build_tools, {"arch": str(archs[0]), "archs": archs}, True)
-        return got, seen
-
-    def test_pascal_takes_cuda_12(self):
-        got, seen = self.tools([61], lambda below: ("nvcc12", (12, 9)) if below == (13, 0) else ("nvcc13", (13, 0)))
-        self.assertEqual(got[0], "nvcc12")
-        self.assertEqual(seen, [(13, 0)])
-        got, seen = self.tools([86, 120], lambda below: ("nvcc13", (13, 0)))
-        self.assertEqual((got[0], seen), ("nvcc13", [None]))           # the default: unchanged
-
-    def test_cuda_132_on_sm120(self):
-        """#892 / #968: nvcc 13.2 for an RTX 50 card: an older 13.x is taken when there is one, else a warning; never an
-        error, and no other card or toolkit is touched."""
-        def nvcc(below):
-            return ("nvcc130", (13, 0)) if below == (13, 2) else ("nvcc132", (13, 2))
-
-        got, seen = self.tools([120], nvcc)
-        self.assertEqual(got[0], "nvcc130")
-        self.assertEqual(seen, [None, (13, 2)])
-        with mock.patch.dict(os.environ, {"STRATA_NVCC": "x"}):          # the user's own pick is kept
-            got, seen = self.tools([120], nvcc)
-            self.assertEqual((got[0], seen), ("nvcc132", [None]))
-        only132 = lambda below: (None, None) if below == (13, 2) else ("nvcc132", (13, 2))
-        with mock.patch.object(setup, "warn") as warn:                   # nothing older: the one found, with a warning
-            got, _ = self.tools([120], only132)
-        self.assertEqual(got[0], "nvcc132")
-        self.assertIn("#892", warn.call_args[0][0])
-        for archs in ([86], [89, 86]):                                   # not an sm_120 card: as before
-            got, seen = self.tools(archs, nvcc)
-            self.assertEqual((got[0], seen), ("nvcc132", [None]))
-
-    def test_pascal_without_cuda_12_stops(self):
-        for archs in ([61], [70, 120]):
-            with self.subTest(archs=archs), self.assertRaises(SystemExit):
-                self.tools(archs, lambda below: (None, None) if below else ("nvcc13", (13, 0)))
-
-
 class HipVision(unittest.TestCase):
     """#304: the picture reader setup's AMD path (the Intel Arc's, through sycl/setup_intel.py) asks for."""
 
@@ -450,7 +267,7 @@ class VramReserve(unittest.TestCase):
         code, out, cfg, _ = self.install("--vision", "cpu")
         self.assertNotIn("--vram-reserve-mib", cfg["args"])          # the CPU reader needs no reserve
         code, out, cfg, _ = self.install()
-        self.assertEqual(cfg["args"][cfg["args"].index("--vram-reserve-mib") + 1], "700")   # pictures on by default, GPU reader on a 32 GB card: its 700 MiB
+        self.assertNotIn("--vram-reserve-mib", cfg["args"])          # pictures on by default, read by the CPU reader: no reserve
 
     def test_with_images_one_value(self):
         code, out, cfg, _ = self.install("--vision", "cpu", "--vram-reserve-mib", "1500")
@@ -482,9 +299,8 @@ class VramReserve(unittest.TestCase):
             p = Path(d) / "strata-q2_0.json"
             p.write_text(json.dumps({"exe": str(exe), "args": ["--kv", "int8"], "gpu": 0, "gpus_asked": True}))
             call = mock.Mock(return_value=0)
-            with mock.patch.object(setup, "gpus", lambda: self.found), \
+            with mock.patch.object(setup, "amd_gpus", lambda: self.found), \
                     mock.patch.object(setup, "is_wsl", lambda: False), \
-                    mock.patch.object(setup, "ensure_engine_for", lambda cards, path, cfg, yes: cfg), \
                     mock.patch.object(setup.subprocess, "call", call):
                 for n in ("2048", "1024"):
                     _, out = quiet(setup.start, p, None, None, False, True, None, {"vram_reserve_mib": int(n)})
@@ -549,34 +365,6 @@ class DesktopReserveTip(unittest.TestCase):
         self.assertIn("desktop", tip)
 
 
-class CudaVision(unittest.TestCase):
-    """#411: the image encoder setup compiles beside the CUDA engine is built for this PC, not portable."""
-
-    def test_the_encoder_is_built_native(self):
-        for vision in ("gpu", "cpu"):
-            with self.subTest(vision), tempfile.TemporaryDirectory() as d:
-                root = Path(d)
-                eng = root / "engine"
-                eng.mkdir()
-                (eng / setup.EXE).write_bytes(b"engine")                 # the engine is built: only the encoder
-                (eng / "BUILD.json").write_text(json.dumps({"source": "local", "archs": [86], "src": "S"}))
-                built = []
-
-                def cmake_build(src_dir, bdir, target, defs, vcvars, bat):
-                    built.append((target, defs))
-                    (bdir / "bin").mkdir(parents=True)
-                    (bdir / "bin" / setup.VEXE).write_bytes(b"vision")
-
-                with mock.patch.object(setup, "ROOT", root), mock.patch.object(setup, "cmake_build", cmake_build), \
-                        mock.patch.object(setup, "source_hash", lambda p: "V" if p == setup.VISION_SOURCES else "S"), \
-                        mock.patch.object(setup, "install_build_tools", lambda gpu, yes: (str(root / "nvcc"), None)), \
-                        mock.patch.object(setup, "source_version", lambda: "test"):
-                    quiet(setup.build_engine, {"arch": "86"}, vision, True, "llama")
-                self.assertEqual([t for t, _ in built], ["strata-vision"])
-                self.assertIn("-DSTRATA_PORTABLE=OFF", built[0][1])
-                self.assertIn(f"-DSTRATA_VISION_CUDA={'ON' if vision == 'gpu' else 'OFF'}", built[0][1])
-
-
 class SwiftIq3s(unittest.TestCase):
     """#1651: Swift 1.5 has its own IQ3_S tier since 2026-10-08 (ukisai's Swift-1.5 GGUF repo) - the model choice
     must not hide it behind the qwen family.  Names and sizes checked against the Hub listing when written."""
@@ -592,58 +380,6 @@ class SwiftIq3s(unittest.TestCase):
                           "Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00002-of-00002.gguf"])
 
 
-class HostCompilers(unittest.TestCase):
-    """#1645: CC / CXX / CUDAHOSTCXX name the build's compilers - handed to CMake as -D, so a build folder that is
-    already configured picks them up too (CXX alone reaches CMake only on the first configure: the reporter's
-    `CXX=g++-14` run died at the last step).  CUDAHOSTCXX is nvcc's host compiler and defaults to CXX."""
-
-    def test_env_names_the_compilers(self):
-        with mock.patch.dict(os.environ, {"CC": "gcc-14", "CXX": "g++-14", "CUDAHOSTCXX": "g++-14-alt"}):
-            self.assertEqual(setup.host_compiler_defs(True), ["-DCMAKE_C_COMPILER=gcc-14",
-                                                              "-DCMAKE_CXX_COMPILER=g++-14",
-                                                              "-DCMAKE_CUDA_HOST_COMPILER=g++-14-alt"])
-
-    def test_cudahostcxx_defaults_to_cxx_and_needs_cuda(self):
-        with mock.patch.dict(os.environ, {"CC": "", "CXX": "g++-14", "CUDAHOSTCXX": ""}):
-            self.assertEqual(setup.host_compiler_defs(True), ["-DCMAKE_CXX_COMPILER=g++-14",
-                                                              "-DCMAKE_CUDA_HOST_COMPILER=g++-14"])
-            self.assertEqual(setup.host_compiler_defs(False), ["-DCMAKE_CXX_COMPILER=g++-14"])   # a C++-only project
-
-    def test_unset_adds_nothing(self):
-        with mock.patch.dict(os.environ, {"CC": "", "CXX": "", "CUDAHOSTCXX": ""}):
-            self.assertEqual(setup.host_compiler_defs(True), [])
-
-    def test_the_defs_reach_cmake(self):
-        """The engine's and the CUDA encoder's configure both take them."""
-        with tempfile.TemporaryDirectory() as d:
-            root = Path(d)
-            eng = root / "engine"
-            eng.mkdir()
-            (eng / "BUILD.json").write_text(json.dumps({"source": "local", "archs": [86], "src": "old"}))
-            built = []
-
-            def cmake_build(src_dir, bdir, target, defs, vcvars, bat):
-                built.append((target, defs))
-                (bdir / "bin").mkdir(parents=True, exist_ok=True)
-                (bdir / "bin" / setup.VEXE).write_bytes(b"vision")
-                (bdir / setup.EXE).write_bytes(b"engine")
-
-            env = {"CC": "gcc-14", "CXX": "g++-14", "CUDAHOSTCXX": ""}
-            with mock.patch.dict(os.environ, env), mock.patch.object(setup, "ROOT", root), \
-                    mock.patch.object(setup, "cmake_build", cmake_build), \
-                    mock.patch.object(setup, "source_hash", lambda p: "V" if p == setup.VISION_SOURCES else "new"), \
-                    mock.patch.object(setup, "install_build_tools", lambda gpu, yes: (str(root / "nvcc"), None)), \
-                    mock.patch.object(setup, "source_version", lambda: "test"):
-                quiet(setup.build_engine, {"arch": "86"}, "gpu", True, "llama")
-        for target, defs in built:
-            self.assertIn("-DCMAKE_CXX_COMPILER=g++-14", defs, target)
-            self.assertIn("-DCMAKE_CUDA_HOST_COMPILER=g++-14", defs, target)
-
-
-if __name__ == "__main__":
-    unittest.main()
-
-
 class CalibrateWithModel(unittest.TestCase):
     """#2036: --calibrate --model X tunes model X (it used to fall through to a plain re-setup); a model that is not
     installed is an error that says so; --calibrate with --setup or --check says it does nothing."""
@@ -657,9 +393,8 @@ class CalibrateWithModel(unittest.TestCase):
             p.write_text(json.dumps({"exe": "x", "args": ["--max-context", "8192"], "model_name": tag}))
             cfgs.append(p)
         tuned = []
-        with mock.patch.object(sys, "argv", ["setup.py", *argv]), \
+        with mock.patch.object(sys, "argv", ["setup.py", "--backend", "hip", *argv]), \
                 mock.patch.object(setup, "installed_configs", lambda: cfgs), \
-                mock.patch.object(setup, "update_installed_engine", lambda *a, **k: None), \
                 mock.patch.object(setup, "calibrate_config", lambda c: tuned.append(c.name) or True), \
                 mock.patch.object(setup, "start", lambda *a, **k: 0), \
                 mock.patch.object(setup, "data_folder", lambda d, *a, **k: (Path(tmp.name), [])), \

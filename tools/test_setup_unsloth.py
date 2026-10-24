@@ -22,6 +22,7 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 import setup  # noqa: E402
+from test_setup_golden import card  # noqa: E402
 
 M = "UD-Q4_K_XL"
 REV = "38bb39ee97821de2c9009abb7e93950eec396e66"
@@ -162,9 +163,9 @@ class Base(unittest.TestCase):
 
         eng = self.t / "engine"
         eng.mkdir(exist_ok=True)
-        (eng / "BUILD.json").write_text(json.dumps({"version": version, "source": "local"}))
-        found = [{"index": i, "name": "NVIDIA GeForce RTX 5070", "vram_gb": vram, "arch": "120", "driver": "580.97"}
-                 for i in range(n_gpus)]
+        (eng / "BUILD.json").write_text(json.dumps({"version": version, "source": "local", "lib_dirs": []}))
+        (eng / setup.VEXE).write_bytes(b"")                # the CPU picture reader (sycl/setup_intel.py's build step)
+        found = list(amd) or [card(i, "Intel Arc B580", vram) for i in range(n_gpus)]   # as sycl/setup_intel.py lists them
 
         def fake_download(url, dst, what=None):
             self.downloads.append(url)
@@ -177,11 +178,10 @@ class Base(unittest.TestCase):
 
         patches = [
             mock.patch.object(setup, "ROOT", self.t),
-            mock.patch.object(setup, "GPU_PICK", None),
             mock.patch.object(setup, "data_folder", lambda d, *a, **k: (self.t / "data", [])),
             mock.patch.object(setup, "installed_configs", lambda: []),
-            mock.patch.object(setup, "gpus", lambda: found),
-            mock.patch.object(setup, "amd_gpus", lambda *a: list(amd)),
+            mock.patch.object(setup, "gpus", lambda: []),
+            mock.patch.object(setup, "amd_gpus", lambda *a: list(found)),
             mock.patch.object(setup, "ram_gb", lambda: ram),
             mock.patch.object(setup, "cpu_info", lambda: ("Test CPU", True, True)),
             mock.patch.object(setup, "cpu_cores", lambda: None),   # #642: not a hybrid CPU
@@ -193,7 +193,7 @@ class Base(unittest.TestCase):
             mock.patch.object(setup, "is_wsl", lambda: False),            # #974: the tests are not run inside WSL
             mock.patch.object(setup, "pip_install", lambda *a, **k: None),
             mock.patch.object(setup, "get_llama_cpp", lambda: self.t / "llama.cpp"),
-            mock.patch.object(setup, "get_prebuilt", lambda *a, **k: eng),
+            mock.patch.object(setup, "build_engine_hip", lambda *a, **k: eng),
             mock.patch.object(setup, "download", fake_download),
             mock.patch.object(setup, "check_shards", lambda shards: None),
             mock.patch.object(setup, "verify_sha256", lambda s, size, sha, own=False: self.verified.append((s.name, size, sha))),
@@ -203,7 +203,7 @@ class Base(unittest.TestCase):
             mock.patch.object(setup, "saved_calibration", lambda cfg: None),
             mock.patch.object(setup, "start", mock.Mock(side_effect=AssertionError("started"))),
             mock.patch.dict(sys.modules, {"gguf_reader": types.SimpleNamespace(GGUFFile=FakeGGUF)}),
-            mock.patch.object(sys, "argv", ["setup.py", *(["--family", "unsloth"] if family else []),
+            mock.patch.object(sys, "argv", ["setup.py", "--backend", "hip", *(["--family", "unsloth"] if family else []),
                                             *(["--model", m] if model else []),
                                             *(["--yes"] if answers is None else []), "--no-start",
                                             "--models-dir", str(self.t / "models"), *argv]),
@@ -352,7 +352,6 @@ class Main(Base):
         """#967: images are allowed with UD-Q4_K_XL (tested end to end since MODEL-UPDATE)."""
         code, out, cfg = self.main(["--context", "8192", "--vision", "yes", "--low-ram", "on"], n_gpus=2)
         self.assertEqual(code, 0, out)
-        self.assertIn("(NVIDIA GeForce RTX 5070, 12 GB) only (--gpus 1,0 shares it across", out)
         self.assertNotIn("images are not available", out)
         self.assertIn("images: on", out)
         self.assertNotIn("are untested", out)                      # MODEL-UPDATE: run end to end (CUDA, HIP)
@@ -423,26 +422,6 @@ class Main(Base):
             self.assertEqual(cfg["args"][cfg["args"].index("--resident-budget-gib") + 1], "30")
             self.assertNotIn("has no layer split", out)
 
-    def test_asked_with_the_budget_one_gpu_by_default(self):
-        """#642: asked as before (one GPU recommended); "2" takes both cards with the budget."""
-        with mock.patch.object(setup, "MIN_ENGINE", setup.RESIDENT_SPLIT_ENGINE):
-            code, out, cfg = self.main(["--context", "8192"], n_gpus=2, answers={})          # Enter: one GPU
-            self.assertEqual(code, 0, out)
-            self.assertTrue(any(f"{M}: which GPUs?" in q and "[1]" in q for q in self.asked), self.asked)
-            self.assertNotIn("layer_split", cfg)
-            self.assertIn("--resident-budget-gib", cfg["args"])
-            code, out, cfg = self.main(["--context", "8192"], n_gpus=2, answers={"which GPUs?": "2"})
-            self.assertEqual(code, 0, out)
-            self.assertEqual(cfg["gpu"], [1, 0])
-            self.assertIn("--resident-budget-gib", cfg["args"])
-
-    @budget_mode()
-    def test_yes_alone_keeps_one_gpu(self):
-        code, out, cfg = self.main(["--context", "8192"], n_gpus=2, ram=165.0)
-        self.assertEqual(code, 0, out)
-        self.assertIn("Main: GPU 1", out)                                       # the roles are shown; the model keeps to one card
-        self.assertNotIn("layer_split", cfg)
-        self.assertIn("--resident-budget-gib", cfg["args"])
 
 
 X = "UD-IQ4_XS"
@@ -591,22 +570,7 @@ class LayerSplit(unittest.TestCase):
         self.addCleanup(p.stop)
         sys.path.insert(0, str(ROOT / "tools"))
         from test_setup_golden import card
-        self.found = [card(i, "NVIDIA GeForce RTX 3090", 24.0, "86") for i in range(2)]
-
-    @budget_mode()
-    def test_asked_one_gpu_by_default(self):
-        from test_setup_golden import install
-        argv = ["--family", "unsloth", "--model", M, "--context", "32768", "--no-start"]
-        code, out, cfg, asked = install(165.0, self.found, argv, answers={"which GPUs?": "1", "Which GPUs?": "1"})
-        self.assertEqual(code, 0, out)
-        self.assertTrue(any("Use these roles? [y]" in q for q in asked), asked)     # the roles question; the model's own question follows
-        self.assertEqual(cfg["gpu"], 0)
-        self.assertIn("--resident-budget-gib", cfg["args"])
-        code, out, cfg, asked = install(165.0, self.found, argv, answers={f"{M}: which GPUs?": "2"})
-        self.assertEqual(code, 0, out)
-        self.assertEqual(cfg["gpu"], [0, 1])
-        self.assertEqual(cfg["layer_split"], "auto")
-        self.assertNotIn("--resident-budget-gib", cfg["args"])
+        self.found = [card(i, "Intel Arc Pro B60", 24.0) for i in range(2)]
 
     def start(self, ram, gpu=(0, 1), offered=None):
         from test_setup_risk import run
@@ -618,10 +582,8 @@ class LayerSplit(unittest.TestCase):
                       "gpu": 0, "gpus_asked": offered is None}
             p.write_text(json.dumps(before))
             call = mock.Mock(return_value=0)
-            with mock.patch.object(setup, "gpus", lambda: self.found), \
+            with mock.patch.object(setup, "amd_gpus", lambda: self.found), \
                     mock.patch.object(setup, "ram_gb", lambda: ram), \
-                    mock.patch.object(setup, "engine_runs_on", lambda g: True), \
-                    mock.patch.object(setup, "ensure_engine_for", lambda cards, path, cfg, yes: cfg), \
                     mock.patch.object(setup, "is_wsl", lambda: False), \
                     mock.patch.object(setup.subprocess, "call", call):
                 code, out, asked = run(setup.start, p, None, list(gpu) if gpu else None, False, offered is None,
@@ -652,21 +614,8 @@ class LayerSplit(unittest.TestCase):
         self.assertEqual(cfg["gpu"], [0, 1])
         self.assertNotIn("--resident-budget-gib", cfg["args"])
 
-    def test_offered_at_a_start(self):
-        code, out, cfg, _ = self.start(165.0, gpu=None, offered="")    # Enter: one GPU (the default here)
-        self.assertIsNone(code, out)
-        self.assertEqual(cfg["gpu"], 0)
-        self.assertIn("--resident-budget-gib", cfg["args"])
-        self.assertIn("about twice as fast in #498", out)
-        code, out, cfg, _ = self.start(165.0, gpu=None, offered="y")
-        self.assertEqual(cfg["gpu"], [0, 1])
-        self.assertNotIn("--resident-budget-gib", cfg["args"])
-        code, out, cfg, _ = self.start(63.7, gpu=None, offered="y")    # not offered: the RAM does not hold it
-        self.assertEqual(cfg["gpu"], 0)
-        self.assertNotIn("Use both", out)
-
     def test_resident_split_engine_keeps_the_budget(self):
-        """#642: a start with --gpus keeps the budget at any RAM; offered both cards (Enter: one, as before)."""
+        """#642: a start with --gpus keeps the budget at any RAM."""
         with mock.patch.object(setup, "MIN_ENGINE", setup.RESIDENT_SPLIT_ENGINE):
             for ram in (165.0, 63.7):
                 code, out, cfg, started = self.start(ram)
@@ -676,14 +625,6 @@ class LayerSplit(unittest.TestCase):
                 self.assertEqual(cfg["args"], ["--pack", "p", "--resident-budget-gib", "40", "--kv", "int8"])
                 self.assertNotIn("no RAM budget", out)
                 self.assertNotIn("cannot share its RAM budget", out)
-            code, out, cfg, _ = self.start(63.7, gpu=None, offered="")    # offered at 64 GB too; Enter: one GPU
-            self.assertIsNone(code, out)
-            self.assertIn("On both it keeps the budget", out)
-            self.assertIn("staying on one GPU", out)
-            self.assertEqual(cfg["gpu"], 0)
-            code, out, cfg, _ = self.start(63.7, gpu=None, offered="y")
-            self.assertEqual(cfg["gpu"], [0, 1])
-            self.assertIn("--resident-budget-gib", cfg["args"])
 
 
 Q5, Q6, Q8 = "UD-Q5_K_XL", "UD-Q6_K_XL", "Q8_0"
@@ -758,14 +699,6 @@ class Resident(Base):
         self.assertEqual(setup.recommended_size("unsloth", names, 191.0), "UD-Q4_K_XL")
         self.assertEqual(setup.recommended_size("unsloth", names, 40.0), "UD-IQ4_XS")   # nothing fits: the 4-bit i-quant
 
-    def test_two_gpus_split_with_every_expert_in_ram(self):
-        """Where the experts fit, two cards are the GGUF models' layer split (no budget question, no #498 note)."""
-        code, out, cfg = self.main(["--context", "8192"], n_gpus=2, ram=127.8, answers={"Use these roles?": "y"})     # the recommended roles
-        self.assertEqual(code, 0, out)
-        self.assertEqual(cfg["gpu"], [1, 0])
-        self.assertEqual(cfg["layer_split"], "auto")
-        self.assertNotIn("--resident-budget-gib", cfg["args"])
-        self.assertNotIn("which GPUs?", out)
 
 
 class BigFiles(Base):

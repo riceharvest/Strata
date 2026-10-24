@@ -1,5 +1,5 @@
-"""Tests for `setup.py --update` (#475, UPDATE.bat / update.sh): it refreshes what a start would - the Python packages,
-the engine, each model's config and draft subset - and never starts the model.  Every outside effect is mocked: no
+"""Tests for `setup.py --update` (#475, update.sh): it refreshes what a start would - the Python packages, each model's
+config and draft subset - and never starts the model (the SYCL engine is built outside setup).  Every outside effect is mocked: no
 GPU, no downloads, nothing written outside a temp folder.
 
     python -m unittest tools.test_setup_update
@@ -30,44 +30,34 @@ class Update(unittest.TestCase):
         return p
 
     def run_update(self, have, argv=()):
-        a = mock.Mock(**{"build": False, "prebuilt": "URL", **dict(argv)})
+        a = mock.Mock(**dict(argv))
         out = io.StringIO()
         with mock.patch.object(setup, "pip_install") as pip, \
-                mock.patch.object(setup, "update_installed_engine") as eng, \
                 mock.patch.object(setup, "refresh_draft_vocab") as dv, \
                 mock.patch.object(setup, "start") as start, \
                 mock.patch("subprocess.call") as call, \
                 contextlib.redirect_stdout(out):
             rc = setup.update_install(have, a)
-        return rc, pip, eng, dv, start, call, out.getvalue()
+        return rc, pip, dv, start, call, out.getvalue()
 
     def test_refreshes_without_starting(self):
         with tempfile.TemporaryDirectory() as d:
             p = self.config(Path(d), draft_vocab="en")
-            rc, pip, eng, dv, start, call, out = self.run_update([p])
+            rc, pip, dv, start, call, out = self.run_update([p])
         self.assertEqual(rc, 0)
         pip.assert_called_once()
-        eng.assert_called_once_with("URL")
         dv.assert_called_once()
         self.assertEqual(dv.call_args[0][1], "en")                 # the model's own subset is kept
         start.assert_not_called()
         call.assert_not_called()
         self.assertIn("Strata is updated", out)
 
-    def test_build_keeps_the_compiled_engine_path(self):
-        with tempfile.TemporaryDirectory() as d:
-            p = self.config(Path(d))
-            rc, pip, eng, dv, *_ = self.run_update([p], {"build": True})
-        self.assertEqual(rc, 0)
-        eng.assert_not_called()
-        self.assertEqual(dv.call_args[0][1], "cjk")
-
     def test_nothing_installed(self):
-        rc, pip, eng, dv, start, call, out = self.run_update([])
+        rc, pip, dv, start, call, out = self.run_update([])
         self.assertEqual(rc, 0)
-        for m in (pip, eng, dv, start, call):
+        for m in (pip, dv, start, call):
             m.assert_not_called()
-        self.assertIn("START-HERE.bat", out)
+        self.assertIn("./setup.sh", out)
 
     def test_a_json_that_is_no_model_config_is_skipped(self):
         """#549: a strata-*.json without "args" (not written by setup) stopped update.sh with KeyError: 'args'."""
@@ -77,7 +67,7 @@ class Update(unittest.TestCase):
             other.write_text(json.dumps({"note": "mine"}), encoding="utf-8")
             broken = Path(d) / "strata-cut.json"
             broken.write_text("{\"args\": [", encoding="utf-8")
-            rc, pip, eng, dv, start, call, out = self.run_update([other, broken, p])
+            rc, pip, dv, start, call, out = self.run_update([other, broken, p])
         self.assertEqual(rc, 0, out)
         self.assertIn('skipped strata-notes.json (no "exe" or "args"): it is not a Strata model config', out)
         self.assertIn("skipped strata-cut.json (not valid JSON)", out)
@@ -95,7 +85,7 @@ class Update(unittest.TestCase):
     def test_main_update_never_starts(self):
         with tempfile.TemporaryDirectory() as d:
             p = self.config(Path(d))
-            with mock.patch.object(sys, "argv", ["setup.py", "--update"]), \
+            with mock.patch.object(sys, "argv", ["setup.py", "--backend", "hip", "--update"]), \
                     mock.patch.object(setup, "data_folder", return_value=(Path(d), [])), \
                     mock.patch.object(setup, "installed_configs", return_value=[p]), \
                     mock.patch.object(setup, "update_install", return_value=0) as up, \
