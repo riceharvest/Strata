@@ -148,12 +148,16 @@ __dpct_inline__ int __popc(unsigned int x) {
     return std::popcount(x);
 }
 
+// CUDA's __syncthreads orders the block's global stores as well as its shared ones (the split-K partials, the all-reduce rows)
 __dpct_inline__ void __syncthreads() {
-    sycl::ext::oneapi::this_work_item::get_nd_item<3>().barrier(sycl::access::fence_space::local_space);
+    sycl::ext::oneapi::this_work_item::get_nd_item<3>().barrier(sycl::access::fence_space::global_and_local);
 }
 
+// a sub-group (warp) barrier: the lanes hand data to each other through shared memory around it.  Every call site runs
+// with the whole warp (a lane mask other than all lanes is not supported)
 __dpct_inline__ void __syncwarp(unsigned mask = 0xffffffffu) {
     (void)mask;
+    sycl::group_barrier(sycl::ext::oneapi::this_work_item::get_sub_group());
 }
 
 __dpct_inline__ void __threadfence_system() {
@@ -213,7 +217,13 @@ __dpct_inline__ SyclId3 get_sycl_grid_dim() {
 #define gridDim   (get_sycl_grid_dim())
 #endif
 
-#define SYCL_SHARED(Type, var) auto& var = *sycl::ext::oneapi::group_local_memory_for_overwrite<Type>(sycl::ext::oneapi::this_work_item::get_nd_item<3>().get_group())
+// __shared__ arrays: group_local_memory aligns to alignof(Type), and the kernels read several of them as uint2 / uint4 / float4
+// (CUDA's __align__(16) on them was dropped in the port), so each is boxed at 16 bytes at least
+template <class T>
+struct alignas(alignof(T) > 16 ? alignof(T) : 16) ds4_slm_box {
+    T v;
+};
+#define SYCL_SHARED(Type, var) auto& var = sycl::ext::oneapi::group_local_memory_for_overwrite<ds4_slm_box<Type>>(sycl::ext::oneapi::this_work_item::get_nd_item<3>().get_group())->v
 
 // ---------------------------------------------------------------- Math / Conversion Helpers
 __dpct_inline__ float __uint_as_float(uint32_t u) { return sycl::bit_cast<float>(u); }
@@ -235,8 +245,9 @@ __dpct_inline__ uint16_t __float2bfloat16_rn(float f) {
 }
 __dpct_inline__ uint16_t __bfloat16_as_ushort(uint16_t u) { return u; }
 
-__dpct_inline__ float fmaxf(float a, float b) { return std::max(a, b); }
-__dpct_inline__ float fminf(float a, float b) { return std::min(a, b); }
+// CUDA's fmaxf / fminf return the other operand when one is NaN (std::max / std::min do not)
+__dpct_inline__ float fmaxf(float a, float b) { return sycl::fmax(a, b); }
+__dpct_inline__ float fminf(float a, float b) { return sycl::fmin(a, b); }
 template <typename A, typename B>
 __dpct_inline__ auto min(A a, B b) { return (a < b) ? a : b; }
 template <typename A, typename B>
@@ -292,9 +303,8 @@ __dpct_inline__ uint32_t __byte_perm(uint32_t x, uint32_t y, unsigned int s) {
     uint32_t res = 0;
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
-        int sel = (s >> (4 * i)) & 0xf;
-        uint32_t b = (sel < 8) ? bytes[sel] : 0;
-        res |= (b << (8 * i));
+        const int sel = (s >> (4 * i)) & 7;   // (CUDA: the low three bits of each selector nibble; the fourth is ignored)
+        res |= ((uint32_t) bytes[sel] << (8 * i));
     }
     return res;
 }
@@ -713,10 +723,12 @@ inline void strata_launch_impl(cudaStream_t s, dim3 grid, dim3 block, size_t shm
     sycl::range<3> global(g.z * b.z, g.y * b.y, g.x * b.x);
     sycl::range<3> local(b.z, b.y, b.x);
     if (shmem > 0) {
+        // (in 16-byte elements: CUDA's dynamic shared memory is 16-byte aligned and the kernels read it as uint4 / float4)
+        const size_t n16 = (shmem + 15) / 16;
         q->submit([&](sycl::handler& cgh) {
-            sycl::local_accessor<uint8_t, 1> slm(sycl::range<1>(shmem), cgh);
+            sycl::local_accessor<sycl::uint4, 1> slm(sycl::range<1>(n16), cgh);
             cgh.parallel_for(sycl::nd_range<3>(global, local), [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
-                fn(&slm[0]);
+                fn(reinterpret_cast<uint8_t*>(&slm[0]));
             });
         });
     } else {
