@@ -35,7 +35,7 @@ from strata_control import components, engine_component as ec, procs, profiles, 
 
 WINDOWS = os.name == "nt"
 LINUX = sys.platform.startswith("linux")
-BACKEND = "metal" if sys.platform == "darwin" else "cuda"      # the family the fake package claims on this OS
+BACKEND = "sycl"      # the family the fake package claims
 
 # Control words (STOP) are taken on a thread of their own, as the real engine does; everything else in order.
 FAKE_ENGINE = r'''

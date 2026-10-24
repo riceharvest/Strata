@@ -66,38 +66,6 @@ class Issue3298MtpDepth(unittest.TestCase):
         self.assertEqual(files_present({"args": ["--mtp", str(self.root / "gone")]}), [str(self.root / "gone")])
 
 
-class Issue3403MacBuildTools(unittest.TestCase):
-    """The Mac setup compiles without setup.cmake_build(), so cmake and ninja must be installed for it too."""
-
-    def test_missing_build_tools_are_installed_before_the_mac_compile(self):
-        from unittest import mock
-        import setup
-        sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "metal"))
-        import setup_mac as M
-        installed = {"cmake": None, "ninja": None}
-
-        def find(name):
-            return installed[name]
-
-        def pip(packages, what):
-            self.assertTrue(all(p.split("==")[0] in ("cmake", "ninja") for p in packages), packages)
-            for p in packages:
-                installed[p.split("==")[0]] = "/venv/bin/" + p.split("==")[0]
-
-        with mock.patch.object(setup, "find_tool", side_effect=find), mock.patch.object(setup, "pip_install", side_effect=pip) as pi:
-            self.assertEqual(setup.ensure_build_tools(), ("/venv/bin/cmake", "/venv/bin/ninja"))
-            self.assertEqual(pi.call_count, 1)
-            setup.ensure_build_tools()                       # present now: nothing more is installed
-            self.assertEqual(pi.call_count, 1)
-
-    def test_both_mac_builds_ask_for_the_tools_first(self):
-        import inspect
-        sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "metal"))
-        import setup_mac as M
-        for fn in (M.build_engine, M.build_vision):
-            self.assertIn("S.ensure_build_tools()", inspect.getsource(fn), fn.__name__)
-
-
 @unittest.skipUnless(sys.platform == "win32", "ACLs are Windows only")
 class WindowsRuntimeFolderRefused(unittest.TestCase):
     """The owner's fresh Windows PC: `strata launch` stopped with "runtime directory must be owner-only" on a folder that was already

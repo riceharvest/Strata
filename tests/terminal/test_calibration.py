@@ -12,7 +12,6 @@ import unittest
 import uuid
 from contextlib import redirect_stdout
 from pathlib import Path
-from types import SimpleNamespace
 from unittest import mock
 
 from strata_cli.cli import main
@@ -21,13 +20,6 @@ import setup
 
 
 class CalibrationFlowTests(unittest.TestCase):
-    def test_mac_ram_identity_is_available_without_proc_meminfo(self):
-        with mock.patch.object(setup, "WIN", False), \
-                mock.patch.object(setup.sys, "platform", "darwin"), \
-                mock.patch.object(setup.subprocess, "run",
-                                  return_value=SimpleNamespace(stdout="17179869184\n")):
-            self.assertEqual(setup.ram_gb(), 16.0)
-
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)

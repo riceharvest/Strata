@@ -170,7 +170,7 @@ class ExistingInstallIsFoundInPlace(unittest.TestCase):
     def test_a_plain_start_from_the_old_folder_uses_the_remembered_data_folder_and_moves_nothing(self):
         started = []
         out = io.StringIO()
-        with mock.patch.object(setup, "ROOT", self.old), mock.patch.object(sys, "argv", ["setup.py", "--yes"]), \
+        with mock.patch.object(setup, "ROOT", self.old), mock.patch.object(sys, "argv", ["setup.py", "--backend", "hip", "--yes"]), \
                 mock.patch.object(setup, "gpus", lambda: []), \
                 mock.patch.object(setup.subprocess, "call", lambda cmd, *a, **k: started.append(cmd) or 0), \
                 contextlib.redirect_stdout(out):

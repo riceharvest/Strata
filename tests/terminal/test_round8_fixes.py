@@ -129,10 +129,9 @@ class SetupArguments(unittest.TestCase):
             self.assertNotIn("--mtp", runner_for().setup_args())
 
     def test_setup_skips_the_draft_layer_download_for_mtp_off(self):
-        # setup.py is a script; its two fetch sites must be guarded by the explicit --mtp off (N3: a 5.2 GB download happened anyway)
+        # setup.py is a script; its fetch site must be guarded by the explicit --mtp off (N3: a 5.2 GB download happened anyway)
         text = (Path(__file__).resolve().parents[2] / "setup.py").read_text(encoding="utf-8")
         self.assertIn('if a.mtp == "off" and not (rt / "experts.bin").exists():', text)
-        self.assertIn('if use_mtp and a.mtp == "off" and not (mtp / "mtp-q2_0.gguf").exists():', text)
         self.assertIn('"use --data-dir on a bigger drive (strata launch --data-dir)" if CONTROL', text)       # N2: a launch option, not --models-dir
 
 

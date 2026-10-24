@@ -198,7 +198,7 @@ class StartNeverAcquiresTests(unittest.TestCase):
         started = []
         with contextlib.ExitStack() as st:
             st.enter_context(mock.patch.object(setup, "ROOT", self.root))
-            st.enter_context(mock.patch.object(sys, "argv", ["setup.py", *argv]))
+            st.enter_context(mock.patch.object(sys, "argv", ["setup.py", "--backend", "hip", *argv]))   # setup's card path (sycl/setup_intel.py re-enters it so)
             st.enter_context(mock.patch.object(urllib.request, "urlopen", rec.urlopen))
             for n in ("run", "call", "Popen", "check_call", "check_output"):
                 st.enter_context(mock.patch.object(subprocess, n, rec.program))
@@ -215,7 +215,7 @@ class StartNeverAcquiresTests(unittest.TestCase):
                 code = e
         return code, out.getvalue(), started
 
-    def test_a_start_with_an_old_engine_makes_no_request_and_runs_no_installer(self):
+    def test_a_start_makes_no_request_and_runs_no_installer(self):
         rec = _Recorder()
         code, text, started = self.run_setup(rec, "--yes", "--no-browser")
         self.assertEqual(code, 0, text)
@@ -224,8 +224,6 @@ class StartNeverAcquiresTests(unittest.TestCase):
         self.assertEqual(len(started), 1, text)                        # the server was started
         self.assertIn("server.py", " ".join(started[0]))
         self.assertEqual(self.env_of_start, "1")                         # the server is told, too
-        self.assertIn("is older than this Strata expects", text)
-        self.assertTrue("UPDATE" in text or "update.sh" in text, text)     # UPDATE.bat on Windows, ./update.sh elsewhere
 
     def test_a_start_moves_copies_and_creates_nothing(self):
         before = sorted(p.relative_to(self.tmp.name).as_posix() for p in Path(self.tmp.name).rglob("*"))
@@ -239,17 +237,6 @@ class StartNeverAcquiresTests(unittest.TestCase):
         for p, ns in stamps.items():
             if p != self.cfg:                                          # a start touches the config (most recently used)
                 self.assertEqual(p.stat().st_mtime_ns, ns, p)
-
-    def test_a_card_the_engine_has_no_code_for_is_a_typed_error_naming_the_command(self):
-        rec = _Recorder()
-        card = {"index": 0, "name": "RTX 5090", "arch": "120", "vram_gb": 32.0, "driver": "580.0"}
-        with mock.patch.object(setup, "engine_runs_on", lambda g, tk=13: False), \
-                mock.patch.object(setup, "old_gpus_opt_in", lambda *a, **k: []):
-            code, text, started = self.run_setup(rec, "--yes", "--no-browser", gpus=[card])
-        self.assertIsInstance(code, acquisition.AcquisitionRefused)
-        self.assertIn("RTX 5090", str(code))
-        self.assertIn("setup", str(code).lower())
-        self.assertEqual((rec.network, rec.installers(), started), ([], [], []))
 
     def test_main_script_reports_the_refusal_and_exits_5(self):
         e = acquisition.AcquisitionRefused("an engine for sm_120")
@@ -266,9 +253,7 @@ class StartNeverAcquiresTests(unittest.TestCase):
             lambda: setup.run([sys.executable, "-m", "pip", "install", "x"]),
             lambda: setup._urlopen(urllib.request.Request("https://example.invalid/")),
             lambda: setup.reachable("https://example.invalid/"),
-            lambda: setup.get_prebuilt("https://example.invalid/", {"arch": "86"}, "none"),
             lambda: setup.cmake_build(self.root, self.root / "b", "strata", [], None, ""),
-            lambda: setup.pip_cuda_libs(13),
         ]
         with mock.patch.object(urllib.request, "urlopen", rec.urlopen), \
                 mock.patch.object(subprocess, "run", rec.program), mock.patch.object(subprocess, "Popen", rec.program):
