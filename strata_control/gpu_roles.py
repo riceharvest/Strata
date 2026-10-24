@@ -427,47 +427,9 @@ def describe(roles: dict[int, str], cards: list[dict]) -> str:
     return " ".join(parts)
 
 
-# ---- speed of each card (the same measure the engine orders a split by: multiprocessors x max clock) ------------------------------------
-
-def nvidia_speeds(timeout: float = 20.0) -> dict[int, float]:
-    """{nvidia-smi number: SMs x max clock} from the CUDA driver API in a child process (no toolkit needed); {} when it cannot say."""
-    import os
-    import subprocess
-    import sys
-    code = ("import ctypes,sys,os\n"
-            "os.environ['CUDA_DEVICE_ORDER']='PCI_BUS_ID'\n"
-            "lib=ctypes.CDLL('nvcuda.dll' if os.name=='nt' else 'libcuda.so.1')\n"
-            "assert lib.cuInit(0)==0\n"
-            "n=ctypes.c_int()\n"
-            "assert lib.cuDeviceGetCount(ctypes.byref(n))==0\n"
-            "for i in range(n.value):\n"
-            "    d=ctypes.c_int()\n"
-            "    assert lib.cuDeviceGet(ctypes.byref(d),i)==0\n"
-            "    sm=ctypes.c_int(); mhz=ctypes.c_int()\n"
-            "    lib.cuDeviceGetAttribute(ctypes.byref(sm),16,d)\n"
-            "    lib.cuDeviceGetAttribute(ctypes.byref(mhz),13,d)\n"
-            "    print(i,sm.value,mhz.value)\n")
-    try:
-        env = dict(os.environ)
-        env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-        env.pop("CUDA_VISIBLE_DEVICES", None)
-        r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=timeout, env=env)
-        out = {}
-        for line in r.stdout.splitlines():
-            i, sm, khz = (int(x) for x in line.split())
-            if sm > 0 and khz > 0:
-                out[i] = float(sm) * float(khz)
-        return out
-    except (OSError, ValueError, subprocess.SubprocessError):
-        return {}
-
+# ---- speed of each card ------------------------------------------------------------------------------------------------------------------
 
 def add_speeds(gpus: list[dict]) -> None:
-    """Puts "speed" on the NVIDIA cards of a hardware report (in place); a card it cannot measure keeps none."""
-    nv = [g for g in gpus if str(g.get("vendor")) == "nvidia"]
-    if not nv:
-        return
-    sp = nvidia_speeds()
-    for g in nv:
-        if g.get("index") in sp:
-            g["speed"] = sp[g["index"]]
+    """Puts "speed" on the cards of a hardware report (in place) where it can be measured. Nothing measures an Intel Arc's speed
+    yet (the CUDA driver API reading of NVIDIA cards is gone), so every card keeps none and the roles follow memory and order."""
+    return None
