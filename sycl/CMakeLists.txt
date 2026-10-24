@@ -486,8 +486,6 @@ if(STRATA_BUILD_DSV41)
 
   set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41/ds4_main.cpp PROPERTIES
     COMPILE_DEFINITIONS "DS4_BUILD_ID=\"${STRATA_BUILD_ID}\"")
-  set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41/ds4_gg_cpu.cpp PROPERTIES
-    COMPILE_OPTIONS "-mavx512f;-mavx512bw;-mavx512vl;-mavx512vnni;-mavx2;-mfma;-mf16c")
 
   target_include_directories(strata-dsv41 PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -498,4 +496,11 @@ if(STRATA_BUILD_DSV41)
   target_compile_options(strata-dsv41 PUBLIC -qmkl=sequential)
   target_link_options(strata-dsv41 PUBLIC -qmkl=sequential)
   target_link_libraries(strata-dsv41 PRIVATE strata_dsv41_kernels strata_core Threads::Threads)
+  # the CPU lane's trellis / ggml-type rows (ds4_tq_cpu.cpp, ds4_gg_cpu.cpp) through strata_kernels_cpu, as the top-level build
+  # does; without it both compile to stubs. ds4_gg_cpu.cpp takes no -mavx512*: the AVX-512 rows live in strata_kernels_cpu and are
+  # taken only where cpu_avx512_ok() says the CPU has them (a Zen 3 host has none)
+  if(STRATA_NATIVE_EXPERTS)
+    target_link_libraries(strata-dsv41 PRIVATE strata_kernels_cpu)
+    target_compile_definitions(strata-dsv41 PRIVATE STRATA_DSV41_TQ_CPU=1)
+  endif()
 endif()
