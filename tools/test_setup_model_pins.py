@@ -65,19 +65,16 @@ class EveryFileIsPinned(unittest.TestCase):
         self.assertRegex(pin[1], HEX)
 
     def test_every_shard_of_every_choice(self):
-        for fam_name, fam in {**setup.FAMILIES, **setup.OWN_PATH_FAMILIES}.items():
-            for model in (setup.MODELS if fam_name in setup.FAMILIES else fam["models"]):
-                if fam_name in setup.FAMILIES and fam_name not in setup.MODELS[model].get("families", ("qwen", "swift")):
+        for fam_name, fam in setup.FAMILIES.items():
+            for model in setup.MODELS:
+                if fam_name not in setup.MODELS[model].get("families", ("qwen", "swift")):
                     continue
                 with self.subTest(family=fam_name, model=model):
-                    if fam_name in setup.FAMILIES:
-                        for i in range(1, setup.model_shards(fam, model) + 1):
-                            self.pinned(fam["hf"].format(q=model) + setup.model_file(fam, model, i))
-                    else:
-                        self.pinned(fam["hf"] + fam["file"].format(q=model))
+                    for i in range(1, setup.model_shards(fam, model) + 1):
+                        self.pinned(fam["hf"].format(q=model) + setup.model_file(fam, model, i))
 
     def test_the_picture_reader_of_every_family(self):
-        for name, fam in {**setup.FAMILIES, **setup.OWN_PATH_FAMILIES}.items():
+        for name, fam in setup.FAMILIES.items():
             with self.subTest(family=name):
                 self.pinned(fam["mmproj_hf"] + fam["mmproj"])
 

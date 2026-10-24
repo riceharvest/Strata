@@ -688,20 +688,6 @@ class EngineLaunchEnv(unittest.TestCase):
             with mock.patch.dict("os.environ", {"PATH": "/usr/bin"}):
                 self.assertEqual(setup.engine_env(Path(t))["PATH"], "/usr/bin")
 
-    def test_families_probe_runs_with_that_env(self):
-        seen = {}
-
-        def fake_run(cmd, **kw):
-            seen["cmd"], seen["env"] = cmd, kw.get("env")
-            return mock.Mock(stdout="qwen4exp qwen35moe\n")
-        with tempfile.TemporaryDirectory() as t:
-            eng = self.engine(Path(t))
-            with mock.patch.object(setup.subprocess, "run", fake_run):
-                names = setup.engine_families(eng)
-            self.assertEqual(names, {"qwen4exp", "qwen35moe"})
-            self.assertEqual(seen["cmd"][1], "--families")
-            self.assertEqual(seen["env"]["PATH"].split(setup.os.pathsep)[0], str(eng / "rocm" / "bin"))
-
     def test_device_probe_runs_with_that_env(self):
         seen = {}
 

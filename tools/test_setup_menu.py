@@ -19,8 +19,8 @@ import setup  # noqa: E402
 
 class FamilyOrder(unittest.TestCase):
     def test_the_menu_order(self):
-        fams = setup.menu_families(True) + list(setup.OWN_PATH_FAMILIES)
-        self.assertEqual(fams, ["qwen", "swift", "coder", "unsloth", "gyro", "qwen36"])
+        fams = setup.menu_families(True)
+        self.assertEqual(fams, ["qwen", "swift", "coder", "unsloth", "gyro"])
 
     def test_the_default_stays_the_first_family(self):
         self.assertEqual(setup.menu_families(False)[0], "qwen")

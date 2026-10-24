@@ -65,7 +65,6 @@ class Entries(unittest.TestCase):
 
     def test_not_a_pack_or_single_file_family(self):
         self.assertNotIn("deepseek41", setup.FAMILIES)
-        self.assertNotIn("deepseek41", setup.OWN_PATH_FAMILIES)
         self.assertNotIn("UD-Q8_K_XL", setup.MODELS)
 
     def test_config_read_back(self):
