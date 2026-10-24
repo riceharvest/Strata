@@ -162,6 +162,12 @@ SYCL_ESIMD_FUNCTION inline simd<uint32_t, 16> apply_signs(simd<uint32_t, 16> g, 
     return (g ^ mask) + m;
 }
 
+// ksigns_iq2xs[s] for s < 128: s with bit 7 set to the parity of its bits (an even number of minus signs per 8 values)
+SYCL_ESIMD_FUNCTION inline simd<uint32_t, 16> ksigns(simd<uint32_t, 16> s7) {
+    simd<uint32_t, 16> c = cbit(s7);
+    return s7 | ((c & 1u) << 7);
+}
+
 struct GArgs {
     const uint8_t* blob[kMaxGroup];
     uint32_t sec_off;                 // gate/up: byte offset of the up rows; down: byte offset of the down rows
@@ -278,7 +284,7 @@ void launch_gu(sycl::queue& q, const GArgs a, int nrowblocks) {
                             sw0 = d * simd<float, 16>(simd<int, 16>((aux >> 28) * 2u + 1u)) * 0.25f;
 #pragma unroll
                             for (int il = 0; il < 4; ++il) {
-                                simd<uint32_t, 16> sbyte = gather<uint32_t, 16>(T + O_KSIGNS, ((aux >> (7 * il)) & 127u) << 2);
+                                simd<uint32_t, 16> sbyte = ksigns((aux >> (7 * il)) & 127u);
 #pragma unroll
                                 for (int hh = 0; hh < 2; ++hh) {
                                     const int r = 2 * il + hh;
@@ -327,7 +333,7 @@ void launch_gu(sycl::queue& q, const GArgs a, int nrowblocks) {
                                 simd<uint32_t, 16> idx = qv & 511u;
                                 simd<uint32_t, 16> gl = gather<uint32_t, 16>(T + O_IQ2XS, (idx << 3));
                                 simd<uint32_t, 16> gh = gather<uint32_t, 16>(T + O_IQ2XS, (idx << 3) + 4u);
-                                simd<uint32_t, 16> sbyte = gather<uint32_t, 16>(T + O_KSIGNS, (qv >> 9) << 2);
+                                simd<uint32_t, 16> sbyte = ksigns(qv >> 9);
                                 simd<uint32_t, 16> vl = apply_signs(gl, sbyte & 0xfu);
                                 simd<uint32_t, 16> vh = apply_signs(gh, sbyte >> 4);
                                 if (il < 2) {
@@ -349,7 +355,7 @@ void launch_gu(sycl::queue& q, const GArgs a, int nrowblocks) {
                                 simd<uint32_t, 16> idx = (q0 >> (8 * il)) & 0xffu;
                                 simd<uint32_t, 16> gl = gather<uint32_t, 16>(T + O_IQ2XXS, (idx << 3));
                                 simd<uint32_t, 16> gh = gather<uint32_t, 16>(T + O_IQ2XXS, (idx << 3) + 4u);
-                                simd<uint32_t, 16> sbyte = gather<uint32_t, 16>(T + O_KSIGNS, ((aux >> (7 * il)) & 127u) << 2);
+                                simd<uint32_t, 16> sbyte = ksigns((aux >> (7 * il)) & 127u);
                                 fr0.template select<16, 1>(16 * (2 * il)) = apply_signs(gl, sbyte & 0xfu);
                                 fr0.template select<16, 1>(16 * (2 * il + 1)) = apply_signs(gh, sbyte >> 4);
                             }
@@ -515,7 +521,7 @@ constexpr auto kAl16 = sycl::ext::oneapi::experimental::properties{sycl::ext::on
 // For IQ2_S / IQ2_XS / IQ2_XXS / Q8_0, TB = 0: only activation tiles are staged in SLM (8x global activation traffic reduction),
 // while codebooks stay hot in the XeCore 64 KB L1 data cache without paying a per-workgroup SLM table copy.
 template <int F> constexpr int tab_bytes() {
-    return F == T_IQ3S ? 2048 : F == T_IQ3XXS ? 1536 : (F == T_IQ4XS || F == T_IQ4NL || F == T_Q2_0) ? 1024 : 0;   // IQ3XXS: grid 1024 + ksigns 512
+    return F == T_IQ3S ? 2048 : F == T_IQ3XXS ? 1024 : (F == T_IQ4XS || F == T_IQ4NL || F == T_Q2_0) ? 1024 : 0;   // IQ3XXS: the grid (its signs are computed, ksigns)
 }
 
 template <int F, int MT>
@@ -578,7 +584,6 @@ void launch_gu_wg(sycl::queue& q, const GArgs a, int nrowblocks) {
 #pragma unroll
                 for (int k = 0; k < 1024 / WGT / 64; ++k)
                     slm_block_store<uint32_t, 16>(lt * (1024 / WGT) + 64 * k, block_load<uint32_t, 16>(T + O_IQ3XXS + (lt * (1024 / WGT) + 64 * k) / 4, kAl16), kAl16);
-                slm_block_store<uint32_t, 16>(1024 + lt * (512 / WGT), block_load<uint32_t, 16>(T + O_KSIGNS + lt * (512 / WGT) / 4, kAl16), kAl16);
             } else if constexpr (F == T_IQ4XS) {
 #pragma unroll
                 for (int k = 0; k < tab_bytes<F>() / WGT / 64; ++k)
@@ -656,7 +661,7 @@ void launch_gu_wg(sycl::queue& q, const GArgs a, int nrowblocks) {
                                         simd<uint32_t, 16> idx = qv & 511u;
                                         gl = gather<uint32_t, 16>(T + O_IQ2XS, idx << 3);
                                         gh = gather<uint32_t, 16>(T + O_IQ2XS, (idx << 3) + 4u);
-                                        sbyte = gather<uint32_t, 16>(T + O_KSIGNS, (qv >> 9) << 2);
+                                        sbyte = ksigns(qv >> 9);
                                     }
                                     fb.template select<16, 1>(64 * hf + 32 * il) = apply_signs(gl, sbyte & 0xfu);
                                     fb.template select<16, 1>(64 * hf + 32 * il + 16) = apply_signs(gh, sbyte >> 4);
@@ -707,7 +712,7 @@ void launch_gu_wg(sycl::queue& q, const GArgs a, int nrowblocks) {
                                 sw0 = d * simd<float, 16>(simd<int, 16>((aux >> 28) * 2u + 1u)) * 0.25f;
 #pragma unroll
                                 for (int il = 0; il < 4; ++il) {
-                                    simd<uint32_t, 16> sbyte = slm_gather<uint32_t, 16>(1024u + (((aux >> (7 * il)) & 127u) << 2));
+                                    simd<uint32_t, 16> sbyte = ksigns((aux >> (7 * il)) & 127u);
 #pragma unroll
                                     for (int hh = 0; hh < 2; ++hh) {
                                         const int r = 2 * il + hh;
@@ -726,7 +731,7 @@ void launch_gu_wg(sycl::queue& q, const GArgs a, int nrowblocks) {
                                     simd<uint32_t, 16> idx = (q0 >> (8 * il)) & 0xffu;
                                     simd<uint32_t, 16> gl = gather<uint32_t, 16>(T + O_IQ2XXS, idx << 3);
                                     simd<uint32_t, 16> gh = gather<uint32_t, 16>(T + O_IQ2XXS, (idx << 3) + 4u);
-                                    simd<uint32_t, 16> sbyte = gather<uint32_t, 16>(T + O_KSIGNS, ((aux >> (7 * il)) & 127u) << 2);
+                                    simd<uint32_t, 16> sbyte = ksigns((aux >> (7 * il)) & 127u);
                                     fr0.template select<16, 1>(16 * (2 * il)) = apply_signs(gl, sbyte & 0xfu);
                                     fr0.template select<16, 1>(16 * (2 * il + 1)) = apply_signs(gh, sbyte >> 4);
                                 }
