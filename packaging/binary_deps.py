@@ -21,7 +21,7 @@ from pathlib import Path
 
 # ---- Windows ---------------------------------------------------------------------------------------------------------------
 # Libraries Windows itself ships (a clean Windows 10/11 has them) or the GPU driver installs in System32. Anything else an
-# engine file imports (the Visual C++ runtime, CUDA, HIP, SYCL/Level Zero loaders, OpenMP...) must travel in the package.
+# engine file imports (the Visual C++ runtime, SYCL/Level Zero loaders, OpenMP...) must travel in the package.
 WINDOWS_OS = (
     "kernel32.dll", "kernelbase.dll", "user32.dll", "gdi32.dll", "advapi32.dll", "shell32.dll", "ole32.dll", "oleaut32.dll",
     "ws2_32.dll", "wsock32.dll", "mswsock.dll", "iphlpapi.dll", "bcrypt.dll", "crypt32.dll", "secur32.dll", "sechost.dll",
@@ -31,11 +31,8 @@ WINDOWS_OS = (
     "dxcore.dll", "wtsapi32.dll", "ncrypt.dll", "normaliz.dll", "api-ms-win-*.dll", "ext-ms-win-*.dll", "hid.dll",
     "opengl32.dll", "glu32.dll", "wldap32.dll", "authz.dll", "msi.dll", "propsys.dll", "uxtheme.dll", "dnsapi.dll",
 )
-# Installed by the GPU driver into System32 (never redistributable by us): the CUDA driver API, the NVIDIA management library,
-# and the AMD / Intel user-mode driver pieces the driver package owns.
+# Installed by the GPU driver into System32 (never redistributable by us): the Intel user-mode driver pieces the driver package owns.
 WINDOWS_DRIVER = (
-    "nvcuda.dll", "nvml.dll", "nvapi64.dll", "nvapi.dll", "nvcuvid.dll", "nvEncodeAPI64.dll", "nvfatbinaryloader.dll",
-    "amdxx64.dll", "amdhip64_*.dll", "amdhip64.dll", "atiadlxx.dll", "atiadlxy.dll", "amdadlx64.dll",
     "igdrcl64.dll", "ze_intel_gpu64.dll", "ze_loader.dll", "OpenCL.dll", "vulkan-1.dll",
 )
 
@@ -44,14 +41,12 @@ WINDOWS_DRIVER = (
 LINUX_OS = (
     "linux-vdso.so.1", "ld-linux-x86-64.so.2", "ld-linux-aarch64.so.1", "libc.so.6", "libm.so.6", "libdl.so.2", "libpthread.so.0",
     "librt.so.1", "libutil.so.1", "libresolv.so.2", "libnss_*.so.*", "libgcc_s.so.1", "libstdc++.so.6", "libgomp.so.1",
-    "libatomic.so.1", "libz.so.1", "libnuma.so.1", "libdrm.so.2", "libdrm_amdgpu.so.1", "libelf.so.1", "libtinfo.so.*",
+    "libatomic.so.1", "libz.so.1", "libnuma.so.1", "libdrm.so.2", "libelf.so.1", "libtinfo.so.*",
     "libcrypt.so.1", "libffi.so.*", "libpci.so.3", "libudev.so.1", "libX11.so.6", "libxcb.so.1",
 )
 # From the GPU driver package: never bundled.
 LINUX_DRIVER = (
-    "libcuda.so.1", "libcuda.so", "libnvidia-*.so*", "libnvcuvid.so*", "libze_intel_gpu.so*", "libze_loader.so*",
-    "libOpenCL.so*", "libvulkan.so*", "libGLX*.so*", "libEGL*.so*", "libamdgpu*.so*", "libhsa-runtime64.so*",
-    "libdrm_amdgpu.so*", "libigdrcl.so*", "libnvidia-ml.so*",
+    "libze_intel_gpu.so*", "libze_loader.so*", "libOpenCL.so*", "libvulkan.so*", "libGLX*.so*", "libEGL*.so*", "libigdrcl.so*",
 )
 
 # ---- macOS -----------------------------------------------------------------------------------------------------------------
@@ -195,8 +190,8 @@ def uncovered(folder: Path, files: list[str] | None = None) -> list[tuple[str, s
     folder = Path(folder)
     rels = files if files is not None else [p.relative_to(folder).as_posix() for p in sorted(folder.rglob("*")) if p.is_file() and not p.is_symlink()]
     # Windows loads a DLL from the program's own folder, System32 and PATH; a DLL in a sub-folder counts only when BUILD.json lists
-    # that folder in "lib_dirs" (Control and the app put those folders on PATH when they start the engine). Found 2026-10-18: the
-    # RX 9000 package kept rocblas.dll under rocm/bin, which only Control's PATH finds, and a plain start died with 0xC0000135.
+    # that folder in "lib_dirs" (Control and the app put those folders on PATH when they start the engine); a DLL only in a
+    # sub-folder otherwise ends a plain start with 0xC0000135.
     lib_dirs = {""}
     if any(r == "BUILD.json" for r in rels):
         try:
@@ -209,7 +204,7 @@ def uncovered(folder: Path, files: list[str] | None = None) -> list[tuple[str, s
     problems: list[tuple[str, str]] = []
     for rel in rels:
         p = folder / rel
-        if p.suffix.lower() in (".json", ".txt", ".md", ".cu", ".h", ".py", ".yaml", ".yml", ".metallib", ".bin"):
+        if p.suffix.lower() in (".json", ".txt", ".md", ".h", ".py", ".yaml", ".yml", ".bin"):
             continue
         try:
             kind, names = imports(p)

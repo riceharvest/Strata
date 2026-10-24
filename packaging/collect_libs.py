@@ -1,19 +1,18 @@
 #!/usr/bin/env python3
 """Collect the shared libraries an engine binary needs into one folder, ready for packaging/package_engine.py (Linux).
 
-    python packaging/collect_libs.py --binary build/strata --search /usr/local/cuda/lib64 --out stage/ \
-        [--also 'libcublasLt.so*'] [--data /opt/rocm/lib/rocblas/library=rocblas/library --data-glob '*gfx1201*']
+    python packaging/collect_libs.py --binary build-sycl/strata --search /opt/intel/oneapi/compiler/latest/lib --out stage/ \
+        [--also 'libur_adapter_level_zero*.so*']
 
 What it does: runs `ldd` on the binary with LD_LIBRARY_PATH set to --search, copies every dependency that is NOT
 supplied by the distribution (anything resolved outside /lib, /lib64, /usr/lib, /usr/lib64 and their x86_64-linux-gnu
 folders) into --out under its soname (symlinks are resolved, the real file is copied once per name), repeats for each
 copied library (their own dependencies), and adds libraries that are loaded with dlopen and so never show up in ldd
-(--also, a glob searched in --search). `--data SRC=DEST` copies a data folder (rocBLAS / hipBLASLt kernel libraries)
-to DEST under --out, optionally filtered by --data-glob.
+(--also, a glob searched in --search). packaging/build_sycl_linux.sh runs it for the oneAPI runtime of the SYCL engine.
 
 Distribution libraries (libc, libm, libstdc++, libdrm, libnuma, ...) are not copied: they are listed in
 `SYSTEM-LIBS.txt` beside the output so a missing one on a target PC can be named. The GPU driver's own libraries
-(libcuda.so.1, libnvidia-*, libze_intel_gpu, libOpenCL ICDs) are never bundled: they belong to the driver.
+(libze_intel_gpu, libigdrcl, libOpenCL ICDs) are never bundled: they belong to the driver.
 Nothing is downloaded; this only reads files on the build machine.
 """
 
@@ -29,8 +28,7 @@ import sys
 from pathlib import Path
 
 SYSTEM_DIRS = ("/lib/", "/lib64/", "/usr/lib/", "/usr/lib64/")
-DRIVER_PATTERNS = ("libcuda.so*", "libnvidia-*", "libnvcuvid*", "libze_intel_gpu*", "libigdrcl*", "libOpenCL.so*",
-                   "libGLX*", "libEGL*", "libvulkan*", "libdrm_amdgpu*", "libdrm.so*", "libamdgpu*")
+DRIVER_PATTERNS = ("libze_intel_gpu*", "libigdrcl*", "libOpenCL.so*", "libGLX*", "libEGL*", "libvulkan*", "libdrm.so*")
 LDD_LINE = re.compile(r"^\s*(\S+)\s+=>\s+(\S+)\s+\(0x")
 
 
@@ -40,17 +38,6 @@ def is_system(path: str) -> bool:
 
 def is_driver(name: str) -> bool:
     return any(fnmatch.fnmatch(name, pattern) for pattern in DRIVER_PATTERNS)
-
-
-GFX = re.compile(r"gfx[0-9a-f]+", re.I)
-
-
-def arch_wanted(name: str, wanted: str) -> bool:
-    """Data files for other GPU architectures are left out; shared ones (no gfx name) stay."""
-    if not wanted:
-        return True
-    named = {m.group(0).lower() for m in GFX.finditer(name)}
-    return not named or bool(named & {w.strip().lower() for w in wanted.split(",") if w.strip()})
 
 
 ELF_MAGIC = bytes([0x7F]) + b"ELF"
@@ -93,10 +80,6 @@ def main(argv=None) -> int:
     ap.add_argument("--search", action="append", default=[], help="a library folder to resolve against (repeatable)")
     ap.add_argument("--out", required=True, type=Path)
     ap.add_argument("--also", action="append", default=[], help="glob of dlopen'd libraries to add, searched in --search")
-    ap.add_argument("--data", action="append", default=[], metavar="SRC=DEST")
-    ap.add_argument("--data-glob", action="append", default=[], help="keep only data files matching one of these globs")
-    ap.add_argument("--data-arch", default="", help="comma list (gfx1200,gfx1201): of the data files that name a gfx arch keep "
-                                                    "only these; files naming none (shared tables) are kept")
     a = ap.parse_args(argv)
     a.out.mkdir(parents=True, exist_ok=True)
     copied: dict[str, str] = {}
@@ -151,18 +134,9 @@ def main(argv=None) -> int:
                 else:
                     shutil.copy2(Path(path).resolve(), a.out / dep)
                     copied[dep] = str(Path(path).resolve())
-    for spec in a.data:
-        src, _, dest = spec.partition("=")
-        if not dest:
-            ap.error(f"--data {spec!r} is not SRC=DEST")
-        for path in sorted(Path(src).rglob("*")):
-            if path.is_file() and (not a.data_glob or any(fnmatch.fnmatch(path.name, g) for g in a.data_glob))                     and arch_wanted(path.name, a.data_arch):
-                target = a.out / dest / path.relative_to(src)
-                target.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(path.resolve(), target)
     (a.out / "SYSTEM-LIBS.txt").write_text("\n".join(sorted(system)) + "\n", encoding="utf-8")
     total = sum(p.stat().st_size for p in a.out.rglob("*") if p.is_file())
-    print(f"copied {len(copied)} libraries ({total / (1 << 20):.1f} MiB incl. data) to {a.out}; {len(system)} system libraries left to the OS")
+    print(f"copied {len(copied)} libraries ({total / (1 << 20):.1f} MiB) to {a.out}; {len(system)} system libraries left to the OS")
     for name in sorted(copied):
         print(f"  {name} <- {copied[name]}")
     return 0

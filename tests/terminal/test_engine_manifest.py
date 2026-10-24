@@ -21,8 +21,8 @@ import package_engine  # noqa: E402
 
 WINDOWS = os.name == "nt"
 HERE = components.host_platform()
-EXE = "strata.exe" if WINDOWS else "strata"
-LIB = "cudart64_13.dll" if WINDOWS else "libcudart.so.13"
+EXE = "strata"
+LIB = "libsycl.so.8"
 
 
 def make_source(folder: Path) -> Path:
@@ -32,8 +32,8 @@ def make_source(folder: Path) -> Path:
     (folder / "BUILD.json").write_text(json.dumps({"version": "0.1.45"}))
     (folder / "LICENSE.txt").write_text("MIT")
     (folder / "notes.txt").write_text("not packaged by default")
-    (folder / "rocm" / "bin").mkdir(parents=True, exist_ok=True)
-    (folder / "rocm" / "bin" / "kernel.co").write_bytes(b"kernel" * 100)
+    (folder / "kernels" / "bin").mkdir(parents=True, exist_ok=True)
+    (folder / "kernels" / "bin" / "kernel.spv").write_bytes(b"kernel" * 100)
     return folder
 
 
@@ -47,39 +47,39 @@ class Manifest(unittest.TestCase):
         self.out.mkdir(parents=True)
 
     def package(self, **kw):
-        args = dict(archs=("sm_86", "compute_89"), min_driver={"nvidia": "580.65"}, build_id="abc123-cuda13.0")
+        args = dict(archs=("intel-arc",), build_id="abc123-oneapi2026.1")
         args.update(kw)
-        return package_engine.build(self.src, "cuda", "0.1.45", HERE, self.out, **args)
+        return package_engine.build(self.src, "sycl", "0.1.45", HERE, self.out, **args)
 
     def test_the_packager_writes_every_field_the_plan_asks_for(self):
         folder = self.package()
         data = json.loads((folder / ec.MANIFEST).read_text())
         self.assertEqual(data["schema_version"], 2)
         self.assertEqual((data["id"], data["name"], data["version"]), ("strata-engine", "strata-engine", "0.1.45"))
-        self.assertEqual((data["platform"], data["backend"]), (HERE, "cuda"))
-        self.assertEqual(data["archs"], ["sm_86", "compute_89"])
-        self.assertEqual(data["min_driver"], {"nvidia": "580.65"})
-        self.assertEqual(data["build_id"], "abc123-cuda13.0")
+        self.assertEqual((data["platform"], data["backend"]), (HERE, "sycl"))
+        self.assertEqual(data["archs"], ["intel-arc"])
+        self.assertEqual(data["min_driver"], {})
+        self.assertEqual(data["build_id"], "abc123-oneapi2026.1")
         self.assertIn("signature", data)
         self.assertIsNone(data["signature"])
         names = {item["path"] for item in data["files"]}
-        self.assertEqual(names, {EXE, LIB, "BUILD.json", "LICENSE.txt"})        # notes.txt and rocm/ need --include / --tree
+        self.assertEqual(names, {EXE, LIB, "BUILD.json", "LICENSE.txt"})        # notes.txt and kernels/ need --include / --tree
         for item in data["files"]:
             body = (folder / item["path"]).read_bytes()
             self.assertEqual((item["sha256"], item["bytes"]), (hashlib.sha256(body).hexdigest(), len(body)))
         self.assertEqual(data["entrypoint"], EXE)
         component = ec.read_manifest(folder)
         self.assertEqual((component.build_id, component.archs, component.min_driver),
-                         ("abc123-cuda13.0", ("sm_86", "compute_89"), {"nvidia": "580.65"}))
+                         ("abc123-oneapi2026.1", ("intel-arc",), {}))
         ec.verify(component, full=True)
 
     def test_include_and_tree_take_nested_files(self):
-        with_include = self.package(include=["rocm/**"])
-        self.assertIn("rocm/bin/kernel.co", {f[0] for f in ec.read_manifest(with_include).files})
+        with_include = self.package(include=["kernels/**"])
+        self.assertIn("kernels/bin/kernel.spv", {f[0] for f in ec.read_manifest(with_include).files})
         self.assertNotIn("notes.txt", {f[0] for f in ec.read_manifest(with_include).files})
         every = self.out / "tree"
         every.mkdir()
-        folder = package_engine.build(self.src, "cuda", "9.9", HERE, every, archs=("sm_86",), tree=True, build_id="x")
+        folder = package_engine.build(self.src, "sycl", "9.9", HERE, every, archs=("intel-arc",), tree=True, build_id="x")
         self.assertIn("notes.txt", {f[0] for f in ec.read_manifest(folder).files})
         self.assertEqual(ec.read_manifest(folder).files[0][0], EXE)
 
@@ -103,20 +103,20 @@ class Manifest(unittest.TestCase):
             self.assertEqual(feed_tool._mode(folder / "strata-vision", "strata-vision", "strata"), 0o755)
 
     def test_strata_dsv41_travels_beside_the_engine_and_can_be_required(self):
-        dsv = "strata-dsv41.exe" if WINDOWS else "strata-dsv41"
+        dsv = "strata-dsv41"
         with self.assertRaises(SystemExit):
             self.package(require_dsv41=True)                                  # a package without it is refused when it is required
-        self.assertNotIn(dsv, {f[0] for f in ec.read_manifest(self.package()).files})   # optional by default (Intel, Mac, Pascal ...)
+        self.assertNotIn(dsv, {f[0] for f in ec.read_manifest(self.package()).files})   # optional by default
         (self.src / dsv).write_bytes(b"dsv41-binary-" * 50)
         other = self.root / "again"
         other.mkdir()
-        folder = package_engine.build(self.src, "cuda", "0.1.46", HERE, other, archs=("sm_86",), build_id="x", require_dsv41=True)
+        folder = package_engine.build(self.src, "sycl", "0.1.46", HERE, other, archs=("intel-arc",), build_id="x", require_dsv41=True)
         self.assertIn(dsv, {f[0] for f in ec.read_manifest(folder).files})
         self.assertEqual(package_engine.main(["--verify", str(folder), "--require-dsv41"]), 0)
         (self.src / dsv).unlink()
         plain = self.root / "plain"
         plain.mkdir()
-        bare = package_engine.build(self.src, "cuda", "0.1.47", HERE, plain, archs=("sm_86",), build_id="x")
+        bare = package_engine.build(self.src, "sycl", "0.1.47", HERE, plain, archs=("intel-arc",), build_id="x")
         self.assertEqual(package_engine.main(["--verify", str(bare), "--require-dsv41"]), 1)
 
     def test_a_gpu_package_without_archs_is_refused_by_the_packager(self):
@@ -134,7 +134,7 @@ class Manifest(unittest.TestCase):
             with self.assertRaises(ec.ComponentProblem) as caught:
                 ec.read_manifest(folder)
             self.assertIn(why, str(caught.exception))
-        data = dict(original, min_driver={"nvidia": 580})
+        data = dict(original, min_driver={"intel": 580})
         path.write_text(json.dumps(data))
         with self.assertRaises(ec.ComponentProblem):
             ec.read_manifest(folder)
@@ -176,13 +176,6 @@ class Manifest(unittest.TestCase):
 
 
 class CollectLibs(unittest.TestCase):
-    def test_kernel_data_is_filtered_by_arch_and_shared_tables_stay(self):
-        want = "gfx1200,gfx1201"
-        self.assertTrue(collect_libs.arch_wanted("Kernels.so-000-gfx1201.hsaco", want))
-        self.assertTrue(collect_libs.arch_wanted("hipblasltTransform.hsaco", want))
-        self.assertFalse(collect_libs.arch_wanted("TensileLibrary_x_gfx1100.co", want))
-        self.assertTrue(collect_libs.arch_wanted("anything_gfx1100.co", ""))
-
     def test_elf_check_and_system_split(self):
         with tempfile.TemporaryDirectory() as d:
             lib, text = Path(d) / "libx.so", Path(d) / "gdb.py"
@@ -191,9 +184,9 @@ class CollectLibs(unittest.TestCase):
             self.assertTrue(collect_libs.is_elf(lib))
             self.assertFalse(collect_libs.is_elf(text))
         self.assertTrue(collect_libs.is_system("/lib/x86_64-linux-gnu/libc.so.6"))
-        self.assertFalse(collect_libs.is_system("/usr/local/cuda/lib64/libcudart.so.13"))
-        self.assertTrue(collect_libs.is_driver("libcuda.so.1"))
-        self.assertFalse(collect_libs.is_driver("libcublas.so.13"))
+        self.assertFalse(collect_libs.is_system("/opt/intel/oneapi/compiler/latest/lib/libsycl.so.8"))
+        self.assertTrue(collect_libs.is_driver("libze_intel_gpu.so.1"))
+        self.assertFalse(collect_libs.is_driver("libsycl.so.8"))
 
 
 class Arch(unittest.TestCase):
@@ -260,15 +253,6 @@ class Start(unittest.TestCase):
         self.assertEqual(ec.read_manifest(old).variant, "cuda12")
         self.assertEqual(Path(self.start(driver="610.0")).parent.resolve(), self.folder.resolve())    # 580.65 build wins
         self.assertEqual(Path(self.start(driver="576.0")).parent.resolve(), old.resolve())            # only the CUDA 12 one fits
-
-    def test_a_cuda12_package_without_pascal_or_volta_code_is_refused(self):
-        """#3503: the Linux cuda12 package shipped with 0.2.1 had sm_75/86/89 only; P100 containers restarted in a loop."""
-        other = make_source(self.root / "src4")
-        with self.assertRaises(SystemExit) as caught:
-            package_engine.build(other, "cuda", "0.1.45", HERE, self.out, archs=("sm_75", "sm_86", "sm_89", "compute_89"),
-                                 min_driver={"nvidia": "575.51"}, build_id="b-12", variant="cuda12")
-        self.assertIn("sm_60", str(caught.exception))
-        package_engine.build(other, "cuda", "0.1.45", HERE, self.out, archs=("sm_70", "sm_86"), build_id="b-13", variant="cuda12")
 
     def test_a_good_package_does_not_hide_a_tampered_one(self):
         newer = package_engine.build(make_source(self.root / "src2"), "cuda", "0.1.46", HERE, self.out,

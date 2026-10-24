@@ -55,7 +55,7 @@ echo "{\"version\": \"$ver\", \"source\": \"packaging/build_sycl_linux.sh\", \"s
 # libsycl and the MKL SYCL libraries come through ldd; the Unified Runtime adapters (level zero, opencl) are dlopen'd, so they are named
 "$py" packaging/collect_libs.py --binary "$build/strata" --search "$oneapi/compiler/latest/lib" --search "$oneapi/mkl/latest/lib" \
     --also 'libur_adapter_level_zero*.so*' --also 'libur_adapter_opencl*.so*' --out "$stage"
-# RUNPATH $ORIGIN on the engine and on every bundled library (the same way packaging/build_hip_linux.sh does it)
+# RUNPATH $ORIGIN on the engine and on every bundled library
 for f in "$stage/strata" "$stage"/*.so "$stage"/*.so.*; do
   [ -f "$f" ] && [ ! -L "$f" ] && patchelf --set-rpath '$ORIGIN' "$f"
 done

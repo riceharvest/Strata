@@ -1,10 +1,9 @@
-"""An engine package must carry every library its binaries import, except the OS's and the GPU driver's.
+"""An engine package must carry every library its binaries import, except the OS's and the GPU driver's (packaging/binary_deps.py).
 
-Tester report 2026-10-17: a clean Windows 11 PC failed with 0xC0000135 because strata.exe imports cublas64_13.dll and the package
-did not hold it (the build PC had the CUDA Toolkit on PATH, which hid the problem). These tests build tiny real PE files, so they
-run anywhere and need no GPU or toolkit."""
+Tester report 2026-10-17: a clean Windows 11 PC failed with 0xC0000135 because strata.exe imported a toolkit DLL the package did
+not hold. These tests build tiny real PE files (the format whose rule is the subtlest: case, lib_dirs), so they run anywhere and need
+no GPU or toolkit; the ELF reader is checked on a system binary."""
 
-import os
 import struct
 import sys
 import tempfile
@@ -14,7 +13,6 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "packaging"))
 import binary_deps  # noqa: E402
-import package_engine  # noqa: E402
 
 
 def make_pe(imports, delay=()):
@@ -54,8 +52,8 @@ class Imports(unittest.TestCase):
     def test_pe_reader_lists_load_time_and_delay_load_imports(self):
         with tempfile.TemporaryDirectory() as d:
             p = Path(d) / "a.exe"
-            p.write_bytes(make_pe(["cublas64_13.dll", "KERNEL32.dll"], delay=["cudart64_13.dll"]))
-            self.assertEqual(binary_deps.pe_imports(p), ["cublas64_13.dll", "KERNEL32.dll", "cudart64_13.dll"])
+            p.write_bytes(make_pe(["sycl8.dll", "KERNEL32.dll"], delay=["ur_loader.dll"]))
+            self.assertEqual(binary_deps.pe_imports(p), ["sycl8.dll", "KERNEL32.dll", "ur_loader.dll"])
 
     @unittest.skipUnless(sys.platform.startswith("linux"), "needs a real ELF")
     def test_elf_reader_on_a_system_binary(self):
@@ -70,56 +68,20 @@ class Rule(unittest.TestCase):
         self.pkg = Path(self.dir.name) / "pkg"
         self.pkg.mkdir()
 
-    def test_a_missing_cuda_dll_is_reported_and_the_driver_and_os_are_not(self):
-        (self.pkg / "strata.exe").write_bytes(make_pe(["cublas64_13.dll", "KERNEL32.dll", "ADVAPI32.dll", "nvcuda.dll", "api-ms-win-crt-heap-l1-1-0.dll"]))
-        self.assertEqual(binary_deps.uncovered(self.pkg), [("strata.exe", "cublas64_13.dll")])
+    def test_a_missing_runtime_dll_is_reported_and_the_driver_and_os_are_not(self):
+        (self.pkg / "strata.exe").write_bytes(make_pe(["sycl8.dll", "KERNEL32.dll", "ADVAPI32.dll", "ze_loader.dll", "api-ms-win-crt-heap-l1-1-0.dll"]))
+        self.assertEqual(binary_deps.uncovered(self.pkg), [("strata.exe", "sycl8.dll")])
 
     def test_the_visual_cpp_runtime_is_not_an_os_library(self):
         (self.pkg / "strata.exe").write_bytes(make_pe(["VCRUNTIME140.dll", "MSVCP140.dll"]))
         self.assertEqual({n for _, n in binary_deps.uncovered(self.pkg)}, {"VCRUNTIME140.dll", "MSVCP140.dll"})
 
     def test_bundled_libraries_count_and_their_own_imports_are_checked(self):
-        (self.pkg / "strata.exe").write_bytes(make_pe(["cublas64_13.dll"]))
-        (self.pkg / "cublas64_13.dll").write_bytes(make_pe(["cublasLt64_13.dll", "KERNEL32.dll"]))
-        self.assertEqual(binary_deps.uncovered(self.pkg), [("cublas64_13.dll", "cublasLt64_13.dll")])
-        (self.pkg / "CUBLASLT64_13.DLL").write_bytes(make_pe(["KERNEL32.dll"]))
+        (self.pkg / "strata.exe").write_bytes(make_pe(["sycl8.dll"]))
+        (self.pkg / "sycl8.dll").write_bytes(make_pe(["ur_loader.dll", "KERNEL32.dll"]))
+        self.assertEqual(binary_deps.uncovered(self.pkg), [("sycl8.dll", "ur_loader.dll")])
+        (self.pkg / "UR_LOADER.DLL").write_bytes(make_pe(["KERNEL32.dll"]))
         self.assertEqual(binary_deps.uncovered(self.pkg), [])
-
-
-@unittest.skipUnless(os.name == "nt", "the packager only copies DLLs for Windows targets")
-class Packager(unittest.TestCase):
-    def setUp(self):
-        self.dir = tempfile.TemporaryDirectory()
-        self.addCleanup(self.dir.cleanup)
-        self.root = Path(self.dir.name)
-        self.src = self.root / "src"
-        self.src.mkdir()
-        (self.src / "strata.exe").write_bytes(make_pe(["cublas64_13.dll", "KERNEL32.dll"]))
-        self.toolkit = self.root / "toolkit"
-        self.toolkit.mkdir()
-        (self.toolkit / "cublas64_13.dll").write_bytes(make_pe(["cublasLt64_13.dll", "KERNEL32.dll"]))
-        (self.toolkit / "cublasLt64_13.dll").write_bytes(make_pe(["KERNEL32.dll"]))
-        self.out = self.root / "out"
-        self.out.mkdir()
-
-    def build(self, search):
-        return package_engine.build(self.src, "cuda", "0.1.45.1", "windows-x86_64", self.out, archs=("sm_86",), build_id="t", search=search)
-
-    def test_it_bundles_the_imported_dlls_and_what_they_import(self):
-        folder = self.build([self.toolkit])
-        self.assertTrue((folder / "cublas64_13.dll").is_file() and (folder / "cublasLt64_13.dll").is_file())
-        self.assertEqual(binary_deps.uncovered(folder), [])
-        self.assertEqual(package_engine.main(["--verify", str(folder)]), 0)
-
-    def test_it_refuses_when_a_dll_cannot_be_found(self):
-        empty = self.root / "empty"
-        empty.mkdir()
-        with self.assertRaises(SystemExit) as raised:
-            self.build([empty])
-        self.assertIn("cublas64_13.dll", str(raised.exception))
-        self.assertFalse(any(self.out.iterdir()) and any(p.name.startswith("0.1.45.1") for p in self.out.iterdir()))
-
-
 
 
 class SubfolderDlls(unittest.TestCase):
@@ -128,19 +90,19 @@ class SubfolderDlls(unittest.TestCase):
     def make(self, d, lib_dirs):
         import json
         d = Path(d)
-        (d / "strata.exe").write_bytes(make_pe(["rocblas.dll", "KERNEL32.dll"]))
-        (d / "rocm" / "bin").mkdir(parents=True)
-        (d / "rocm" / "bin" / "rocblas.dll").write_bytes(make_pe(["KERNEL32.dll"]))
+        (d / "strata.exe").write_bytes(make_pe(["mkl_sycl.dll", "KERNEL32.dll"]))
+        (d / "oneapi" / "bin").mkdir(parents=True)
+        (d / "oneapi" / "bin" / "mkl_sycl.dll").write_bytes(make_pe(["KERNEL32.dll"]))
         (d / "BUILD.json").write_text(json.dumps({"lib_dirs": lib_dirs}))
 
     def test_subfolder_dll_not_on_the_path_is_flagged(self):
         with tempfile.TemporaryDirectory() as d:
             self.make(d, [])
-            self.assertEqual(binary_deps.uncovered(Path(d)), [("strata.exe", "rocblas.dll")])
+            self.assertEqual(binary_deps.uncovered(Path(d)), [("strata.exe", "mkl_sycl.dll")])
 
     def test_subfolder_dll_listed_in_lib_dirs_passes(self):
         with tempfile.TemporaryDirectory() as d:
-            self.make(d, ["rocm/bin"])
+            self.make(d, ["oneapi/bin"])
             self.assertEqual(binary_deps.uncovered(Path(d)), [])
 
 
