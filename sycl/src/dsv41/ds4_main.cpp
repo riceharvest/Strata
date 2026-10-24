@@ -86,7 +86,7 @@ void usage() {
     std::fprintf(stderr,
                  "strata-dsv41 --pack <model>/pack [--gpus 0,1,...] [--max-context N] [--reserve-mib N]\n"
                  "           [--vram-experts F] [--cpu-threads N] [--expert-profile FILE|none] [--ssd-cache GB] [--ssd-policy lru|lfu|lfulru]\n"
-                 "           [--disk-skip-w F] [--disk-skip-from N] [--engram-cache-mb N] [--engram-threads N] [--no-expert-cache] [--verbose]\n"
+                 "           [--disk-skip-w F] [--disk-skip-from N] [--prune-experts N] [--engram-cache-mb N] [--engram-threads N] [--no-expert-cache] [--verbose]\n"
                  "           [--tp N] [--threads on|off] [--prefill-chunk N] [--dspark on|off|none|auto] [--dspark-block N] [--dspark-conf F]\n"
                  "           [--vision on|off] [--mmap-experts on|off|auto]\n"
                  "           (--ids I,J,... [--images FILE] [--n N] [--dump-logits FILE] | --serve\n"
@@ -1222,6 +1222,7 @@ int main(int argc, char** argv) {
         }
         else if (a == "--disk-skip-w") o.disk_skip_w = (float) std::atof(val("--disk-skip-w").c_str());
         else if (a == "--disk-skip-from") o.disk_skip_from = std::max(0, std::atoi(val("--disk-skip-from").c_str()));
+        else if (a == "--prune-experts") o.prune_experts = std::max(0, std::atoi(val("--prune-experts").c_str()));
         else if (a == "--engram-cache-mb") o.engram_cache_mb = std::max(0, std::atoi(val("--engram-cache-mb").c_str()));
         else if (a == "--engram-threads") o.engram_threads = std::max(1, std::atoi(val("--engram-threads").c_str()));
         else if (a == "--eos") eos = val("--eos");
@@ -1288,6 +1289,8 @@ int main(int argc, char** argv) {
         usage();
         return 2;
     }
+    if (o.prune_experts == 0 && std::getenv("STRATA_DS4_PRUNE_EXPERTS"))
+        o.prune_experts = std::max(0, std::atoi(std::getenv("STRATA_DS4_PRUNE_EXPERTS")));
     if (o.profile.empty()) o.profile = o.pack + "/expert-profile.bin";   // "none": no profile
     if (o.profile == "none") o.profile.clear();
     o.vision_only = !enc_rgb.empty();

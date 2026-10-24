@@ -142,6 +142,17 @@ class Fit(unittest.TestCase):
             self.assertEqual(r[-1][1], 39)
             self.assertTrue(all(a[1] + 1 == b[0] for a, b in zip(r, r[1:])))
 
+    def test_b70_pruned_plan_fits_in_ram(self):
+        b70 = {"name": "Intel Arc Pro B70", "vendor": "intel", "vram_gb": 32.0, "index": 0}
+        p = dsv41_fit.plan([b70], 64.0, 500.0, vendor="intel", model="IST-DAS-1.75bpw", prune_experts=160)
+        self.assertEqual(p["verdict"], "fits")
+        self.assertEqual(p["spill_gb"], 0.0)
+        self.assertIn("--prune-experts", p["args"])
+        self.assertIn("160", p["args"])
+        self.assertNotIn("--ssd-cache", p["args"])
+        opts = dsv41_fit.options([b70], 64.0, vendor="intel", model="IST-DAS-1.75bpw")
+        self.assertTrue(any(o["key"] == "pruned160" for o in opts["options"]))
+
     def test_options_like_gpu_fit(self):
         o = dsv41_fit.options(FOUR, 251.0, "amd")
         self.assertEqual(o["recommended"], "all")
