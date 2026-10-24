@@ -131,17 +131,13 @@ def source_ok(src: Path) -> bool:
         and (Path(src) / "ggml" / "CMakeLists.txt").is_file()
 
 
-NATIVE_BACKENDS = ()       # setup.py's build_image_engine still asks; no build here carries the CUDA/HIP-only native DiT runner
-
-
 def build_stamp(backend: str, arch) -> dict:
     return {"sd_cpp": SD_CPP_COMMIT, "ggml": SD_GGML_COMMIT, "backend": backend, "arch": str(arch or "")}
 
 
 def image_config(backend: str, quant: str, exe: Path, models_dir: Path, *, uma: bool = False, gpu=None,
-                 lib_dirs=(), policy: str = "auto", native: bool = False) -> dict:
-    """The run config's "images" section (serve/images.py reads it).  `native` is accepted and ignored: the native DiT runner was a
-    CUDA/HIP build."""
+                 lib_dirs=(), policy: str = "auto") -> dict:
+    """The run config's "images" section (serve/images.py reads it)."""
     cfg = {"model_name": "qwen-image-2.1-turbo", "exe": str(exe), "backend": backend, "quant": quant,
            "diffusion_model": str(local_path(models_dir, quant)), "vae": str(local_path(models_dir, "vae")),
            "llm": str(local_path(models_dir, "llm")), "args": default_args(backend), "gpu_policy": policy,

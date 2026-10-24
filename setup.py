@@ -2794,24 +2794,12 @@ def vulkan_sdk() -> Path | None:
     return sdk
 
 
-def apply_native_runner(src: Path) -> None:
-    """I2: tools/image/sdcpp_native's runner into the stable-diffusion.cpp source (idempotent)."""
-    import importlib.util
-    QI = _qimage()
-    spec = importlib.util.spec_from_file_location("strata_sdcpp_native_apply", QI.NATIVE_DIR / "apply.py")
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    mod.apply(src)
-
-
 def build_image_engine(backend: str, gpu: dict) -> tuple[Path, list[str]]:
     """Compile sd-cli for `backend` into engine-image/ (again only when the pins or the backend changed) -> (its path,
     the library folders it runs with)."""
     QI = _qimage()
     IMAGE_ENGINE.mkdir(exist_ok=True)
     exe, stamp = IMAGE_ENGINE / QI.SD_EXE, IMAGE_ENGINE / "BUILD.json"
-    if backend in ("cuda", "hip"):
-        fail(f"this Strata has no {backend.upper()} build of the image generator", "use --image-backend vulkan (or cpu)")
     want = QI.build_stamp(backend, None)
     meta = json.loads(stamp.read_text(encoding="utf-8")) if stamp.exists() else {}
     lib_dirs = [d for d in meta.get("lib_dirs") or [] if Path(d).is_dir()]
@@ -2819,8 +2807,6 @@ def build_image_engine(backend: str, gpu: dict) -> tuple[Path, list[str]]:
         ok(f"image generator already built ({backend})")
         return exe, lib_dirs
     src = get_sd_cpp()
-    if backend in QI.NATIVE_BACKENDS:                 # Strata's DiT runner (inert unless the config asks for it)
-        apply_native_runner(src)
     lib_dirs = []
     if backend == "vulkan":
         sdk = vulkan_sdk()
@@ -2883,7 +2869,7 @@ def setup_images(a, gpu: dict, hip: bool, models_dir: Path) -> dict | None:
         download(QI.file_url(name, hf_endpoint()), dst, f"image model: {Path(path).name}")
         verify_sha256(dst, size, sha)
     cfg = QI.image_config(backend, quant, exe, models_dir, uma=QI.is_apu(gpu), lib_dirs=lib_dirs,
-                          policy=a.image_gpu_policy or "auto", native=getattr(a, "image_native", None) == "on")
+                          policy=a.image_gpu_policy or "auto")
     ok(f"image generation: {quant} on {backend}, GPU policy {cfg['gpu_policy']}")
     return cfg
 
@@ -4585,7 +4571,7 @@ def get_dsv41_engine(eng: Path, hip: bool, package: str | None = None) -> Path |
     hw = None
     if hip:
         from strata_control import updater
-        hw = {**updater.detect_hardware(), "backend": "hip", "backend_source": "requested"}
+        hw = {**updater.detect_hardware(), "backend": "sycl", "backend_source": "requested"}
     exe = dsv41_engine.install(root, source, hardware=hw, emit=lambda m: say("  " + m))
     if exe is None:
         warn("no DeepSeek engine package could be fetched (see above)")
@@ -4986,9 +4972,7 @@ def main() -> int:
                     help=argparse.SUPPRESS)
     ap.add_argument("--image-quant", choices=["Q4_K_M", "Q6_K", "Q8_0"],
                     help=argparse.SUPPRESS)
-    ap.add_argument("--image-backend", choices=["cuda", "hip", "vulkan", "cpu"],
-                    help=argparse.SUPPRESS)
-    ap.add_argument("--image-native", choices=["on", "off"],
+    ap.add_argument("--image-backend", choices=["vulkan", "cpu"],
                     help=argparse.SUPPRESS)
     ap.add_argument("--image-gpu-policy", choices=["auto", "keep", "shrink", "unload"],
                     help=argparse.SUPPRESS)
