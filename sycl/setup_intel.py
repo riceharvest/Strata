@@ -78,11 +78,6 @@ def intel_gpus():
             if driver != "xe":                          # i915 without a known Arc id is an integrated GPU
                 continue
             name = f"Intel GPU {devid} (xe)"
-        if not vram:
-            try:
-                vram = int((dev / "mem_info_vram_total").read_text().strip()) / 2**30
-            except (OSError, ValueError):
-                vram = 0.0
         if not vram:                                    # resource line 2 (BAR 2) is the VRAM aperture on xe cards
             try:
                 start, end, _ = (dev / "resource").read_text().splitlines()[2].split()
@@ -163,8 +158,9 @@ def is_b_series(driver: str, devid: str = "") -> bool:
     return driver != "i915" and devid not in ALCHEMIST_IDS
 
 
-B_SERIES_LINE = ("Intel Arc B-series (Battlemage / Arc Pro B70) text generation is natively tuned for Xe2 ESIMD DPAS and USM host expert mirroring. "
-                 "If a picture request fails on the xe kernel driver, run again with --vision no to turn pictures off.")
+B_SERIES_LINE = ("This Intel Arc B-series card is new to Strata and we have not tested it ourselves, so pictures and long answers may fail on it. "
+                 "If something fails, run again with --vision no to turn pictures off, and tell us at https://github.com/Niko1221/Strata/issues "
+                 "(say it is a B-series card and attach the engine log).")
 
 
 READER_DIR = ROOT / "engine-sycl"    # the folder setup treats as the engine's: BUILD.json and, for pictures, the CPU reader strata-vision
@@ -390,10 +386,6 @@ def to_sycl(cfg: dict, exe: Path, ram: float, keep: dict, vram_gb: float = 0.0, 
         # first launch - "'double' is not supported in ... device", the engine dies on the first request with a
         # temperature - unless the driver emulates it (docs/INTEL.md)
         env.update({"IGC_EnableDPEmulation": "1", "OverrideDefaultFP64Settings": "1", "NEOReadDebugKeys": "1"})
-    elif is_b_series(driver, devid):
-        env.setdefault("STRATA_VERIFY_DEVICE_PLAN", "1")
-        env.setdefault("STRATA_VERIFY_NO_HOST", "1")
-        env.setdefault("STRATA_STAGER_THREADS", "12")
     if exe != ROOT / "build-sycl-aot" / "strata":
         env["STRATA_SYCL_BIN"] = exe.relative_to(ROOT).as_posix()
     if MOUNT.resolve() != ROOT.parent.resolve():
