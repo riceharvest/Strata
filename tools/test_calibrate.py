@@ -328,13 +328,14 @@ class SetupIntegration(unittest.TestCase):
         os.environ["XDG_CONFIG_HOME"] = self.tmp.name
         import setup as S
         self.S = S
-        self.saved = (S.gpu_info, S.cpu_info, S.ram_gb, CAL.run)
-        S.gpu_info = lambda pick=None: {"name": "RTX Test", "vram_gb": 12.0, "arch": "120", "count": 1, "index": 0}
+        self.saved = (S.amd_gpus, S.cpu_info, S.ram_gb, CAL.run)
+        # the card list sycl/setup_intel.py hands setup (through amd_gpus)
+        S.amd_gpus = lambda *a, **k: [{"index": 0, "name": "Arc Pro B70", "vram_gb": 32.0, "arch": "xe"}]
         S.cpu_info = lambda: ("Test CPU", True, True)
         S.ram_gb = lambda: 64.0
 
     def tearDown(self):
-        self.S.gpu_info, self.S.cpu_info, self.S.ram_gb, CAL.run = self.saved
+        self.S.amd_gpus, self.S.cpu_info, self.S.ram_gb, CAL.run = self.saved
         for k, v in self.old.items():
             if v is None:
                 os.environ.pop(k, None)
@@ -406,8 +407,8 @@ class SetupIntegration(unittest.TestCase):
         out = io.StringIO()
         with mock.patch.object(self.S, "ROOT", Path(self.tmp.name)), \
                 mock.patch.object(self.S, "data_folder", lambda d, *a, **k: (Path(self.tmp.name) / "data", [])), \
-                mock.patch.object(self.S, "update_installed_engine", lambda *a: None), \
-                mock.patch.object(sys, "argv", ["setup.py", "--calibrate", "--no-start"]), \
+                mock.patch.object(self.S, "sycl_setup", side_effect=AssertionError("ran the Intel setup")), \
+                mock.patch.object(sys, "argv", ["setup.py", "--backend", "hip", "--calibrate", "--no-start"]), \
                 contextlib.redirect_stdout(out):
             self.assertEqual(self.S.main(), 0)
         self.assertIn("this PC is NOT tuned: the tuning failed (the reason is above); the model keeps the default "

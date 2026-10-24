@@ -33,10 +33,10 @@ class PictureDefaults(unittest.TestCase):
                         setup.WIN = old
 
     def test_yes_means_pictures_on_for_qwen_swift_and_coder(self):
-        """setup --yes (and Enter at the question) on the original Flash-Next, Swift and Coder files: pictures on, the reader by the 24 GB rule,
-        and no VRAM reserve for the CPU reader."""
+        """setup --yes (and Enter at the question) on the original Flash-Next, Swift and Coder files: pictures on, and on an Intel Arc the CPU
+        reader at every size (sycl/setup_intel.py, intel_vision: --vision gpu asks for the card's), so no VRAM reserve."""
         from test_setup_golden import PROFILES, install
-        for key, gpu in (("64GB-1x32GB", True), ("96GB-1x16GB", False)):          # 31.8 GB: the GPU reader; 15.9 GB: the CPU reader
+        for key, gpu in (("64GB-1x32GB", False), ("96GB-1x16GB", False)):
             ram, found = PROFILES[key]
             for fam, model in (("qwen", "Q2_0"), ("swift", "IQ3_S"), ("coder", "IQ1_M")):
                 for answers in (None, ""):

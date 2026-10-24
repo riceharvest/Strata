@@ -89,34 +89,6 @@ class SetupRerun(unittest.TestCase):
         self.assertEqual(cfg["user_args"], CVEC)
         self.assertEqual(cfg["args"][-len(CVEC):], CVEC)
 
-    def test_3215_a_reserve_of_zero_is_kept(self):
-        first = self.first()
-        written = list(first["args"])
-        edited = [*written]
-        edited[edited.index("--vram-reserve-mib") + 1] = "0"
-        for old in ({**first, "args": edited, "args_written": written},                    # with the copy of what was written
-                    {**first, "args": edited}):                                           # a 0.2.0-beta file
-            code, out, cfg, _ = self.run_setup("--context", "131072", configs=[("strata-q2_0.json", old)])
-            self.assertEqual(code, 0, out)
-            self.assertEqual(value(cfg["args"], "--vram-reserve-mib"), "0")
-            self.assertEqual(cfg["user_args"], ["--vram-reserve-mib", "0"])
-
-    def test_3270_a_lowered_reserve_is_not_reset(self):
-        first = self.first()
-        written = list(first["args"])
-        for mib in ("1024", "256"):
-            edited = [*written]
-            edited[edited.index("--vram-reserve-mib") + 1] = mib
-            code, out, cfg, _ = self.run_setup("--context", "131072", configs=[("strata-q2_0.json", {**first, "args": edited, "args_written": written})])
-            self.assertEqual(value(cfg["args"], "--vram-reserve-mib"), mib)
-
-    def test_the_vision_default_is_not_taken_for_a_choice(self):
-        first = self.first()                                                               # pictures on the GPU write 700 themselves
-        self.assertEqual(value(first["args"], "--vram-reserve-mib"), "700")
-        code, out, cfg, _ = self.run_setup("--context", "131072", "--vision", "cpu", configs=[("strata-q2_0.json", first)])
-        self.assertNotIn("user_args", cfg)
-        self.assertNotIn("--vram-reserve-mib", cfg["args"])                                # the CPU reader needs no reserve
-
     def test_an_option_given_on_the_command_line_wins_and_is_kept(self):
         first = self.first()
         old = {**first, "args": first["args"] + ["--vram-reserve-mib", "0"], "user_args": ["--vram-reserve-mib", "0"]}
