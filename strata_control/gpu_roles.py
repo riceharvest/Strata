@@ -20,7 +20,7 @@ from strata_control import gpu_fit
 
 ROLES = ("main", "helper", "off")
 OFF_AT_OR_BELOW_GB = 8.0          # owner rule: a card with 8 GB or less starts Off (it is not a helper unless the person turns it on)
-SAME_SPEED = 1.05                 # serve/server.py ordered_gpus: cards within 5% of each other are the same card
+SAME_SPEED = 1.05                 # cards within 5% of each other are the same card
 MEMORY_GUARD_SPEED = 0.5          # a card with more memory takes Main from a faster one only when it is at least half as fast (#1576)
 
 CPU_ONLY_LINE = "Performance is degraded on CPU only."
