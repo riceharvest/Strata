@@ -15,7 +15,6 @@ import json
 import os
 import platform
 import re
-import shutil
 import subprocess
 import sys
 import time
@@ -76,45 +75,9 @@ def _run(argv: list[str], timeout: float = 10.0) -> str | None:
 
 def gpus() -> list[dict[str, Any]]:
     """Graphics cards with their memory: ``name``, ``vram_total_mib``, ``vram_used_mib`` (None when unreadable),
-    ``driver``, ``vendor``. NVIDIA through nvidia-smi, AMD through the kernel's sysfs files; Intel and Apple report
-    their name only where it is known, and leave the memory unreadable."""
-    out: list[dict[str, Any]] = []
-    smi = shutil.which("nvidia-smi")
-    if smi:
-        text = _run([smi, "--query-gpu=index,name,memory.total,memory.used,driver_version",
-                     "--format=csv,noheader,nounits"])
-        for line in (text or "").splitlines():
-            parts = [p.strip() for p in line.split(",")]
-            if len(parts) >= 5:
-                try:
-                    out.append({"vendor": "nvidia", "index": int(parts[0]), "name": parts[1],
-                                "vram_total_mib": int(float(parts[2])), "vram_used_mib": int(float(parts[3])),
-                                "driver": parts[4]})
-                except ValueError:
-                    continue
-    if not out and sys.platform.startswith("linux"):
-        base = Path("/sys/class/drm")
-        if base.is_dir():
-            index = 0
-            for card in sorted(base.glob("card[0-9]*")):
-                dev = card / "device"
-                try:
-                    vendor = (dev / "vendor").read_text().strip()
-                    total = int((dev / "mem_info_vram_total").read_text()) // MIB
-                    used = int((dev / "mem_info_vram_used").read_text()) // MIB
-                except (OSError, ValueError):
-                    continue
-                if vendor != "0x1002":
-                    continue
-                name = None
-                try:
-                    name = (dev / "product_name").read_text().strip()
-                except OSError:
-                    pass
-                out.append({"vendor": "amd", "index": index, "name": name or f"AMD GPU {index}",
-                            "vram_total_mib": total, "vram_used_mib": used, "driver": None})
-                index += 1
-    return out
+    ``driver``, ``vendor``.  There is no reader here for the Intel Arc (xe keeps its VRAM accounting per client, root
+    only; the server's Monitor reads it through sycl/serve/xe_telemetry.py), so the list is empty."""
+    return []
 
 
 def gpu_used_mib(indexes: list[int] | None = None) -> int | None:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import threading
 import unittest
+from unittest import mock
 
 from strata_control import autotune, tune_knobs
 from strata_control.tune_session import StartFailed
@@ -15,8 +16,22 @@ BASE = ["--pack", "P", "--native", "m.gguf", "--expert-cache", "auto", "--prefil
         "--vram-reserve-mib", "1536"]
 
 
+#: A test arm: one exact single-knob candidate the stub engine's speed can depend on (the shipped SYCL list holds only
+#: placement-dependent arms, which an exact-only run never tries).
+TEST_ARMS = tune_knobs.ARMS + (
+    tune_knobs.Arm("kv_resident_64k", "Keep more of the conversation in graphics memory", "exact", {"--kv-resident": 65536},
+                   classes=("G",), needs=("ctx_ge_128k",)),
+)
+
+
+def setUpModule():
+    patcher = mock.patch.object(tune_knobs, "ARMS", TEST_ARMS)
+    patcher.start()
+    unittest.addModuleCleanup(patcher.stop)
+
+
 def make_ctx(**kw):
-    ctx = tune_knobs.Context(backend="cuda", family="flash-next", gpu_count=1, vram_mib=12000, ram_gib=64, model_gib=60.0,
+    ctx = tune_knobs.Context(backend="sycl", family="flash-next", gpu_count=1, vram_mib=12000, ram_gib=64, model_gib=60.0,
                              context_tokens=131072, base_args=list(BASE), logical_threads=12, **kw)
     ctx.facts = {"workers": 6, "slots": 3000}
     return ctx
@@ -57,11 +72,10 @@ def run_tuner(model, *, opts=None, ctx=None, clock=None, session_kw=None, cancel
 
 class RulesTest(unittest.TestCase):
     def test_never_list(self):
-        ctx = make_ctx(arch="gfx1201")
+        ctx = make_ctx()
         bad = [({"--expert-cache": 0}, {}), ({"--kv-resident": 20480}, {}), ({"--pcie-frac": 0.75}, {}),
                ({"--spec": 6}, {}), ({"--spec": 2}, {}), ({"--lookup-chain": 4}, {}), ({"--adapt-every": 100000}, {}),
-               ({"--prefill": 512}, {}), ({"--ple-io": "ram"}, {}), ({}, {"STRATA_SH_STREAM": "1"}),
-               ({}, {"STRATA_RDNA2_SGEMM": "all"}), ({}, {"STRATA_HIP_WMMA": "1"}), ({"--pool-workers": 8}, {})]
+               ({"--prefill": 512}, {}), ({"--ple-io": "ram"}, {}), ({"--pool-workers": 8}, {})]
         for args, env in bad:
             self.assertTrue(tune_knobs.check_setting(args, env, ctx), (args, env))
         ok = [({"--spec": 3}, {}), ({"--kv-resident": 65536}, {}), ({"--pool-workers": 4}, {}), ({"--prefill": "auto:32768"}, {}),
@@ -80,68 +94,18 @@ class RulesTest(unittest.TestCase):
         self.assertTrue(tune_knobs.check_setting({"--kv-resident": 20480}, {}, short))     # -29.5% at 32K
         self.assertEqual(tune_knobs.check_setting({"--kv-resident": 65536}, {}, make_ctx_small()), [])   # above the context: no streaming at all
 
-    def test_long_context_candidates_exist_and_are_exact(self):
-        ctx = make_ctx()
-        ctx.vram_mib = 32624                            # the R9700: class B
-        ctx.facts = {"workers": 31}
-        arms, _ = tune_knobs.plan_arms(ctx, mode="quick")
-        ids = [p.arm.id for p in arms]
-        self.assertEqual(ids[:2], ["kv_resident_64k", "prefill_32k"])
-        self.assertTrue(all(p.arm.answer == "exact" for p in arms))
-        short = make_ctx()
-        short.vram_mib = 32624
-        short.context_tokens = 32768
-        short.base_args = ["--max-context", "32768"]
-        self.assertNotIn("kv_resident_64k", [p.arm.id for p in tune_knobs.plan_arms(short, mode="quick")[0]])
-
-    def test_a_prompt_knob_is_judged_on_prompt_speed_and_may_not_cost_decode(self):
-        ctx = make_ctx()
-        ctx.vram_mib = 32624
-        def pp(args, env):
-            return 1500.0 * (1.06 if flag(args, "--prefill") == "auto:32768" else 1.0)
-        # decode unchanged, long prompt +6%: wins on the prompt metric
-        clock = FakeClock()
-        sess = StubSession(model=lambda a, e, tune=None: 60.0, pp=pp, clock=clock, noise=0.001)
-        t = autotune.Tuner(sess, BASE, {}, ctx, autotune.Options(budget_s=3600), clock=clock, sleep=clock.sleep, system=sess.system,
-                           total_ram_mib=64000, total_vram_mib=32000, quiet=lambda: None)
-        r = t.run()
-        self.assertEqual(r.settings["args"], {"--prefill": "auto:32768"}, r.notes)
-        # the same prompt gain with a 6% decode loss does not
-        sess2 = StubSession(model=lambda a, e, tune=None: 60.0 * (0.94 if flag(a, "--prefill") == "auto:32768" else 1.0), pp=pp, clock=FakeClock(), noise=0.001)
-        c2 = sess2.clock
-        t2 = autotune.Tuner(sess2, BASE, {}, ctx, autotune.Options(budget_s=3600), clock=c2, sleep=c2.sleep, system=sess2.system,
-                            total_ram_mib=64000, total_vram_mib=32000, quiet=lambda: None)
-        self.assertEqual(t2.run().settings["args"], {})
-
-    def test_only_the_best_single_knob_is_kept(self):
-        ctx = make_ctx()
-        ctx.vram_mib = 32624
-        model = speed_with({("--kv-resident", "65536"): 1.06})
-        pp = lambda a, e: 1500.0 * (1.07 if flag(a, "--prefill") == "auto:32768" else 1.0)
-        clock = FakeClock()
-        sess = StubSession(model=model, pp=pp, clock=clock, noise=0.001)
-        t = autotune.Tuner(sess, BASE, {}, ctx, autotune.Options(budget_s=3600), clock=clock, sleep=clock.sleep, system=sess.system,
-                           total_ram_mib=64000, total_vram_mib=32000, quiet=lambda: None)
-        r = t.run()
-        self.assertEqual(len(r.settings["args"]), 1)
-        self.assertTrue(any("only the best one" in n for n in r.notes))
-
     def test_a_box_whose_default_is_not_repeatable_says_so(self):
-        ctx = make_ctx()
-        self.assertFalse(tune_knobs.default_unsteady(ctx))
-        ctx.facts = {"workers": 6, "resident_ram": True}            # the RTX 3060 in resident-RAM mode
-        self.assertTrue(tune_knobs.default_unsteady(ctx))
-        sy = make_ctx()
-        sy.backend = "sycl"
-        self.assertTrue(tune_knobs.default_unsteady(sy))
+        self.assertTrue(tune_knobs.default_unsteady(make_ctx()))      # SYCL: the setup default itself is not repeatable
+        cpu = make_ctx()
+        cpu.backend = "cpu"
+        self.assertFalse(tune_knobs.default_unsteady(cpu))
+        cpu.facts = {"workers": 6, "resident_ram": True}             # the low-RAM resident mode
+        self.assertTrue(tune_knobs.default_unsteady(cpu))
         from strata_control import presets
         steady = {"answers": {"class": "exact", "default_repeatable": True}}
         unsteady = {"answers": {"class": "exact", "default_repeatable": False}}
         self.assertIn("identical", presets.notice(steady))
         self.assertIn("even with the standard setup", presets.notice(unsteady))
-        # the class of the knob does not change: exact knobs are still auto-picked there, nonrepeatable ones stay behind their switch
-        ids = [p.arm.id for p in tune_knobs.plan_arms(ctx, mode="quick")[0]]
-        self.assertNotIn("adapt_async", ids)
 
     def test_hybrid_cpu_affinity_never(self):
         ctx = make_ctx()
@@ -168,15 +132,9 @@ class RulesTest(unittest.TestCase):
             self.assertEqual(tune_knobs.check_setting(p.args, p.env, ctx), [])
 
     def test_answer_changing_arms_need_the_users_tick(self):
-        ctx = make_ctx()
-        ids = {p.arm.id for p in tune_knobs.plan_arms(ctx, mode="thorough")[0]}
-        self.assertNotIn("spec3", ids)
-        self.assertNotIn("adapt_async", ids)
-        ctx2 = make_ctx(allow_placement=True)
-        self.assertIn("spec3", {p.arm.id for p in tune_knobs.plan_arms(ctx2, mode="thorough")[0]})
-        ctx3 = make_ctx(allow_nonrepeatable=True)
-        ctx3.facts = {"workers": 6, "resident_ram": True}
-        self.assertIn("adapt_async", {p.arm.id for p in tune_knobs.plan_arms(ctx3, mode="thorough")[0]})
+        ids = {p.arm.id for p in tune_knobs.plan_arms(make_ctx(), mode="thorough")[0]}
+        self.assertNotIn("pcie_start_02", ids)
+        self.assertIn("pcie_start_02", {p.arm.id for p in tune_knobs.plan_arms(make_ctx(allow_placement=True), mode="thorough")[0]})
 
     def test_engine_without_a_flag_drops_the_arm_with_a_reason(self):
         ctx = make_ctx()
@@ -185,17 +143,11 @@ class RulesTest(unittest.TestCase):
         self.assertFalse(any(p.arm.id == "kv_resident_64k" for p in arms))
         self.assertTrue(any("does not accept" in s["reason"] for s in skipped))
 
-    def test_qwen36_and_sycl_lists(self):
-        q = make_ctx()
-        q.family = "qwen36"
-        q.facts = {"workers": 6, "hybrid_experts": True}
-        ids = [p.arm.id for p in tune_knobs.plan_arms(q, mode="thorough")[0]]
-        self.assertIn("q36_workers_explicit", ids)
-        self.assertNotIn("kv_resident_64k", ids)
+    def test_the_sycl_list(self):
         s = make_ctx(allow_placement=True)
-        s.backend = "sycl"
-        ids = [p.arm.id for p in tune_knobs.plan_arms(s, mode="thorough")[0]]
-        self.assertEqual(set(ids) - {"adapt_decay_09", "pcie_start_02"}, set())
+        with mock.patch.object(tune_knobs, "ARMS", TEST_ARMS[:-1]):      # the shipped list
+            ids = [p.arm.id for p in tune_knobs.plan_arms(s, mode="thorough")[0]]
+        self.assertEqual(set(ids), {"adapt_decay_09", "pcie_start_02"})
 
     def test_workers_arm_never_goes_below_a_quarter(self):
         c = make_ctx()

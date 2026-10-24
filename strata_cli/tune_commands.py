@@ -218,11 +218,6 @@ def auto(a: argparse.Namespace) -> int:
     session = WorkerSession(base_config=cfg, python=sys.executable, serve_dir=_serve_dir(a), workdir=workdir,
                             boot_timeout_s=a.boot_timeout, lock=_lock_factory(a, say), log=say)
     base_args = [str(x) for x in cfg.get("args") or []]
-    # the wish becomes part of the base: leave-room asks the engine for the reserve if the configuration has none yet
-    if goal == "room" and reserve and "--vram-reserve-mib" not in base_args and ctx.family == "flash-next" \
-            and backend in ("cuda", "hip") and (flags is None or "--vram-reserve-mib" in flags):
-        base_args += ["--vram-reserve-mib", str(reserve)]
-        ctx.base_args = list(base_args)
     tuner = autotune.Tuner(session, base_args, dict(cfg.get("env") or {}), ctx, opts, progress=progress, cancel=cancel,
                            history_bad=bad, quiet=None)
     say(f"Tuning {presets.choices_from_config(cfg).get('model')} ({a.mode}); engine {exe}")

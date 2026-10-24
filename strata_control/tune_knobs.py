@@ -62,7 +62,7 @@ class Arm:
     set_args: dict[str, Any] = field(default_factory=dict)   # flag -> value | True (present) | None (remove)
     env: dict[str, str | None] = field(default_factory=dict)
     families: tuple[str, ...] = ("flash-next",)
-    backends: tuple[str, ...] = ("cuda", "hip")
+    backends: tuple[str, ...] = ("sycl",)
     classes: tuple[str, ...] = ()                # machine classes (6.2) whose list this arm is on
     needs: tuple[str, ...] = ()                  # machine facts that must hold, see `condition_holds`
     goals: tuple[str, ...] = ("speed", "coding", "chat", "room")
@@ -78,57 +78,23 @@ class Arm:
 
 
 ARMS: tuple[Arm, ...] = (
-    # --- long contexts (spec 4.3, 3.3): exact, measured +5.4% decode (5/5) at 128K on the R9700 --------------------------------
-    Arm("kv_resident_64k", "Keep more of the conversation in graphics memory", "exact", {"--kv-resident": 65536},
-        classes=("A", "B", "C"), backends=("cuda", "hip"), needs=("ctx_ge_128k",)),
-    # --- prompt speed: the chunk size is exact (10/10) and costs no decode speed on a card with VRAM to spare ------------------
-    Arm("prefill_32k", "Larger prompt chunks (faster very long prompts)", "exact", {"--prefill": "auto:32768"},
-        classes=("B",), goals=("coding", "chat"), ram_delta_mib=4096, needs=("vram_ge_24g", "long_prompts"), metric="prompt"),
-    # --- class A: RAM-bound resident mode (RTX 3060 / 46 GB): the one measured gain is adapt-async, behind its own switch ------
-    Arm("adapt_async", "Learn which experts to keep while you chat, in the background", "nonrepeatable",
-        {"--adapt-async": 1}, backends=("cuda",), classes=("A",), needs=("resident_ram", "one_gpu")),
     # --- placement-dependent (behind the owner's switch for answers that may differ slightly) ---------------------------------
-    Arm("adapt_tier_fast", "Re-balance the expert cache faster", "placement",
-        {"--adapt-every": 1, "--adapt-swaps": 80, "--adapt-decay": 0.97}, classes=("B", "C")),
     Arm("adapt_decay_09", "Forget old expert use a little faster", "placement", {"--adapt-decay": 0.9},
-        classes=("B", "C", "G"), backends=("cuda", "hip", "sycl")),
-    Arm("spec3", "Shorter speculative window (3 tokens)", "placement", {"--spec": 3}, classes=("A", "B")),
-    # --- class C: mid graphics memory, PCIe-bound -------------------------------------------------------------------------------
-    Arm("trim_stage", "Trim stage weights on two cards", "exact", {"--trim-stage-weights": True},
-        backends=("cuda",), classes=("C",), needs=("two_gpus",)),
+        classes=("B", "C", "G")),
     # --- class G: Intel Arc (SYCL): +5.5% (5/5, twice) ------------------------------------------------------------------------
-    Arm("pcie_start_02", "Start with a smaller PCIe share", "placement", {"--pcie-frac": 0.2},
-        backends=("sycl",), classes=("G",)),
-    # --- Qwen3.6 hybrid (class D): exact while the experts fit the card, placement-dependent when CPU experts take part ------
-    Arm("q36_workers_explicit", "Fix the CPU helper thread count", "exact", {}, families=("qwen36",),
-        backends=("cuda", "hip"), classes=("D",), dynamic={"--pool-workers": "workers"}, needs=("hybrid_experts",)),
-    Arm("q36_mtp1", "Shorter draft window (1)", "placement", {"--mtp": 1}, families=("qwen36",),
-        backends=("cuda", "hip"), classes=("D",), needs=("hybrid_experts",)),
-    Arm("q36_prefill_4096", "Larger prompt chunks (twice the prompt speed, a little slower answers)", "placement",
-        {"--prefill": 4096}, families=("qwen36",), backends=("cuda", "hip"), classes=("D",), goals=("coding",),
-        needs=("hybrid_experts",)),
-    Arm("q36_hybrid_rows_256", "Larger hybrid row blocks", "placement", {"--hybrid-rows": 256}, families=("qwen36",),
-        backends=("cuda", "hip"), classes=("D",), needs=("hybrid_experts",), deep_only=True),
+    Arm("pcie_start_02", "Start with a smaller PCIe share", "placement", {"--pcie-frac": 0.2}, classes=("G",)),
     # --- thorough only: measured as no effect (spec 4.2-4.4), tried last ------------------------------------------------------
-    Arm("pin_by_need", "Pin memory only when needed", "exact", {}, {"STRATA_PIN_BY_NEED": "1"},
-        backends=("cuda",), classes=("C",), needs=("one_gpu",), deep_only=True),
-    Arm("host_core_last", "Run the control thread on the last CPU core", "exact", {"--host-core": "last"},
-        classes=("B", "C"), deep_only=True),
-    Arm("workers_minus1", "One fewer CPU helper thread", "exact", {}, classes=("F",),
-        dynamic={"--pool-workers": "workers-1"}, needs=("hybrid_cpu",), deep_only=True),
     Arm("kv_grow", "Allocate the conversation memory as it grows", "exact", {"--kv-grow": True},
-        classes=("B", "C"), backends=("cuda", "hip", "sycl"), deep_only=True),
+        classes=("B", "C"), deep_only=True),
 )
 
 #: The per-request settings (3.1, 4.1). They need no restart, so every one is tried before any restart (5).
 #: `values` are tried against the engine's own choice (absent); a win needs >= 3% in every round.
 PER_REQUEST: tuple[dict[str, Any], ...] = (
-    {"key": "pcie_frac", "values": (0.2, 0.35, 0.0), "backends": ("cuda", "hip", "sycl"),
+    {"key": "pcie_frac", "values": (0.2, 0.35, 0.0), "backends": ("sycl",),
      "label": "PCIe share", "answer": "placement"},
-    {"key": "spec_min_p", "values": (0.7, 0.5), "backends": ("cuda", "hip", "sycl", "metal"),
+    {"key": "spec_min_p", "values": (0.7, 0.5), "backends": ("sycl",),
      "label": "speculative confidence floor", "answer": "exact"},
-    {"key": "aux_cpus", "values": (1, 0), "backends": ("cuda", "hip"), "label": "spare CPU cores for helper threads",
-     "answer": "exact"},
 )
 
 # --------------------------------------------------------------------------- bounds and the never list
@@ -151,10 +117,7 @@ BOUNDS: dict[str, dict[str, Any]] = {
 #: The never-pick list (4.5), as rows: ``flag`` (or ``env``), a condition on the machine, the value test and the reason
 #: in plain words. ``when`` names facts from `condition_holds`; empty = always.
 NEVER: tuple[dict[str, Any], ...] = (
-    {"env": "STRATA_SH_STREAM", "when": ("gfx12",), "reason": "it halves decode speed on this graphics card"},
-    {"env": "STRATA_RDNA2_SGEMM", "value": "all", "when": ("gfx12",), "reason": "it makes long prompts five times slower"},
     {"env": "STRATA_SELECT_SIMT", "reason": "its gain is below the 3% margin"},
-    {"env": "STRATA_HIP_WMMA", "reason": "it changes the numbers (a quality setting)"},
     {"flag": "--pool-affinity", "when": ("hybrid_cpu",), "values": ("auto", "p-cores"),
      "reason": "it made answers 47% slower on a CPU with performance and efficiency cores"},
     {"flag": "--pool-workers", "test": "above_engine_default", "reason": "more helper threads than the engine chose made it 36% slower"},
@@ -190,7 +153,7 @@ ANSWER_OF_FLAG: dict[str, str] = {
 class Context:
     """The machine and the choices a candidate plan is made for."""
 
-    backend: str = "cuda"                 # cuda | hip | sycl | metal | cpu
+    backend: str = "sycl"                 # sycl | cpu
     family: str = "flash-next"            # flash-next | qwen36
     gpu_count: int = 1
     vram_mib: int = 0                     # the card the model runs on (smallest if several)
@@ -198,7 +161,6 @@ class Context:
     model_gib: float = 0.0
     hybrid_cpu: bool = False
     logical_threads: int = 0
-    arch: str | None = None               # e.g. gfx1201
     context_tokens: int = 32768
     goal: str = "speed"                   # speed | room
     use: str = "chat"                     # chat | coding
@@ -219,7 +181,6 @@ def condition_holds(name: str, ctx: Context) -> bool:
         "hybrid_experts": bool(f.get("hybrid_experts")),
         "vram_ge_24g": ctx.vram_mib >= 24000,
         "vram_le_8g": 0 < ctx.vram_mib <= 8400,
-        "gfx12": bool(ctx.arch and ctx.arch.startswith("gfx12")),
         "pcie_bound": 0 < ctx.vram_mib < 24000,
         "ram_bound": bool(ctx.ram_gib and ctx.model_gib and ctx.ram_gib - ctx.model_gib < 30),
         "ctx_ge_128k": ctx.context_tokens >= 98304,

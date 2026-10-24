@@ -12,11 +12,8 @@ every backend. The evidence, gathered from the pinned checkout and this machine'
 
 * Its search space is expressed as engine flags: ``--vram-reserve-mib``, ``--pcie-frac``,
   ``--pool-workers``, ``--host-core``, ``--pool-affinity``, ``--ple-io``, ``--kv``, ``--kv-grow``,
-  ``--prompt-cache-tail``, ``--spec-min-p``. Two of those, ``--vram-reserve-mib`` and
-  ``--pcie-frac``, are NVIDIA/AMD concepts: the Apple Silicon engine does not parse them at all
-  (``strata --help`` on the Metal build lists neither). On Metal their "measurements" could only be
-  an engine refusal, so a HyperCore sweep there would produce ``FAIL_BOOT`` rows rather than
-  evidence.
+  ``--prompt-cache-tail``, ``--spec-min-p``. A flag the engine does not parse could only be
+  measured as an engine refusal, so a sweep would produce ``FAIL_BOOT`` rows rather than evidence.
 * It resolves the engine by walking up from its own directory looking for a Strata checkout, and it
   writes its deliverables next to that root. Neither is acceptable for a packaged application: the
   component registry must name an exact engine build, and the active profile must not be mutated by
@@ -65,7 +62,7 @@ SCHEMA_VERSION = 1
 
 #: The backend families the product targets. The key is what the engine package manifest and the
 #: profile record, not something inferred from a device name.
-BACKENDS = ("metal", "cuda", "hip", "sycl", "cpu")
+BACKENDS = ("sycl", "cpu")
 
 
 @dataclass(frozen=True)
@@ -90,32 +87,21 @@ class Dimension:
 #: which those are is *checked against the engine binary*, not assumed — see `validate_dimensions`.
 DIMENSIONS: tuple[Dimension, ...] = (
     Dimension("ple_io", ("--ple-io",), ("direct", "mmap", "ram"),
-              ("metal", "cuda", "hip", "sycl", "cpu"),
+              ("sycl", "cpu"),
               "How the n-gram table is read: unbuffered SSD reads, mmap, or locked in RAM."),
     Dimension("kv", ("--kv",), ("fp16", "int8", "q4_0", "k8v4"),
-              ("metal", "cuda", "hip", "sycl", "cpu"),
+              ("sycl", "cpu"),
               "KV storage format. Lower precision is cheaper and slightly less exact."),
     Dimension("kv_grow", ("--kv-grow",), (False, True),
-              ("metal", "cuda", "hip", "sycl", "cpu"),
+              ("sycl", "cpu"),
               "Allocate KV only for the cells actually reached, returning VRAM to the expert cache."),
     Dimension("expert_cache", ("--expert-cache",), (0, 1024, 2048, 4096, 8192, 12288, 16384),
-              ("cuda", "hip", "sycl"), "MiB of device memory for the expert cache."),
-    Dimension("host_core", ("--host-core",), ("first", "last"),
-              ("cuda", "hip"), "Which cores run the host-side work."),
-    Dimension("pool_affinity", ("--pool-affinity",), ("all", "p-cores", "auto"),
-              ("cuda", "hip"), "CPU pool affinity for the expert I/O threads."),
-    Dimension("pool_workers", ("--pool-workers",), (0, 2, 4, 8, 12, 16),
-              ("cuda", "hip"), "I/O workers; 0 means every physical core except the host's."),
+              ("sycl",), "MiB of device memory for the expert cache."),
     Dimension("spec_min_p", ("--spec-min-p",), (0.001, 0.1, 0.5, 0.9),
-              ("metal", "cuda", "hip", "sycl", "cpu"),
+              ("sycl", "cpu"),
               "Draft-acceptance floor: how confident a speculative token must be to be proposed."),
-    Dimension("vram_reserve", ("--vram-reserve-mib",), (256, 512, 768, 1024, 1280, 1536),
-              ("cuda", "hip"),
-              "Device memory left free for other programs. NVIDIA/AMD only."),
-    Dimension("pcie_frac", ("--pcie-frac",), (0.0, 0.25, 0.5, 0.75, 0.95),
-              ("cuda", "hip"), "Share of PCIe bandwidth the expert streamer may use. NVIDIA/AMD only."),
     Dimension("prompt_cache_tail", ("--prompt-cache-tail",), (False, True),
-              ("cuda", "hip", "sycl"),
+              ("sycl",),
               "Prompt-cache tail retention. BENCHMARK ONLY: measured, never exported.",
               benchmark_only=True),
 )
@@ -138,13 +124,6 @@ def flag_argv(flag: str, value: Any) -> list[str]:
 def _why_excluded(dim: Dimension, backend: str) -> str | None:
     if backend in dim.backends:
         return None
-    if backend == "metal":
-        if dim.id in ("vram_reserve", "pcie_frac", "expert_cache"):
-            return ("the Apple Silicon engine does not parse this flag; it is an NVIDIA/AMD device "
-                    "concept, so a sweep could only record a boot failure")
-        if dim.id in ("host_core", "pool_affinity", "pool_workers"):
-            return ("the Metal build's CPU-side pool is not exposed; the flag parses but its "
-                    "entry point is one of the unported kernels (metal/src/engine/stubs.cpp)")
     return f"not a {backend} setting"
 
 

@@ -31,7 +31,7 @@ class TuningCase(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def plan(self, backend="cuda", objective="generation", hold=(), max_trials=16, repeats=3,
+    def plan(self, backend="sycl", objective="generation", hold=(), max_trials=16, repeats=3,
              flags=None, dimensions=()):
         return tuning.TuningPlan(
             id="job1", backend=backend, engine="/nonexistent/strata",
@@ -51,31 +51,29 @@ class TuningCase(unittest.TestCase):
 class TestDimensionValidation(TuningCase):
     """A backend is offered only the levers its engine can actually accept."""
 
-    def test_metal_is_not_offered_nvidia_only_dimensions(self):
-        offered, excluded = tuning.validate_dimensions("metal")
+    def test_cpu_is_not_offered_device_dimensions(self):
+        offered, excluded = tuning.validate_dimensions("cpu")
         ids = {d.id for d in offered}
-        self.assertNotIn("vram_reserve", ids)
-        self.assertNotIn("pcie_frac", ids)
+        self.assertNotIn("expert_cache", ids)
         reasons = {e["id"]: e["reason"] for e in excluded}
-        self.assertIn("vram_reserve", reasons)
-        self.assertIn("NVIDIA/AMD", reasons["vram_reserve"])
+        self.assertIn("not a cpu setting", reasons["expert_cache"])
 
-    def test_cuda_is_offered_the_nvidia_dimensions(self):
-        offered, _ = tuning.validate_dimensions("cuda")
+    def test_sycl_is_offered_the_device_dimensions(self):
+        offered, _ = tuning.validate_dimensions("sycl")
         ids = {d.id for d in offered}
-        self.assertTrue({"vram_reserve", "pcie_frac", "expert_cache"} <= ids)
+        self.assertTrue({"expert_cache", "kv", "ple_io"} <= ids)
 
     def test_a_flag_the_binary_does_not_accept_excludes_the_dimension(self):
         """The static table is not trusted: the actual binary's flag list decides."""
-        offered, excluded = tuning.validate_dimensions("cuda", engine_flags=["--kv", "--ple-io"])
+        offered, excluded = tuning.validate_dimensions("sycl", engine_flags=["--kv", "--ple-io"])
         ids = {d.id for d in offered}
-        self.assertNotIn("vram_reserve", ids, "a dimension whose flag the binary lacks must be excluded")
+        self.assertNotIn("expert_cache", ids, "a dimension whose flag the binary lacks must be excluded")
         reasons = {e["id"]: e["reason"] for e in excluded}
-        self.assertIn("does not accept --vram-reserve-mib", reasons["vram_reserve"])
+        self.assertIn("does not accept --expert-cache", reasons["expert_cache"])
 
     def test_a_flag_the_binary_does_accept_keeps_the_dimension(self):
-        offered, _ = tuning.validate_dimensions("cuda", engine_flags=["--kv", "--vram-reserve-mib"])
-        self.assertIn("vram_reserve", {d.id for d in offered})
+        offered, _ = tuning.validate_dimensions("sycl", engine_flags=["--kv", "--expert-cache"])
+        self.assertIn("expert_cache", {d.id for d in offered})
 
     def test_benchmark_only_dimension_is_never_exported(self):
         tuner = tuning.Tuner(self.tmp / "runs", self.plan(), lambda c: {"tokens_per_s": 1.0})
@@ -113,12 +111,12 @@ class TestDimensionValidation(TuningCase):
         binary does not accept them. What must never happen is a dimension with no reason being
         dropped silently.
         """
-        offered, excluded = tuning.validate_dimensions("metal", engine_flags=["--unrelated"])
+        offered, excluded = tuning.validate_dimensions("cpu", engine_flags=["--unrelated"])
         self.assertEqual(offered, [])
         self.assertEqual(len(excluded), len(tuning.DIMENSIONS))
         for e in excluded:
             self.assertTrue(e["reason"].strip(), f"{e['id']} was excluded with no reason given")
-        # The dimensions that ARE Metal concepts are excluded specifically because the binary lacks
+        # The dimensions that ARE CPU concepts are excluded specifically because the binary lacks
         # their flags, which is the check that matters.
         by_id = {e["id"]: e["reason"] for e in excluded}
         for dim_id in ("kv", "ple_io", "kv_grow", "spec_min_p"):
@@ -443,9 +441,9 @@ class TestPersistenceAndReporting(TuningCase):
         self.assertIn("machine", json.dumps(tuning.machine_identity()))
 
     def test_the_report_names_what_was_excluded_and_why(self):
-        plan = tuning.plan_tuning(Path("/nonexistent/strata"), "metal", "m", "generation",
+        plan = tuning.plan_tuning(Path("/nonexistent/strata"), "cpu", "m", "generation",
                                   {"prompt_tokens": 128})
-        self.assertIn("vram_reserve", {e["id"] for e in plan.excluded})
+        self.assertIn("expert_cache", {e["id"] for e in plan.excluded})
         self.assertFalse(plan.engine_flags_known,
                          "a plan must record that the engine could not be interrogated")
 

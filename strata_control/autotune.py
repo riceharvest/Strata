@@ -29,7 +29,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from strata_control import engine_component, tune_knobs, tune_machine
+from strata_control import tune_knobs, tune_machine
 from strata_control.tune_session import RequestSet, RunResult, Session, StartFailed
 
 MIN_FREE_RAM_MIB = 3584            # 3.5 GiB left for the system at every start (6.5)
@@ -862,20 +862,12 @@ def context_from_config(cfg: dict[str, Any], *, engine_backend: str | None, opts
             ctx_tokens = int(args[i + 1])
     mem = system.get("memory") or {}
     cpu = system.get("cpu") or {}
-    backend = engine_backend or ("cuda" if any(g.get("vendor") == "nvidia" for g in cards) else
-                                 "hip" if any(g.get("vendor") == "amd" for g in cards) else "cpu")
-    arch = None
-    if backend == "hip":
-        try:
-            archs = engine_component.hip_archs_present()
-            arch = archs[0] if archs else None
-        except Exception:  # noqa: BLE001
-            arch = None
+    backend = engine_backend or "sycl"
     return tune_knobs.Context(
         backend=backend, family=family or detect_family(args), gpu_count=max(1, len(used)),
         vram_mib=min((g["vram_total_mib"] for g in used if g.get("vram_total_mib")), default=0),
         ram_gib=int((mem.get("total_mib") or 0) // 1024), model_gib=model_gib_of(args),
-        hybrid_cpu=bool(cpu.get("hybrid")), logical_threads=int(cpu.get("logical") or 0), arch=arch,
+        hybrid_cpu=bool(cpu.get("hybrid")), logical_threads=int(cpu.get("logical") or 0),
         context_tokens=ctx_tokens, goal=opts.goal, use=opts.use, allow_placement=opts.allow_placement,
         allow_nonrepeatable=opts.allow_nonrepeatable, engine_flags=engine_flags, base_args=args)
 

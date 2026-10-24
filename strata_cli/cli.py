@@ -20,7 +20,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 #: Backend families, as the engine package manifest records them. Kept here so the argument parsers
 #: stay declarative without importing the tuning module on every CLI start.
-BACKENDS = ("metal", "cuda", "hip", "sycl", "cpu")
+BACKENDS = ("sycl", "cpu")
 from strata_control.doctor import inspect as inspect_components
 from strata_control.profiles import ProfileError
 from strata_cli.client import ClientError, Endpoint

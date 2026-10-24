@@ -126,10 +126,6 @@ def parse_facts(text: str) -> dict[str, Any]:
     return facts
 
 
-_CUDA_BUSY = re.compile(r"failed to initialize cuda|no cuda-capable device|cuda-capable device\(s\) is/are busy|"
-                        r"cuda driver version is insufficient|hipinit.{0,40}(?:fail|error)|no hip-capable device", re.I)
-
-
 def failure_kind(text: str, returncode: int | None) -> tuple[str, str]:
     """Classify an engine that ended before it was ready: (status, one plain line). The engine's informational
     `memory guard: limit ... available ...` line is not a failure and never decides the status (#3502)."""
@@ -140,9 +136,6 @@ def failure_kind(text: str, returncode: int | None) -> tuple[str, str]:
     reason = " | ".join(lines[:3])[:300]
     if re.search(r"unknown argument|unrecognized (argument|option)", low):
         return "UNSUPPORTED", reason or "the engine does not accept one of the settings"
-    if _CUDA_BUSY.search(text):
-        return "FAIL_BOOT", ("the graphics card could not be opened by the measuring engine; it is probably in use by the "
-                             "loaded model. Unload the model and tune again (" + reason + ")")[:400]
     if re.search(r"out of memory|memory guard: (?:refus|not enough|too)|cannot allocate|std::bad_alloc|\boom\b|(?:^|\n)killed(?:\r?\n|$)", low) or returncode in (-9, 137, 3221226505):
         return "OOM", reason or "the engine ran out of memory"
     return "FAIL_BOOT", reason or f"the engine stopped while starting (exit {returncode})"
