@@ -510,7 +510,7 @@ if(STRATA_BUILD_DSV41)
     target_link_libraries(strata-dsv41 PRIVATE strata_kernels_cpu)
     target_compile_definitions(strata-dsv41 PRIVATE STRATA_DSV41_TQ_CPU=1)
   endif()
-  if(STRATA_SYCL_PARITY)   # the CUDA->SYCL shim's semantics on the device (< 1 MB of device memory)
+  if(STRATA_SYCL_PARITY)   # the CUDA->SYCL shim's semantics on the device (~300 MB of device memory)
     add_executable(ds4_shim_test ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41/ds4_shim_test.cpp)
     target_include_directories(ds4_shim_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41
                                ${STRATA_ROOT}/include ${STRATA_ROOT}/third_party/ggml)
