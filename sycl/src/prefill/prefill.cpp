@@ -858,7 +858,7 @@ strata::kernels::QsaAttnPools pools_of(const strata::kernels::KvHostPools& h, co
 // synthetic experts (random blobs of the layer's format and shape) at 16, 32, 64, 128 and 256 rows per expert, and the crossover
 // (the mean rows per expert where the FP16 chain becomes the faster one, interpolated on the cost ratio) is kept, with a flag for
 // how clear the measurement was.  It is cached in a small text file (STRATA_CACHE_DIR, else ~/.cache/strata/i8-crossover.txt) keyed by
-// device name, driver, formats and shape, and read back instead of measured when the key matches.
+// device name, driver, formats, shape and the kernels' revision (i8::kKernelRev), and read back instead of measured when the key matches.
 namespace {
 struct I8Cross { double rows = 0; bool confident = false; bool measured = false; };
 
@@ -916,7 +916,8 @@ I8Cross i8_calibrate(M& m, const strata::kernels::cpu::NativeFmt& f) {
     const std::string dev = q.get_device().template get_info<sycl::info::device::name>() + "|" +
                             q.get_device().template get_info<sycl::info::device::driver_version>();
     char keyb[600];
-    std::snprintf(keyb, sizeof keyb, "%s|%d|%d|%lldx%lld", dev.c_str(), f.gu_type, f.d_type, (long long) f.n_ff, (long long) f.n_embd);
+    std::snprintf(keyb, sizeof keyb, "%s|%d|%d|%lldx%lld|k%d", dev.c_str(), f.gu_type, f.d_type, (long long) f.n_ff, (long long) f.n_embd,
+                  strata::prefill::i8::kKernelRev);
     const std::string key = keyb;
     I8Cross res;
     if (i8_cache_read(key, res)) {
