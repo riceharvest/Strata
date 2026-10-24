@@ -2,7 +2,7 @@
 
     python tools/embd_bf16_pack.py --model <checkpoint dir> --out <token-embd-bf16.gguf>
 
-nvfp4_convert.py stores token_embd as Q8_0 (0.56% off per value). The engine keeps the table in mapped host memory
+A Q8_0 token_embd is 0.56% off per value. The engine keeps the table in mapped host memory
 and reads one row per token, so BF16 costs 0.6 GB of RAM more and no VRAM; `--embd-gguf` takes it from this file.
 
 The output is a one-tensor GGUF: `token_embd.weight`, ne = [n_embd, n_vocab], type BF16, the bytes copied straight

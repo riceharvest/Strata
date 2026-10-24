@@ -457,7 +457,7 @@ def expert_layout(model: Model, src: pathlib.Path):
             # NVFP4 (ModelOpt) carries one F32 weight_scale_2 per expert and projection, which the block format has
             # no room for. Each blob gets a 16-byte tail {s_gate, s_up, s_down, 0} so every consumer that already
             # moves whole blobs (the arena, the device cache, the prefill staging, a second GPU) moves the scales
-            # with the weights; the gate/up kernels read it. See tools/nvfp4_convert.py.
+            # with the weights; the gate/up kernels read it.
             # a mixed expert (e.g. NVFP4 gate/up + Q8_0 down) has the tail too, with 1.0 for the other projection
             if any(t.type_name == "NVFP4" and "blk.%d.ffn_%s_exps.scale" % (l, r) not in T for t, r in zip(ts, ROLES)):
                 return "layer %d: NVFP4 experts without their .scale tensors" % l
