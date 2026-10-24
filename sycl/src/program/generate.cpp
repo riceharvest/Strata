@@ -39,6 +39,7 @@
 #include "strata/core/gguf_expert_source.hpp"
 namespace strata::prefill { void set_nonresident_share(double share); }   // SYCL port: prefill.cpp
 #include "strata/kernels/resident_plan_mirror.hpp"
+#include "strata/core/lean_exchange.hpp"
 #include "strata/core/pinned.hpp"
 #include "strata/core/remote_experts.hpp"
 #include "strata/core/on_device.hpp"
@@ -7203,6 +7204,42 @@ int main(int argc, char **argv) try {
             usage_dev_srv = sycl::malloc_device<int32_t>((size_t) (g.n_layers * g.n_expert), dpct::get_in_order_queue());
             dpct::get_in_order_queue().memset(usage_dev_srv, 0, (size_t) (g.n_layers * g.n_expert) * 4).wait();
         }
+        // The lean window's adaptive VRAM tier (strata/core/lean_exchange.hpp; STRATA_LEAN_EXCHANGE=0 turns it off):
+        // mirrored experts the windows keep fetching trade places with cold resident ones, between windows; the device
+        // plan's routing counts are its signal. B70, Flash-Next IQ2_XS: decode +12-18% (greedy, standard-v1 prompts).
+        strata::core::LeanExchange lex;
+        {
+            auto env_set_nonzero = [](const char* k) { const char* v = std::getenv(k); return v != nullptr && v[0] != '\0' && v[0] != '0'; };
+            const char* lv = std::getenv("STRATA_LEAN_EXCHANGE");
+            const bool want = !(lv != nullptr && lv[0] == '0');
+            const char* why = !want ? nullptr
+                            : mirror_table_d == nullptr ? "no host mirror"
+                            : !env_set_nonzero("STRATA_VERIFY_NO_HOST") || !env_set_nonzero("STRATA_VERIFY_DEVICE_PLAN") ||
+                              (std::getenv("STRATA_VERIFY_LEAN") && std::getenv("STRATA_VERIFY_LEAN")[0] == '0')
+                                ? "the window is not the lean one (STRATA_VERIFY_NO_HOST, _DEVICE_PLAN, _LEAN)"
+                            : multi_gpu || !split_devs.empty() ? "a layer split"
+                            : host_res.empty() || thits.d_res == nullptr ? "no device residency table"
+                            : srcp != &gguf_src ? "not --stream-experts"
+                            : kvg.on ? "the elastic K/V takes cache slots" : nullptr;
+            if (want && why != nullptr && mirror_table_d != nullptr)
+                std::fprintf(stderr, "strata serve: the lean exchange is off (%s)\n", why);
+            if (want && why == nullptr) {
+                if (usage_dev_srv == nullptr) {
+                    usage_dev_srv = sycl::malloc_device<int32_t>((size_t) (g.n_layers * g.n_expert), dpct::get_in_order_queue());
+                    dpct::get_in_order_queue().memset(usage_dev_srv, 0, (size_t) (g.n_layers * g.n_expert) * 4).wait();
+                }
+                strata::core::LeanExchange::Config lc;
+                if (const char* e = std::getenv("STRATA_LEAN_EXCHANGE_SWAPS")) lc.swaps_per_step = std::max(1, std::atoi(e));
+                if (const char* e = std::getenv("STRATA_LEAN_EXCHANGE_DECAY")) lc.decay = (float) std::atof(e);
+                if (const char* e = std::getenv("STRATA_LEAN_EXCHANGE_MARGIN")) lc.margin = (float) std::atof(e);
+                if (const char* e = std::getenv("STRATA_LEAN_EXCHANGE_SPARES")) lc.spares_per_size = std::max(1, std::atoi(e));
+                const int64_t loan_first = borrow != nullptr && lend_first >= 0 ? (int64_t) lend_first : xcache.slots();
+                std::string lerr;
+                if (!lex.init(lc, &xcache, &gguf_src, host_res.data(), const_cast<int32_t*>(thits.d_res), mirror_table_d, usage_dev_srv,
+                              g.n_layers, g.n_expert, loan_first, lerr))
+                    std::fprintf(stderr, "strata serve: the lean exchange is off (%s)\n", lerr.c_str());
+            }
+        }
         if (mirror_table_d) strata::kernels::resident_plan_set_mirror(thits.d_res, mirror_table_d, usage_dev_srv, (long long) (g.n_layers * g.n_expert));
         vh.h_res = host_res.empty() ? nullptr : host_res.data();
         vh.cache_base = thits.cache_base;
@@ -11527,6 +11564,10 @@ int main(int argc, char **argv) try {
                     return 1;
                 }
                 tr("window", p, T);
+                if (lex.on() && !lex.step(err)) {   // STRATA_LEAN_EXCHANGE: between two windows
+                    std::printf("ERR %s\n", err.c_str());
+                    return 1;
+                }
                 const Clock::time_point tw0 = Clock::now();
                 if (!ver.run(T, window.data(), p, win_pool_fn, win_pool_user, outv.data(), err) || drive.d.failed) {
                     std::printf("ERR %s\n", drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str());
@@ -11643,6 +11684,10 @@ int main(int argc, char **argv) try {
                 std::printf("ERR %s\n", err.c_str());
                 return 1;
             }
+            if (lex.on() && !lex.drain(err)) {   // no exchange in flight while the next prompt is read
+                std::printf("ERR %s\n", err.c_str());
+                return 1;
+            }
             if (dec_timing && dec_windows > 0) {
                 const DecSnap d1 = dec_snap();
                 const double w = (double) dec_windows, L = (double) g.n_layers;
@@ -11655,6 +11700,9 @@ int main(int argc, char **argv) try {
                              (d1.actq - ds0.actq) / w, (d1.jobs - ds0.jobs) / w, (d1.run - ds0.run) / w,
                              (d1.host - ds0.host) / w, dt_commit / w, dt_draft / w, (d1.misses - ds0.misses) / (w * L),
                              (d1.entries - ds0.entries) / (w * L), (d1.hits - ds0.hits) / (w * L), (d1.pcie - ds0.pcie) / (w * L));
+                if (lex.on())
+                    std::fprintf(stderr, "strata decode lean exchange: %lld swaps done since the start, %lld in flight\n",
+                                 (long long) lex.done(), (long long) lex.in_flight());
                 for (int st = 0; st < n_stages; ++st) {   // every stage's GPU profile, not only the first card's
                     const std::string pr = stage_ver(st).profile_report();
                     if (pr.empty()) continue;

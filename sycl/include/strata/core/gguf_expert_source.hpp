@@ -55,6 +55,14 @@ public:
     /// "does this source have device-readable experts", and dereferences an alias only for `pinned()` experts.
     const uint8_t* device_alias(int64_t layer, int64_t expert) const override;
     uint64_t mirrored_bytes() const { return mirror_bytes_; }
+    /// The lean exchange (STRATA_LEAN_EXCHANGE): an expert's mirror blob, or null; and moving one. The caller keeps
+    /// the device tables in step and calls these only while no prompt is read (the prompt path reads them).
+    uint8_t* mirror_blob(int64_t layer, int64_t expert) const {
+        return mirror_ptr_.empty() ? nullptr : mirror_ptr_[(size_t) (layer * n_expert_ + expert)];
+    }
+    void set_mirror_blob(int64_t layer, int64_t expert, uint8_t* p) {
+        if (!mirror_ptr_.empty()) mirror_ptr_[(size_t) (layer * n_expert_ + expert)] = p;
+    }
 
 private:
     int fd_of(int64_t layer, int role, std::string& err);
