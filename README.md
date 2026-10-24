@@ -5,434 +5,228 @@
   </picture>
 </p>
 
-<p align="center"><b>English</b> · <a href="README.zh-CN.md">简体中文</a> · <a href="README.ja.md">日本語</a> · <a href="README.de.md">Deutsch</a> · <a href="README.fr.md">Français</a> · <a href="README.es.md">Español</a> · <a href="README.pt-BR.md">Português</a></p>
-
-<h3 align="center">Run a state-of-the-art model on your own gaming PC</h3>
-
-<p align="center">Support for NVIDIA, AMD, Intel · Windows, Linux, Mac · free and open source</p>
+<h2 align="center">Strata — Intel Arc Pro B70 (<code>bmg-g31</code> / Xe2) Edition</h2>
 
 <p align="center">
-  <a href="https://github.com/Niko1221/Strata/releases"><img src="https://img.shields.io/github/v/release/Niko1221/Strata?include_prereleases&label=release" alt="Latest release"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/github/license/Niko1221/Strata" alt="MIT license"></a>
-  <a href="https://github.com/Niko1221/Strata/stargazers"><img src="https://img.shields.io/github/stars/Niko1221/Strata?style=flat" alt="GitHub stars"></a>
+  <b>Hyper-optimized SYCL 2020 + Xe2 ESIMD DPAS + AVX-512 VNNI inference engine for Intel Arc Pro B70 (32 GB GDDR6) &amp; Battlemage</b><br>
+  <sub>Stream 125B–1T+ Mixture-of-Experts models (<b>Qwen3.8-Flash-Next</b> &amp; <b>DeepSeek-V4.1-Flash-1017</b>) at full PCIe 5.0 + XMX speed on Linux</sub>
 </p>
 
-<p align="center"><a href="https://github.com/Niko1221/Strata/releases/download/v0.1.10/Pagoda.mp4"><img src="docs/media/pagoda-preview.webp" width="720" alt="A voxel pagoda garden that Strata's model wrote, running in the browser"></a><br>
-<sub>A voxel pagoda garden, 1 shot prompt running on an RTX 5070 with Strata (IQ3_S, 128K context) ·
-<a href="https://github.com/Niko1221/Strata/releases/download/v0.1.10/Pagoda.mp4">full video (49 s)</a></sub></p>
+<p align="center">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT license"></a>
+  <img src="https://img.shields.io/badge/GPU-Intel%20Arc%20Pro%20B70%20(bmg--g31%20%2F%2032GB)-0071C5" alt="Intel Arc Pro B70">
+  <img src="https://img.shields.io/badge/Backend-oneAPI%202026%20SYCL%20%2B%20ESIMD%20DPAS-0071C5" alt="SYCL 2020 + ESIMD">
+  <img src="https://img.shields.io/badge/CPU%20Lane-AVX--512%20VNNI%20%2B%20VPOPCNTDQ-orange" alt="AVX-512">
+</p>
 
-Strata runs **[Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)**, a 125-billion-parameter model that
-normally needs a server, on a normal PC. It chats, writes code, reads pictures and works with your apps and coding
-agents. Your chats and files stay on your PC.
+---
 
-> ### ⚡ `riceharvest/Strata` — Intel Arc Pro B70 (`bmg-g31` / Xe2) Optimized Fork
->
-> This fork is hyper-optimized for **Intel Arc Pro B70 (32 GB GDDR6, `bmg-g31` / Xe2)** and Battlemage (`bmg-g21` / B580 / B60) on Linux (`xe` kernel driver + oneAPI 2026 SYCL/ESIMD) to eliminate host/SYCL engine overhead and maximize prefill, MTP verify, and decode throughput on out-of-VRAM streamed MoEs (`Qwen3.8-Flash-Next`, `DeepSeek-V4.1-Flash-1017`, `Qwen3-Coder-Next`, `GSQ-RCO-IQ3_S`, `IQ2_XS`, `UD-Q4_K_XL`):
->
-> - **2 MiB Hugepage USM Host Expert Mirror & Arena (`Strata#3681` fix):** Calls `madvise(..., MADV_HUGEPAGE)` on every 2 GiB `sycl::malloc_host` chunk in `gguf_expert_source.cpp` and 2 MiB-aligns + advises `MADV_HUGEPAGE` on `ExpertStore` chunks in `ds4_os.hpp` before reader threads fault in the host expert mirror, preventing 4 KiB order-0 page fragmentation and PCIe IOTLB thrashing under `xe` + IOMMU `DMA-FQ` (**42.7 tok/s vs 26.9 tok/s**, **24.0 GB/s vs 9.6–15.0 GB/s** PCIe read bandwidth). Includes `/proc/buddyinfo` Normal-zone high-order block (`order 9 + 10`) & `AnonHugePages` diagnostics at startup and preflight checks in `sycl/serve/strata-sycl.sh`.
-> - **Zero-Overhead SYCL Dispatch & Lean MTP Verify Graph (`sycl/src/`, `sycl/include/dpct/device.hpp`, `sycl/src/core/verify.cpp`):**
->   - **Stripped 394 bogus `use_root_sync` cooperative launch properties across 49 `.dp.cpp` files:** DPCT migrated kernel launches with `sycl::ext::oneapi::experimental::use_root_sync` despite zero kernels using `get_root_group()`, which forced Level Zero onto cooperative launch dispatch (`zeCommandListAppendLaunchCooperativeKernel`) and serialized command streamers on ~600+ launches per decode token.
->   - **Eliminated 96–192 redundant verify window kernel launches (`verify.cpp`):** In `lean` mode (`STRATA_VERIFY_DEVICE_PLAN=1` + `STRATA_VERIFY_NO_HOST=1`, enabled automatically on B70), `grouped` now writes expert outputs directly into `parts_out` instead of writing to `hit_out`, launching `copy_or_zero_from_mapped` to zero `parts_out`, and launching `moe_hit_add` to add `hit_out` back into `parts_out`.
->   - **Non-blocking `dpct::sync_barrier` & lock-free thread-local `strata::q_of`:** Replaces `dpct::sync_barrier`'s host-blocking `queues_wait_and_throw()` + dummy `single_task` kernel with `queue->ext_oneapi_submit_barrier()`, and caches `get_in_order_queue()` per thread in `strata::q_of` to avoid locking `dev_mgr::m_mutex` twice per kernel launch.
->   - **Auto-detected B70 / `xe` runtime defaults (`strata::apply_sycl_arch_defaults`):** Automatically configures `STRATA_VERIFY_DEVICE_PLAN=1`, `STRATA_VERIFY_NO_HOST=1`, and `STRATA_STAGER_THREADS=12` on Battlemage (`xe` driver) without requiring wrapper scripts.
-> - **Battlemage Decode & MTP Verify Kernel Optimizations (`iq_kernels.dp.cpp`, `router_top10.dp.cpp`, `native_router.dp.cpp`, `verify_kernels.dp.cpp`, `qsa_decode_attn.dp.cpp`, `fused_gdn.dp.cpp`):**
->   - **Aligned 32-bit loads (`load4_a2` / `load8_a2`) across all single-token & multi-token expert/dense dots:** Replaces 16-bit byte-pair loads (`get_int_b2`) with aligned 32-bit dword loads in `vec_dot_iq2_xxs/iq2_xs/iq2_s/iq3_xxs/iq3_s_q8_1`, `vec_dot_q4_0/q5_0/q6_K/q8_0_q8_1`, and `KqSplit<14, 8>::load`.
->   - **In-register `iq4nl_pair` LUT & 3-op SWAR `q6_k_centred`:** Eliminates global-memory `kvalues_iq4nl` table loads in `vec_dot_iq4_xs_q8_1` and replaces DPCT's 4-byte `dpct::vectorized_binary<sycl::char4>(..., dpct::sub_sat())` loop in `vec_dot_q6_K_q8_1_impl_mmvq` and `KqSplit<14>` with 3-instruction SWAR sign-extension.
->   - **SWAR sign arithmetic (`swar_ne4` / `swar_sub4`) & multi-token weight reuse (`Multi<16>`, `Multi<17>`, `Multi<23>`):** Eliminates per-byte `uchar4` loops in `Split<16, 17, 22, 18, 21, 20>` and enables `kEntryMulti` for `IQ2_XXS`, `IQ2_XS`, and `IQ4_XS` in `native_gu_kernel` and `native_down_kernel`.
->   - **Native SYCL 2020 subgroup intrinsics & S6 single-subgroup router:** Replaces `dpct::experimental::permute_sub_group_by_xor` / `shift_sub_group_left` with native `sycl::permute_group_by_xor` / `sycl::inclusive_scan_over_group`, enables the S6 single-subgroup top-10 router by default on SYCL, and shrinks `native_router.dp.cpp` from 8 warps (7 idle) to 1 warp.
-> - **Full-Format Fused Int8 ESIMD DPAS Prefill (`esimd_moe.dp.cpp`, `prefill.cpp`, `iq_tables.inc`):**
->   - Supports **all 5 gate/up formats** (`T_IQ3S=21`, `T_IQ3XXS=18`, `T_IQ2S=22`, `T_IQ2XS=17`, `T_IQ2XXS=16`, `T_IQ4XS=23`) and **all 3 down formats** (`T_IQ4NL=20`, `T_Q2_0=42`, `T_Q8_0=8`) on Xe2 `8x16x32` int8 DPAS, fixing the `prefill.cpp` whitelist and enabling SLM activation-tile sharing (`launch_gu_wg`) for `IQ2_S` / `IQ2_XS` / `IQ2_XXS` with `tab_bytes = 0` plus coalesced prefill barrier submission.
-> - **CPU Expert Lane (`iq_avx512.cpp`, `pool.hpp`) & `DeepSeek-V4.1-Flash-1017` (`sycl/src/dsv41/`, `dsv41_fit.py`):**
->   - **AVX-512 `VPOPCNTDQ` + `VNNI` (`_mm512_dpwssd_epi32`) in `iq512_gu_rows` / `iq512_rows`:** Enables vectorized popcount parity sign decoding (`FmtX`) and single-instruction VNNI accumulation across all CPU expert gate/up/down projections, replaces cross-lane `scales4` permutes, and cache-line-pads `ExpertPool::wstate_` (`alignas(64)`).
->   - **`DeepSeek-V4.1-Flash-1017` (`strata-dsv41`) Full 16-TU SYCL 2020 Port & B70 Placement (`sycl/src/dsv41/`, `sycl/CMakeLists.txt`, `dsv41_fit.py`, `sycl/setup_intel.py`):**
->     - Ports all 6 device kernel translation units (`ds4_gemv.dp.cpp`, `ds4_mla_ops.dp.cpp`, `ds4_moe_ops.dp.cpp`, `ds4_SanityCheck.dp.cpp`, `ds4_prefill_sm120.dp.cpp`, `ds4_trellis_tricache.dp.cpp`) and all 10 host engine units (`ds4_model.cpp`, `ds4_generate.cpp`, `ds4_prefill.cpp`, `ds4_verify.cpp`, `ds4_mla.cpp`, `ds4_moe.cpp`, `ds4_CPU_moe.cpp`, `ds4_embed.cpp`, `ds4_sampler.cpp`, `ds4_tok.cpp`) to SYCL 2020 with native `sub_group_size(16)` Xe2 subgroup collectives and generic-space SLM atomics (`ds4_sycl.hpp`).
->     - Replaces CUDA Driver API `cuMemAddressReserve` / `cuMemCreate` / `cuMemMap` virtual memory stitching in `ds4_moe.cpp` with a contiguous USM device pool (`sycl::malloc_device`) and a pinned USM host staging pool (`sycl::malloc_host`) for PCIe 5.0 DMA expert streaming.
->     - Wires `strata-dsv41` into `sycl/CMakeLists.txt` and `sycl/setup_intel.py` alongside `strata-generate`, and updates `strata_control/dsv41_fit.py` for Intel Arc Pro B70 (`ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF` `2.00bpw` / `2.25bpw` / `1.75bpw`, reserving 1024 MiB for Level Zero and caching ~12,800–16,300 hot experts in 32 GB GDDR6 VRAM).
+## Overview
 
-**New here?** Check [what you need](#what-you-need), then [install the app](#option-a-the-strata-app).
+**`riceharvest/Strata`** is an architecture-specific fork of [Strata](https://github.com/Niko1221/Strata) engineered specifically for the **Intel Arc Pro B70 (`bmg-g31`, 32 GB GDDR6, 32 Xe2 cores / 256 XMX engines, PCIe 5.0 x16)** and Battlemage (`bmg-g21` / Arc B580 / B60) on Linux (`xe` kernel driver + Intel oneAPI 2026).
 
-- **Runs on a gaming PC.** 32 GB of RAM and graphics memory together is enough to start.
-- **Works with your tools.** It speaks the OpenAI and Anthropic APIs, so Claude Code, Codex CLI, OpenCode and other agents connect to it.
-- **Reads pictures.** They are on by default.
-- **Free.** MIT license, no account, no cloud.
-- **Private.** No telemetry. What Strata downloads, when it uses the internet and how it checks downloads is in [docs/SAFETY.md](docs/SAFETY.md).
+Upstream Strata's SYCL backend was produced via automated CUDA-to-SYCL (`dpct`) migration, leaving substantial Level Zero submission overhead, host-stalling synchronization primitives, unaligned byte-pair loads on Xe2's 32-bit LSC data port, incomplete ESIMD DPAS prefill format coverage, and no SYCL port for `DeepSeek-V4.1-Flash` (`strata-dsv41`).
 
-Version 0.2.3 · engine 0.1.48
+This fork strips out the DPCT translation overhead, rewires the decode, MTP verify, and ESIMD DPAS prefill pipelines specifically for **Battlemage Xe2 (`sub_group_size(16)`, `8x16x32` int8 XMX DPAS)**, fixes Linux `xe` + IOMMU `DMA-FQ` host-mirror page fragmentation (`Strata#3681`), and ports the entire **16-translation-unit `DeepSeek-V4.1-Flash` (`strata-dsv41`)** engine to native SYCL 2020.
 
-## What you need
+---
 
-**You need at least 32 GB of RAM and graphics memory (VRAM) together.** On a Mac or a Ryzen AI Max, that is the unified
-memory. More memory gives a bigger model or a faster one.
+## Supported Models & Arc Pro B70 (32 GB VRAM) Placement
 
-- A 32 GB PC with a 12-16 GB card runs the Coder.
-- 64 GB of RAM runs every size.
+Strata runs sparse Mixture-of-Experts (MoE) models that far exceed GPU VRAM by keeping dense attention/MLA layers, KV cache, and the hottest routed experts resident in **32 GB GDDR6 VRAM**, holding warm experts in **2 MiB hugepage-backed pinned USM host RAM** (streamed over PCIe 5.0 DMA or co-processed on the CPU AVX-512 lane), and reading cold experts / Engram lookup tables from NVMe SSD.
 
-| Your computer | Details |
-| --- | --- |
-| **NVIDIA** GeForce RTX 20, 30, 40, 50 series (12 GB or more) | Install the app or the Terminal. |
-| **AMD** Radeon RX 6800 and newer, Radeon AI PRO R9700 (12 GB or more) | [AMD cards](docs/AMD_HIP.md) |
-| **Intel** Arc | [Intel Arc](docs/INTEL_ARC.md), [Intel engine](docs/INTEL.md) |
-| **Apple Silicon Mac** (M1 or newer, macOS 15 or newer) | [Mac](docs/MAC.md) |
-| **AMD Ryzen AI Max (Strix Halo)** and other unified-memory systems | [Strix Halo](docs/STRIX_HALO.md) |
-| Older cards and processors | [Older GPUs](docs/OLDER_GPUS.md), [Older CPUs](docs/INSTALL.md#older-cpus-experimental) |
+### 1. `Qwen3.8-Flash-Next` (125B-A3B, 512 experts/layer, top-10 routed, MTP speculative verify)
+Engine binary: **`strata-generate`**
 
-Also needed:
+| Quantization | Total Footprint | B70 (32 GB VRAM) + 64 GB RAM Placement | ESIMD DPAS Prefill | Decode / MTP Verify Kernels |
+| :--- | ---: | :--- | :---: | :---: |
+| **`Q2_0`** (`GSQ-RCO`) | ~35 GB | Trunk + ~45% experts in VRAM; rest in pinned USM host RAM | `T_Q2_0` (Down) | Native SWAR + `Multi` |
+| **`IQ2_XS`** (`GSQ-RCO` / `Swift 1.5`) | ~39.2 GB | Trunk + ~40% experts in VRAM; rest in pinned USM host RAM | `T_IQ2XS` (Gate/Up) + `T_IQ4NL`/`T_Q2_0` (Down) | `Multi<17>` + `load4_a2` |
+| **`IQ3_XXS`** (`GSQ-RCO`) | ~47.0 GB | Trunk + ~33% experts in VRAM; rest in pinned USM host RAM | `T_IQ3XXS` (Gate/Up) + `T_IQ4NL` (Down) | `Multi<18>` + `load4_a2` |
+| **`IQ3_S`** (`GSQ-RCO`) | ~54.8 GB | Trunk + ~28% experts in VRAM; rest in pinned USM host RAM | `T_IQ3S` (Gate/Up) + `T_IQ4NL` (Down) | `Multi<21>` + `load4_a2` |
+| **`UD-IQ4_XS`** / **`UD-Q4_K_XL`** | ~68–72 GB | Trunk + hot experts in VRAM; warm experts in RAM / SSD | `T_IQ4XS` (Gate/Up) + `T_Q8_0` (Down) | `Multi<23>` + in-reg LUT + SWAR `q6_K` |
+| **`Qwen3-Coder-Next`** | ~32 GB | Trunk + ~50% experts in VRAM; rest in pinned USM host RAM | Full Xe2 DPAS | Full Xe2 Native |
 
-- about 80 GB of free disk (an SSD makes the first start much faster)
-- Windows 10 / 11, Linux or macOS
-- a current graphics driver
+### 2. `DeepSeek-V4.1-Flash-1017` (`ISTA-DASLab` GSQ-RCO + 111 GB `IQ4_NL` Engram)
+Engine binary: **`strata-dsv41`** *(ported to SYCL 2020 in this fork)*
 
-Two or three cards of the same make can share a model ([multi-GPU](docs/MULTI_GPU.md)). Strata never splits a model across
-NVIDIA and AMD cards. Full list: [docs/INSTALL.md](docs/INSTALL.md#what-you-need).
+| Quantization (`ISTA-DASLab`) | Download Size | B70 (32 GB VRAM, 1 GiB reserved) Residency | RAM + NVMe Tiering (64 GB Host RAM) | Quality vs FP8 Base |
+| :--- | ---: | :--- | :--- | :--- |
+| **`ist-das-1.75bpw`** (`IQ1_M`) | 239 GB | Trunk (`4.65 GiB`) + KV + **~16,300 hot experts** (`~24.5 GiB`) in VRAM | ~20,900 experts in 2 MiB hugepage RAM; cold experts + 111 GB Engram on NVMe | 98.7% task average (AIME25, GPQA-D, LCB v6) |
+| **`ist-das-2.00bpw`** (`IQ2_XXS`) | 257 GB | Trunk (`4.65 GiB`) + KV + **~14,350 hot experts** (`~24.5 GiB`) in VRAM | ~18,400 experts in 2 MiB hugepage RAM; cold experts + 111 GB Engram on NVMe | KL 0.170; code +8.6%, agent +5.3% |
+| **`ist-das-2.25bpw`** (`IQ2_XS`) | 274 GB | Trunk (`4.65 GiB`) + KV + **~12,800 hot experts** (`~24.5 GiB`) in VRAM | ~16,400 experts in 2 MiB hugepage RAM; cold experts + 111 GB Engram on NVMe | KL 0.107; code +3.2%, agent +2.2% |
 
-## Install
+---
 
-Pick one option. They all start the same engine and use the same models.
+## Key Optimizations in This Fork
 
-### Option A: the Strata app
+### 1. Zero-Overhead SYCL / Level Zero Dispatch & Lean MTP Verify
+| Subsystem | Upstream Bottleneck | B70 Fork Optimization | Impact |
+| :--- | :--- | :--- | :--- |
+| **Kernel Launch Properties** (`sycl/src/**/*.dp.cpp`) | DPCT attached `sycl::ext::oneapi::experimental::use_root_sync` to **394 kernel launches** across 49 `.dp.cpp` files even though zero kernels call `get_root_group()`. | Stripped all 394 `use_root_sync` properties so Level Zero uses standard `zeCommandListAppendLaunchKernel` instead of `zeCommandListAppendLaunchCooperativeKernel`. | Eliminates Level Zero cooperative residency/occupancy queries and implicit slice serialization across ~600+ launches/token. |
+| **MTP Verify Window MoE** (`sycl/src/core/verify.cpp`) | On every MoE layer (48 layers), `verify.cpp` launched `grouped` -> `hit_out`, `copy_or_zero_from_mapped` -> zero `parts_out`, and `moe_hit_add` -> `parts_out += hit_out` even when CPU host misses were disabled. | In `lean` mode (`STRATA_VERIFY_DEVICE_PLAN=1` + `STRATA_VERIFY_NO_HOST=1`), `grouped` writes directly into `parts_out`, bypassing `copy_or_zero_from_mapped` and `moe_hit_add`. | Eliminates **96 to 192 kernel launches and ~3.8 MB of redundant VRAM traffic** per verify step. |
+| **Device Barrier Sync** (`sycl/include/dpct/device.hpp`) | `dpct::sync_barrier()` called `dev_mgr::instance().queues_wait_and_throw()` on the CPU host before submitting a dummy `single_task` kernel. | Replaced with pure non-blocking `queue->ext_oneapi_submit_barrier()`. | Prevents full-device CPU host stalls during multi-queue prefill and expert staging. |
+| **Queue Resolution** (`sycl/include/strata/sycl_queue.hpp`) | `strata::q_of(nullptr)` locked `dev_mgr::m_mutex` twice per kernel submission (`current_device_id()` + `get_device()`). | Added lock-free `thread_local` fast path caching the default in-order queue pointer per host thread. | Eliminates ~1,200 global mutex locks per decode step. |
+| **B70 Auto-Defaults** (`sycl_queue.hpp`, `generate.cpp`) | Required manual wrapper env vars to enable device-side verify planning and tune PCIe stager thread count. | `strata::apply_sycl_arch_defaults()` detects Battlemage (`xe` driver) at startup and enables `STRATA_VERIFY_DEVICE_PLAN=1`, `STRATA_VERIFY_NO_HOST=1`, and `STRATA_STAGER_THREADS=12`. | Out-of-the-box optimal B70 execution even when running `strata-generate` directly. |
 
-The easiest way. The app has the engine inside: install it, pick a model, chat. Download the file for your system and
-graphics card from the [releases page](https://github.com/Niko1221/Strata/releases/latest). Not sure which one? See the
-line under the table.
+### 2. USM Host Expert Mirror 2 MiB Hugepage Advisory (`Strata#3681`)
+On Linux with the `xe` driver and IOMMU `DMA-FQ`, allocating a 25–42 GiB USM host expert mirror (`sycl::malloc_host` in `gguf_expert_source.cpp` or `mmap` in `ds4_os.hpp`) after page-cache pressure causes the kernel to back pinned DMA mappings with fragmented 4 KiB (`order-0`) pages. When the B70 DMAs cold experts over PCIe 5.0 during decode, 4 KiB scatter-gather lists thrash the GPU/IOMMU IOTLB:
+* **Fragmented 4 KiB USM Host Pages:** `9.6–15.0 GB/s` PCIe read bandwidth → **26.9 tok/s** decode (`37 ms/step`).
+* **2 MiB Contiguous Hugepage USM Host Mirror:** `24.0 GB/s` PCIe read bandwidth → **42.7 tok/s** decode (`23 ms/step`, **+58% throughput**).
 
-| System | Your graphics card | File to download |
-| --- | --- | --- |
-| **Windows 10 / 11** | NVIDIA RTX, driver 580 or newer | [`Strata-0.2.3-windows-cuda13.exe`](https://github.com/Niko1221/Strata/releases/latest/download/Strata-0.2.3-windows-cuda13.exe) |
-| | NVIDIA, older card or driver older than 580 | [`Strata-0.2.3-windows-cuda12.exe`](https://github.com/Niko1221/Strata/releases/latest/download/Strata-0.2.3-windows-cuda12.exe) |
-| | AMD Radeon RX 9000 series or Radeon AI PRO R9700 | [`Strata-0.2.3-windows-hip.exe`](https://github.com/Niko1221/Strata/releases/latest/download/Strata-0.2.3-windows-hip.exe) |
-| | AMD Radeon RX 7000 series or Ryzen AI Max (Strix Halo) | [`Strata-0.2.3-windows-hip-rdna3.exe`](https://github.com/Niko1221/Strata/releases/latest/download/Strata-0.2.3-windows-hip-rdna3.exe) |
-| **Linux** | NVIDIA RTX, driver 580 or newer | [`Strata-0.2.3-linux-nvidia-cuda13.AppImage`](https://github.com/Niko1221/Strata/releases/latest/download/Strata-0.2.3-linux-nvidia-cuda13.AppImage) |
-| | NVIDIA, older card or driver older than 580 | [`Strata-0.2.3-linux-nvidia-cuda12.AppImage`](https://github.com/Niko1221/Strata/releases/latest/download/Strata-0.2.3-linux-nvidia-cuda12.AppImage) |
-| | AMD Radeon RX 9000 series or Radeon AI PRO R9700 | [`Strata-0.2.3-linux-amd-rx9070.AppImage`](https://github.com/Niko1221/Strata/releases/latest/download/Strata-0.2.3-linux-amd-rx9070.AppImage) |
-| | AMD Radeon RX 7000 series | [`Strata-0.2.3-linux-amd-rx7900.AppImage`](https://github.com/Niko1221/Strata/releases/latest/download/Strata-0.2.3-linux-amd-rx7900.AppImage) |
-| | AMD Ryzen AI Max (Strix Halo) | [`Strata-0.2.3-linux-amd-strixhalo.AppImage`](https://github.com/Niko1221/Strata/releases/latest/download/Strata-0.2.3-linux-amd-strixhalo.AppImage) |
-| **Mac** (Apple Silicon, macOS 15 or newer) | built in | [`Strata-0.2.3-mac.dmg`](https://github.com/Niko1221/Strata/releases/latest/download/Strata-0.2.3-mac.dmg) |
+**What this fork does:**
+* Calls `madvise(p, bytes, MADV_HUGEPAGE)` on every 2 GiB `sycl::malloc_host` chunk in `sycl/src/core/gguf_expert_source.cpp` immediately upon allocation before reader threads fault in the pages.
+* Aligns `range_reserve` to 2 MiB (`kHugePageAlign`) and calls `madvise(..., MADV_HUGEPAGE)` inside `range_commit` in `src/dsv41/ds4_os.hpp` and `sycl/src/dsv41/ds4_os.hpp`.
+* Samples `/proc/meminfo` (`AnonHugePages`) and `/proc/buddyinfo` (`Normal` zone `order-9` 2 MiB + `order-10` 4 MiB blocks) before and after mirror population, emitting an explicit actionable warning if `xe` DMA will be IOTLB-throttled.
+* Adds preflight THP & buddy allocator checks to `sycl/serve/strata-sycl.sh`.
 
-**If you are unsure:** for NVIDIA, take `cuda13` if your driver is version 580 or newer, otherwise `cuda12`. `cuda12` is
-for older cards and older drivers. The `hip` and `amd` files are for AMD cards. RX 6000 cards have no installer of
-their own: install `hip-rdna3` (Windows) or `amd-rx7900` (Linux), and on a PC with an RX 6000 card it fetches the RX 6000 engine by itself
-(also `strata update`). That engine is built but not yet tested on a real RX 6000 card: see [AMD cards](docs/AMD_HIP.md).
+### 3. Full-Format Xe2 Int8 ESIMD DPAS Prefill (`esimd_moe.dp.cpp`, `prefill.cpp`)
+Battlemage's Xe2 XMX systolic array executes `8x16x32` int8 DPAS instructions (`esimd::dpas<8, 8, int32_t, int32_t, int8_t, int8_t>`). Upstream only whitelisted a subset of quant formats and fell back to slow scalar per-token GEMV on `IQ4_XS`, `IQ2_XS`, `IQ2_XXS`, and `Q8_0`.
+* **Complete Gate/Up Format Coverage:** `T_IQ3S (21)`, `T_IQ3XXS (18)`, `T_IQ2S (22)`, `T_IQ2XS (17)`, `T_IQ2XXS (16)`, and `T_IQ4XS (23)`.
+* **Complete Down Format Coverage:** `T_IQ4NL (20)`, `T_Q2_0 (42)`, and `T_Q8_0 (8)`.
+* **SLM Activation Tile Sharing (`launch_gu_wg`):** Enabled workgroup-cooperative SLM activation caching for 2-bit formats (`T_IQ2S`, `T_IQ2XS`, `T_IQ2XXS`) with `tab_bytes = 0` (saving 2 KiB of SLM per WG), and coalesced per-expert barriers in `prefill.cpp`.
 
-Then:
+### 4. Battlemage Decode & MTP Verify Kernel Optimizations (`iq_kernels.dp.cpp`, `router_top10.dp.cpp`, `native_router.dp.cpp`)
+* **Aligned 32-Bit LSC Dword Loads (`load4_a2` / `load8_a2`):** Replaces 16-bit byte-pair loads (`get_int_b2`) with aligned 32-bit loads across `vec_dot_iq2_xxs/iq2_xs/iq2_s/iq3_xxs/iq3_s_q8_1`, `vec_dot_q4_0/q5_0/q6_K/q8_0_q8_1`, `KqSplit<14, 8>::load`, and `dq_q4_k`, cutting LSC load instructions in half.
+* **In-Register `iq4nl_pair` LUT & 3-Op SWAR `q6_k_centred`:** Replaces global-memory `kvalues_iq4nl[]` table lookups in `vec_dot_iq4_xs_q8_1` with an in-register arithmetic lookup, and replaces DPCT's 4-byte `dpct::vectorized_binary<sycl::char4>(..., dpct::sub_sat())` loop in `q6_K` with 3-instruction SWAR centering (`v - 32`).
+* **SWAR Sign Application (`swar_ne4` / `swar_sub4`) & Multi-Token Weight Reuse (`Multi<16, 17, 23>`):** Eliminates per-byte `uchar4` loops in `Split<16, 17, 22, 18, 21, 20>` and enables `kEntryMulti` for `IQ2_XXS`, `IQ2_XS`, and `IQ4_XS` in `native_gu_kernel` and `native_down_kernel` so MTP verify tokens reuse dequantized weights in registers.
+* **Native SYCL 2020 Group Collectives & Single-Subgroup Routers:** Replaces `dpct::experimental::permute_sub_group_by_xor` / `shift_sub_group_left` (which emitted bounds-checking branches on every shuffle) with native SYCL 2020 `sycl::permute_group_by_xor` / `sycl::inclusive_scan_over_group` across 9 hot kernel files, enables the S6 single-subgroup top-10 router (`router_top10.dp.cpp`), and shrinks `native_router.dp.cpp` from 8 warps (7 idle) to 1 subgroup.
 
-- **Windows:** run the `.exe`. It installs for your user and needs no administrator rights. If Windows says "Windows
-  protected your PC", choose **More info**, then **Run anyway** (the installer is not code-signed yet).
-- **Linux:** make the file runnable (`chmod +x`) and start it. It needs FUSE 2: `sudo apt install libfuse2` (Ubuntu 22.04)
-  or `libfuse2t64` (Ubuntu 24.04 and newer).
-- **Mac:** open the `.dmg` and drag Strata onto Applications.
+### 5. AVX-512 (`VPOPCNTDQ` + `VNNI`) CPU Expert Co-Processing Lane (`iq_avx512.cpp`, `pool.hpp`)
+* **Hardware `VPOPCNTDQ` + `VNNI` (`_mm512_dpwssd_epi32`) in `iq512_gu_rows` & `iq512_rows`:** Enables `FmtX<TY>::decode` (`_mm256_popcnt_epi32` parity sign extraction + `_mm512_dpwssd_epi32` int16 dot-product accumulation) in `row_dot` instead of scalar `kSigns` table gathers and 3-instruction `maddubs + madd + add` sequences.
+* **Fast Scale Broadcast & Cache-Line Isolation:** Replaces cross-lane `_mm256_permutevar8x32_epi32` scale expansion in `scales4` with `vpshufb + vpmovzxbd`, and aligns `ExpertPool::wstate_` to 64-byte cache lines (`alignas(64)`) to prevent false sharing across worker threads.
 
-On the first screen the app reads your PC and recommends a model that fits. Press install. The model is a big download
-(about 40-70 GB) and continues where it stopped if it is interrupted. Closing the window stops Strata and the engine.
+### 6. Full 16-TU `DeepSeek-V4.1-Flash` (`strata-dsv41`) SYCL 2020 Port (`sycl/src/dsv41/`)
+Upstream only built `strata-dsv41` for CUDA (`src/dsv41/`) and HIP (`hip/src/dsv41/`). This fork ports all 16 translation units to SYCL 2020 in `sycl/src/dsv41/`:
+* **6 Device Kernel TUs:** `ds4_gemv.dp.cpp`, `ds4_mla_ops.dp.cpp` (Multi-head Latent Attention + RoPE + KV cache), `ds4_moe_ops.dp.cpp` (256-expert group router + GSQ-RCO expert kernels), `ds4_SanityCheck.dp.cpp`, `ds4_prefill_sm120.dp.cpp`, `ds4_trellis_tricache.dp.cpp`.
+* **10 Host Engine TUs:** `ds4_model.cpp`, `ds4_generate.cpp`, `ds4_prefill.cpp`, `ds4_verify.cpp`, `ds4_mla.cpp`, `ds4_moe.cpp`, `ds4_CPU_moe.cpp`, `ds4_embed.cpp`, `ds4_sampler.cpp`, `ds4_tok.cpp`.
+* **USM Device + Pinned USM Host Expert Pool (`ds4_moe.cpp`):** Replaces CUDA Driver API `cuMemAddressReserve` / `cuMemCreate` / `cuMemMap` virtual memory stitching with a contiguous USM device pool (`sycl::malloc_device`) and a 2 MiB hugepage-advised pinned USM host pool (`sycl::malloc_host`) for PCIe 5.0 DMA expert streaming.
 
-### Option B: the Terminal (one line)
+---
 
-The Terminal is the `strata` command, for scripts, servers and AI agents.
+## Quickstart: Building & Running on Intel Arc Pro B70
 
-Linux and Mac:
+### 1. Host Prerequisites (Linux + `xe` Driver)
+Ensure transparent hugepages are enabled (`always` or `madvise`) and proactive memory compaction is active so the 25–42 GiB USM host expert mirror receives contiguous 2 MiB pages:
 
-```sh
-curl -fsSL https://github.com/Niko1221/Strata/releases/latest/download/install.sh | sh
+```bash
+# Enable madvise THP and compact fragmented 4 KiB pages into 2 MiB blocks
+echo madvise | sudo tee /sys/kernel/mm/transparent_hugepage/enabled
+sudo sysctl -w vm.compaction_proactiveness=20
+echo 1 | sudo tee /proc/sys/vm/compact_memory
 ```
 
-Windows (PowerShell):
+### 2. Build `strata-generate` & `strata-dsv41`
+You can build either natively with **Intel oneAPI 2026.0+** (`icpx` + MKL) installed on the host, or inside Intel's official `intel/deep-learning-essentials:2026.0.0-devel-ubuntu24.04` container:
 
-```powershell
-irm https://github.com/Niko1221/Strata/releases/latest/download/install.ps1 | iex
+#### Option A: Native Build (with oneAPI 2026 installed)
+```bash
+source /opt/intel/oneapi/setvars.sh
+cmake -B sycl/build -S sycl -GNinja -DCMAKE_BUILD_TYPE=Release
+ninja -C sycl/build strata-generate strata-dsv41
 ```
 
-The script checks your PC, downloads the Terminal, verifies its SHA-256 and unpacks it into your home folder. It needs no
-administrator rights. On Windows, open a new terminal window afterwards. Then start Strata:
-
-```sh
-strata launch
+#### Option B: Containerized Build (no host oneAPI installation required)
+```bash
+docker run --rm -v "$PWD":/work -w /work \
+  intel/deep-learning-essentials:2026.0.0-devel-ubuntu24.04 \
+  bash -c 'source /opt/intel/oneapi/setvars.sh --force >/dev/null 2>&1 && \
+           cmake -B sycl/build -S sycl -GNinja -DCMAKE_BUILD_TYPE=Release && \
+           ninja -C sycl/build strata-generate strata-dsv41'
 ```
 
-It asks one question at a time: model, context, pictures, who may connect. Then it downloads the engine for your graphics
-card (signed, and test-started before use) and the model, and starts serving. For scripts and AI agents, use flags:
+### 3. Run `Qwen3.8-Flash-Next` on Arc Pro B70
+Use the guided Intel setup script (`sycl/setup_intel.py`) or launch the OpenAI/Anthropic-compatible server directly via `sycl/serve/strata-sycl.sh`:
 
-```sh
-strata launch --model q2_0 --yes --no-tui
+```bash
+# Guided setup (downloads model, detects B70 32 GB VRAM, configures expert cache & launches server)
+python3 sycl/setup_intel.py
+
+# Or launch directly with strata-sycl.sh (runs THP/buddyinfo preflight checks automatically)
+./sycl/serve/strata-sycl.sh
 ```
 
-To read the install script before it runs, download it first with `curl -fsSL <address> -o install.sh`, read it, then run
-`sh install.sh`. All screens and flags: [docs/TERMINAL_LAUNCH.md](docs/TERMINAL_LAUNCH.md).
+### 4. Run `DeepSeek-V4.1-Flash-1017` on Arc Pro B70 (`strata-dsv41`)
+Compute the exact B70 VRAM / Host RAM / NVMe expert placement plan with `strata_control.dsv41_fit` (automatically detects Intel Arc Pro B70 via `sycl-ls` / sysfs and reserves `1024 MiB` for Level Zero context & scratch buffers):
 
-### Option C: let your AI set it up
+```bash
+# Preview the B70 hardware placement plan and generated strata-dsv41 command line
+python3 -m strata_control.dsv41_fit \
+  --model-dir /path/to/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF \
+  --variant 2.00bpw \
+  --ctx 32768 \
+  --ssd-cache /path/to/fast-nvme/ds4_experts.cache
+```
 
-Paste this into Claude Code, Cursor, Codex, GitHub Copilot or another coding assistant:
+Or select **DeepSeek V4.1-Flash (`1.75bpw` / `2.00bpw` / `2.25bpw`)** interactively in `python3 sycl/setup_intel.py`.
+
+---
+
+## Arc Pro B70 Runtime Environment Variables
+
+`strata::apply_sycl_arch_defaults()` automatically configures optimal defaults when it detects an Intel `xe` GPU at startup. Any setting can still be overridden via environment variables:
+
+| Environment Variable | B70 Default | Description |
+| :--- | :---: | :--- |
+| `STRATA_VERIFY_DEVICE_PLAN` | `1` (auto) | Builds the MTP speculative verify expert routing plan on the GPU (`verify_plan_build`) and uses the `lean` direct-to-`parts_out` verify graph. |
+| `STRATA_VERIFY_NO_HOST` | `1` (auto) | Keeps MTP verify MoE dispatch purely on the GPU + asynchronous PCIe DMA stager without stalling on host CPU misses. |
+| `STRATA_STAGER_THREADS` | `12` (auto) | Number of host threads copying missed experts into the pinned staging ring (`12` saturates PCIe 5.0 x16 without scheduling contention). |
+| `STRATA_ESIMD_PREFILL` | `1` (default) | Uses fused Int8 Xe2 ESIMD DPAS (`8x16x32` XMX) for MoE prefill across all supported quant types (`IQ3_S`, `IQ3_XXS`, `IQ2_S`, `IQ2_XS`, `IQ2_XXS`, `IQ4_XS`, `IQ4_NL`, `Q2_0`, `Q8_0`). |
+| `STRATA_DPAS_DENSE` | `1` (default) | Uses Xe2 BF16 XMX DPAS (`esimd_gemm.dp.cpp`) for dense trunk / attention / LM-head GEMMs. |
+| `STRATA_EXPERT_BUDGET_MB` | Auto (~22–26 GB) | Override the GDDR6 VRAM budget (in MiB) dedicated to the GPU hot-expert cache. |
+| `NEOReadDebugKeys=1` `UseKmdMigration=0` | Set in `strata-sycl.sh` | Prevents the Level Zero / NEO runtime from migrating USM allocations through KMD page-fault handlers. |
+
+---
+
+## Repository Structure
 
 ```text
-Set up Strata on this PC for me: https://github.com/Niko1221/Strata - follow docs/AI_SETUP.md in that repository.
+Strata/
+├── sycl/
+│   ├── CMakeLists.txt                   # Builds strata-generate & strata-dsv41 with icpx (-fsycl -mavx512vnni -mavx512vpopcntdq)
+│   ├── setup_intel.py                   # Interactive Intel Arc B70 builder, model downloader & launcher (Qwen3.8 + DeepSeek-V4.1)
+│   ├── include/
+│   │   ├── dpct/device.hpp              # Non-blocking ext_oneapi_submit_barrier() sync_barrier implementation
+│   │   └── strata/
+│   │       ├── sycl_queue.hpp           # Lock-free thread-local queue lookup & apply_sycl_arch_defaults() for Battlemage
+│   │       └── core/gguf_expert_source.hpp
+│   ├── src/
+│   │   ├── core/
+│   │   │   ├── gguf_expert_source.cpp   # 2 MiB MADV_HUGEPAGE USM host expert mirror + /proc/buddyinfo diagnostics
+│   │   │   └── verify.cpp               # Lean direct-to-parts_out MTP speculative verify pipeline
+│   │   ├── prefill/
+│   │   │   ├── esimd_moe.dp.cpp         # Xe2 Int8 8x16x32 ESIMD DPAS MoE prefill (IQ2/IQ3/IQ4/Q2_0/Q8_0)
+│   │   │   ├── esimd_gemm.dp.cpp        # Xe2 BF16 XMX ESIMD DPAS dense GEMM
+│   │   │   └── prefill.cpp              # Prefill dispatcher with coalesced barriers & full ESIMD format routing
+│   │   ├── kernels/cuda/
+│   │   │   ├── iq_kernels.dp.cpp        # B70-optimized decode/verify kernels (load4_a2, SWAR, Multi<16/17/23>, native SYCL shuffles)
+│   │   │   ├── router_top10.dp.cpp      # S6 single-subgroup top-10 router
+│   │   │   └── native_router.dp.cpp     # Single-subgroup native router
+│   │   └── dsv41/                       # Full 16-TU SYCL 2020 port of DeepSeek-V4.1-Flash (strata-dsv41)
+│   └── serve/
+│       ├── strata-sycl.sh               # B70 server launcher with THP & /proc/buddyinfo preflight checks
+│       └── server_intel.py              # OpenAI & Anthropic API server with cached token-byte decoding
+├── src/kernels/cpu/
+│   └── iq_avx512.cpp                    # AVX-512 VPOPCNTDQ + VNNI (_mm512_dpwssd_epi32) CPU expert co-processing lane
+└── strata_control/
+    └── dsv41_fit.py                     # Hardware discovery & VRAM/RAM/SSD placement planner for DeepSeek-V4.1-Flash
 ```
 
-It checks your graphics card, RAM and disk, picks the model that fits, installs and starts it, and tells you how to
-connect your apps. AI tools can also install, start and stop Strata through its [MCP server](docs/MCP_SERVER.md).
+---
 
-Prefer to build it yourself? See [Build from source](#build-from-source).
+## Running CPU Unit & Bit-Exactness Verification Tests
 
-## Models
+All B70 SWAR bit-manipulation math (`q6_k_centred`, `swar_ne4`, `swar_sub4`, `iq4nl_pair`, `load4_a2`) and `/proc/buddyinfo` + `/proc/meminfo` hugepage diagnostics have standalone CPU unit tests that run without touching `/dev/dri`:
 
-The app and `strata launch` recommend a model for your memory. It is one model in several sizes, compressed more or less.
-Smaller sizes are faster. Larger sizes are a bit smarter.
-
-### Low on memory? Try Gyro
-
-[Gyro](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-GGUF) (by agentionai) is the smallest way to run this model.
-
-| Size | Memory it needs (RAM + VRAM) | Download | What it is |
-| --- | ---: | ---: | --- |
-| **Gyro-S** | 27.6 GB | 58.5 GB | For PCs that fit nothing else. Quality is lower than IQ2_XS. |
-| **Gyro-M** | 35 GB | 92.0 GB | About IQ3_XXS quality with about 20% less GPU memory. It writes answers 16% (12 GB RTX 3060) to 21% (R9700) slower than Q2_0. |
-
-Gyro runs on NVIDIA and AMD cards (AMD is experimental) on Intel Arc cards on Linux (tested on an Arc A750) and, from 0.2.2, on Apple Silicon Macs (Gyro-S on a 32 GB Mac mini: 9 tok/s, streaming from the SSD; [docs/MAC.md](docs/MAC.md#gyro-s-and-gyro-m-agentionais-trellis-experts)). Details and measurements:
-[docs/GYRO.md](docs/GYRO.md). Start it with `strata launch --model gyro-s`.
-
-### The other sizes
-
-The tiers count your RAM plus your VRAM, less 5 GB that Windows and the system keep for themselves. Every other size stays a choice.
-
-| Your memory (RAM + VRAM) | Take | Notes |
-| --- | --- | --- |
-| **32 GB** | **Gyro-S**, or the **[Coder](docs/MODELS.md#coder)** for code | The Coder needs 32 GB of RAM and keeps half of the experts, so it is weaker outside code |
-| **40 GB** | **[Swift 1.5](docs/MODELS.md#swift-15)** IQ2_XS (39.2 GB), or **Gyro-M** (35 GB) | Swift thinks for a shorter time before it answers. Gyro-M is close to IQ3_XXS in quality, but it writes answers 16-21% slower than Q2_0 |
-| **48 GB** | **IQ3_XXS** (47.0 GB) | Slower, better |
-| **64 GB** | **IQ3_S** (54.8 GB), the original or Swift 1.5 | The slowest, the best: it matches the full model on the published tests |
-| **96 GB or more** | Unsloth's **UD-IQ4_XS** (about 72 GB of RAM) to **Q8_0** (about 136 GB), 4 to 8 bit | Closer to the full model. With less RAM, Strata reads part of them from the SSD, which is much slower |
-
-Less RAM than a row says can still work: Strata switches to its
-[low-RAM mode](docs/MODELS.md#a-big-graphics-card-and-little-ram) by itself. Expect it to be slower, and much slower
-with a small graphics card.
-
-More choices:
-
-- **[Swift 1.5](docs/MODELS.md#swift-15)** is a fine-tune that thinks for a shorter time before it answers, at about the same quality and RAM.
-- **[NVFP4](docs/NVFP4.md)** is NVIDIA's 4-bit version for NVIDIA cards. It needs about 80 GB of RAM to keep every expert in RAM.
-- **[Qwen3.6-35B-A3B](docs/QWEN36.md)** is a smaller, different model that reads pictures and can answer several requests at once.
-- **[OrcaRouter's Uncensored IQ3_XXS](docs/MODELS.md#orcarouter-uncensored-iq3_xxs)** is set up by hand.
-
-Every size, download and what fits where: [docs/MODELS.md](docs/MODELS.md).
-
-### DeepSeek V4.1-Flash (in the Terminal, from 0.2.4)
-
-[DeepSeek V4.1-Flash](https://huggingface.co/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF) is a different, much bigger model. ISTA-DASLab made the three sets below. Strata runs them on a PC with one 12 GB graphics card and 46 to 64 GB of RAM, and reads the rest from your SSD. It runs on NVIDIA RTX 30 to 50 cards, on the Radeon AI PRO R9700, and (in this fork via `sycl/src/dsv41`) on **Intel Arc Pro B70 (32 GB)** and Battlemage cards. It uses its own engine package, `strata-dsv41`, which `strata launch` downloads (or `sycl/setup_intel.py` builds alongside `strata-generate`) when you pick DeepSeek. The desktop app does not offer it yet.
-
-| Set | Download | Quality against the original model | Writes at |
-| --- | ---: | --- | --- |
-| **IQ1_M** (1.75 bits) | 239 GB | KL 0.217, perplexity 3.80 (+21%); code +8.9%, agent work +10.2%; weaker on plain English prose. ISTA-DASLab's model card: keeps 98.7% of the base model's task average (AIME25, GPQA-Diamond, LiveCodeBench v6). | not measured yet |
-| **IQ2_XXS** (2.00 bits) | 257 GB | KL 0.170, perplexity 3.63 (+15.5%); code +8.6%, agent work +5.3% | about 8 to 10 tokens/s on an RTX 3060 (code 9.9, agent work 7.8), about 5 on an RTX 5070 |
-| **IQ2_XS** (2.25 bits) | 274 GB | KL 0.107, perplexity 3.37 (+7.3%); code +3.2%, agent work +2.2% | about 11 tokens/s on one Radeon AI PRO R9700 |
-| **IQ4_NL** (Engram table, not a third model) | 111 GB, already in all three downloads above | The 4-bit Engram lookup table the model reads from RAM or SSD. All three sets use this one file (`DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf`). | n/a |
-
-4x Radeon AI PRO R9700: about 31 tokens/s, 55 to 69 with DSpark.
-
-Start it with `strata launch --model ist-das-2.00bpw` (or `ist-das-1.75bpw`, `ist-das-2.25bpw`). Details, speeds per card and the manual install: [docs/DEEPSEEK41.md](docs/DEEPSEEK41.md).
-
-## How fast is it?
-
-Based on a 12 GB graphics card (RTX 5070, Ryzen 5 7600, 64 GB RAM). See results from other cards:
-[speed of each model](docs/MODELS.md#how-fast-is-each-size), [community results](docs/COMMUNITY_BENCHMARKS.md).
-
-| Model | Answers appear at | Reads your prompt at |
-| --- | --- | --- |
-| **Q2_0** | `████████████` 94 tokens/s | `████████████` 2,650 tokens/s |
-| **IQ2_XS** | `██████████░░` 79 tokens/s | `█████████░░░` 2,090 tokens/s |
-| **IQ3_XXS** | `████████░░░░` 62 tokens/s | `████████░░░░` 1,750 tokens/s |
-| **IQ3_S** | `███████░░░░░` 53 tokens/s | `███████░░░░░` 1,620 tokens/s |
-| **Coder** | `███████░░░░░` 55 tokens/s | `██████████░░` 2,180 tokens/s |
-
-A token is about ¾ of a word, so 60 tokens per second is faster than you can read. "Reads your prompt" is how fast Strata
-takes in a long document, code or chat history.
-
-Measured on a 16 GB AMD card (RX 9070 XT, Ryzen 9 3900X, 47 GB RAM):
-
-| Model | Answers appear at | Reads your prompt at |
-| --- | --- | --- |
-| **Q2_0** | `████████░░░░` 60 tokens/s | `█████░░░░░░░` 1,160 tokens/s |
-| **IQ2_XS** | `███████░░░░░` 52 tokens/s | `█████░░░░░░░` 1,110 tokens/s |
-| **Coder** | `██████░░░░░░` 44 tokens/s | `██████░░░░░░` 1,420 tokens/s |
-
-The bars use one scale for both tables. A card with more VRAM is faster: an RTX 3090 (24 GB) should write about 100-140
-tokens per second. The engine version behind each number is in [DETAILS.md](docs/DETAILS.md#speed-measured).
-
-## Using it
-
-### In the app
-
-The app has a **Chat**, a **Monitor** of the model and your GPU, CPU and RAM, a **Models** page and **Settings**. The chat
-can work in a folder on your PC. In **Manual** mode it asks before it changes a file or runs a command. Type
-`/loop 10m <what to do>` to repeat a message every 10 minutes while the chat is open.
-
-The chat can search the web with DuckDuckGo (or Bing), with no account. You can add a search key under **Settings, Tools**.
-Search is the one feature that sends something off your PC, the search words.
-
-To run two models, turn on **Run multiple models** and give each model its own card of the same make.
-
-<p align="center"><img src="docs/media/app-chat.png" width="900" alt="The Strata app: a chat where the agent built a small voxel pagoda garden, with the page open in the preview on the right"><br>
-<sub>A chat in the Strata app: the agent wrote a small voxel pagoda garden as one HTML file, and the page opens in the preview next to the conversation</sub></p>
-
-### In the Terminal
-
-<p align="center"><img src="docs/media/terminal-monitor.png" width="900" alt="The Strata Terminal monitor overview while the model writes a reply"><br>
-<sub><code>strata monitor</code> while the model writes a reply: speed, GPU, memory and the recent requests</sub></p>
-
-```sh
-strata launch                                  # guided screens: model, context, pictures, access, then serve
-strata launch --model q2_0 --yes --no-tui     # no questions: serve, print the address, return
-strata launch --plan --model q2_0              # show what would happen; nothing changes
-strata launch --status                         # what is being served now
-strata launch --stop                           # stop it
-strata monitor --url http://127.0.0.1:8080     # watch speed, GPU, memory and requests
-strata update --check                          # is there a new engine? (strata update installs it)
-strata doctor                                  # check the installed engine files
+```bash
+g++ -O3 -std=c++20 sycl/src/kernels/iq_b70_math_test.cpp -o /tmp/iq_b70_math_test && /tmp/iq_b70_math_test
+g++ -O2 -std=c++20 sycl/src/core/gguf_expert_source_test.cpp -o /tmp/gguf_expert_source_test && /tmp/gguf_expert_source_test
 ```
 
-`strata --help` lists everything. Starting and serving never download anything. Only the install, `strata launch` (when
-you choose a model) and `strata update` do. To reach Strata from your phone or another PC, use
-`strata launch --access lan`. It makes an API key (recommended; add `--no-api-key` to go without, with a warning). No browser opens unless
-you add `--open`. Guide: [docs/TERMINAL_LAUNCH.md](docs/TERMINAL_LAUNCH.md). Whole client: [docs/TERMINAL.md](docs/TERMINAL.md).
+---
 
-### With AI agents
+## Credits & License
 
-An agent installs Strata with the one-line command in Option B and runs
-`strata launch --model NAME --yes --no-tui`. The steps, flags and exit codes are in [docs/AI_SETUP.md](docs/AI_SETUP.md),
-and the repository rules are in [AGENTS.md](AGENTS.md).
-
-### Connect your other apps
-
-| App type | Base URL |
-| --- | --- |
-| OpenAI-compatible (most apps and agents) | `http://127.0.0.1:8080/v1` (any API key, any model name) |
-| Anthropic API (Claude Code and others) | `http://127.0.0.1:8080`, without `/v1`. These apps add `/v1/messages` themselves. Claude Code: `ANTHROPIC_BASE_URL=http://127.0.0.1:8080` |
-| OpenAI Responses API (Codex CLI) | `http://127.0.0.1:8080/v1/responses` ([setup](docs/DETAILS.md#the-responses-api-and-codex-cli)) |
-
-`strata connect` prints the exact settings for OpenCode, Codex CLI, Claude Code, oh-my-pi, pi, Hermes Agent and OpenClaw.
-`strata connect opencode --write` writes the file after asking and keeps a backup.
-
-### Pictures
-
-Pictures are on by default for models that can read them. Attach or paste a picture in the chat, or send it from your app.
-The picture reader runs on the processor when your graphics card has less than 24 GB (a few seconds per picture, nothing
-taken from the card's memory) and on the graphics card from 24 GB. The rule is the same for NVIDIA and AMD. Turn pictures
-off per model, or choose the reader with `--vision off`, `--vision gpu` or `--vision cpu`.
-
-The numbers behind the rule: on a Radeon AI PRO R9700 the card's reader took 57 ms for a 260-token picture and the
-processor's took 3.1 s. On 16 GB cards (Tesla P100 and RTX A4000, Linux) the card's reader cost 3-5% of text speed,
-because it holds about 1.4 GB that the model would use otherwise. On a Mac the reader runs on the Mac's GPU whatever its memory (0.45 s for a 260-token picture on an M4 with 32 GB, about 1.2 GB of the shared
-memory); the processor reader needs about 50 s per picture there, so it runs only when you ask for it with `--vision cpu`.
-
-### Good to know
-
-- Choose the thinking level (**off, low, medium or high**) in the chat menu or in your app's "reasoning effort". Off is fastest.
-- Strata answers one request at a time by default. For several at once, use `--parallel N` in `strata launch` or
-  `"parallel": 2` in the config ([BATCHING.md](docs/BATCHING.md)). On a 12 GB card this makes each answer slower.
-- Strata reads the first message of a chat in full, about 1 minute per 30,000 tokens. Follow-up messages start in seconds.
-- Where your chats are stored and the whole API: [docs/INSTALL.md](docs/INSTALL.md#where-things-are-stored), [docs/DETAILS.md](docs/DETAILS.md#using-it).
-
-## Build from source
-
-<details>
-<summary>Windows, Linux and Mac from the repository</summary>
-
-[Download Strata](https://github.com/Niko1221/Strata/archive/refs/heads/main.zip) and unzip it, or `git clone` it.
-**Windows:** double-click `START-HERE.bat`. **Linux:** run `./setup.sh` in the Strata folder.
-
-**Mac (Apple Silicon, macOS 15 or newer):** install Apple's Command Line Tools once with `xcode-select --install`
-(Xcode itself is not needed). Open Terminal in the Strata folder and run `./setup.sh`. It builds the Mac engine on your
-Mac (about 7 minutes), asks the same questions, downloads the model and starts it. Next time, `./setup.sh` starts it
-right away. Which size fits your Mac: [docs/MAC.md](docs/MAC.md).
-
-The installer finds your card and sets up the right engine. It asks which model and size, how much context (how much text
-the model keeps in mind) and whether it should read pictures. Press Enter for the recommended answer. Then it downloads the
-model (about 70 GB) and starts it. If the download stops, run it again and it continues. Your browser opens the Strata
-page at `http://127.0.0.1:8080`.
-
-> While the model starts, your PC can be slow or stop responding for 1-3 minutes (longest the first time). Strata loads
-> 35-55 GB into your RAM and locks part of it for the graphics card. Wait, and don't close the window.
-
-Next time, run `START-HERE.bat` (or `./setup.sh`) again. It starts right away and downloads nothing twice. Close its
-window to stop the model. `UPDATE.bat` (`./update.sh`) updates Strata without starting it. Updating, Docker, several cards,
-where the files go and every option: [docs/INSTALL.md](docs/INSTALL.md).
-
-To measure your PC, run `BENCH.bat` (`./bench.sh`). It takes 5-10 minutes and writes a report you can share
-([how](docs/COMMUNITY_BENCHMARKS.md#run-the-benchmark)).
-
-**Optional: more speed on one card when the whole model fits in RAM.** Two opt-in settings by RubenTorney (#1904, #1905).
-They help when you run one graphics card and your RAM holds every expert, for example Q2_0 or IQ3_XXS on a 64 GB PC. Open
-`strata-<model>.json` in the Strata data folder ([where](docs/INSTALL.md#where-things-are-stored)) and add:
-
-- `"--adapt-async", "1"` to the `"args"` list. The expert cache then updates on a helper thread instead of pausing the
-  answer. Measured on an RTX 5070 (Windows, Q2_0): +4-5% decode, +7-10% on code and long documents. Answers can differ
-  slightly from the default and stay the same from run to run.
-- `"STRATA_PIN_BY_NEED": "1"` in the `"env"` block (Windows). Windows can lock only about half the RAM for the graphics
-  card, and this locks the experts the card needs first. Measured on the RTX 5070: +4.4% prompt reading.
-
-```json
-"args": [ ..., "--adapt-async", "1" ],
-"env": { "STRATA_PIN_BY_NEED": "1" }
-```
-
-Restart Strata after the change. To undo, remove the two entries.
-
-</details>
-
-## How does it work?
-
-Models like this one usually run on servers with hundreds of gigabytes of graphics memory. Your graphics card has
-12-24 GB. Strata makes the model fit by sharing the work across your whole PC. Picture a library.
-
-- The model is a team of 24,576 small specialists ("experts"), like 24,576 reference books. Each word needs only 10 of them.
-- **Your graphics card is the desk.** It is small and fast. The roughly 4,000 books used most often lie open on it.
-- **Your RAM is the shelves in the reading room.** All 24,576 books are there. When a word needs a book that is not on the
-  desk, your processor reads it from the shelf at once, while the card keeps working.
-- **Your SSD is the archive.** It holds a 29 GB lookup table. The model reads a few rows of it per word, so it does not
-  need to sit in RAM.
-
-<p align="center"><img src="docs/media/how-it-works.svg" width="860" alt="The model's 24,576 experts: the busiest on the graphics card, all of them in RAM, a lookup table on the SSD"></p>
-
-A small helper also guesses the next few words. The big model checks all of them at once and keeps the right ones. You get
-the same answer, 1.6-1.8x sooner. Long texts are read in big pieces, up to 8,192 tokens at a time, at over 1,000 tokens
-per second.
-
-<p align="center"><img src="docs/media/guess-and-check.svg" width="860" alt="A small helper guesses the next words; the big model checks them all at once and keeps the right ones"></p>
-
-The longer explanation: [docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md). Every part and its numbers:
-[the details](docs/DETAILS.md#how-it-works) and the [paper](docs/paper/Strata-Paper.pdf).
-
-## Something went wrong?
-
-- **My PC froze the first time Strata started.** It loads the model into RAM. Wait, and don't close the window. Still
-  frozen after 10 minutes? Restart the PC, close other programs and try again, or pick a smaller size.
-- **It stopped while downloading or installing.** Start the app or `strata launch` again, or run `START-HERE.bat` (or
-  `./setup.sh`) again. It continues where it stopped.
-- **It is very slow, the disk light keeps blinking, or it says "the engine stopped unexpectedly".** Your PC does not have
-  enough free RAM. Close other programs (browsers use a lot), or pick a smaller size such as Q2_0 or IQ2_XS.
-- **It says there is no engine for this PC.** In the app, open **Settings, Engine** and press **Update engine**. In the
-  Terminal, run `strata update`. `strata doctor` shows which engine files are installed.
-- **It says port 8080 is already in use.** Strata is already running. Look for its window.
-
-More problems and fixes: [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md). Still stuck? Open an
-[issue](https://github.com/Niko1221/Strata/issues). In the app, attach the file from **Settings, Engine, Diagnostics, View
-logs, Save logs**. In the Terminal, paste the output of `strata doctor`. From source, attach `strata-<model>.log` from the
-Strata folder. For a security problem, report it privately: [SECURITY.md](SECURITY.md).
-
-## Credits and license
-
-The model is [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) by the Qwen team. It was compressed by
-[ISTA-DASLab](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF), UkisAI (Swift 1.5), agentionai (Gyro)
-and Unsloth. Strata uses parts of [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp). All credits:
-[docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md#credits). Strata is open source under the [MIT License](LICENSE). A few parts and
-every model have their own licenses ([which ones](docs/HOW_IT_WORKS.md#license)).
-
-## Contributing
-
-Found a bug, or want to send a change or a benchmark? Read [CONTRIBUTING.md](CONTRIBUTING.md) first. It says what to
-include so that others can check your work.
-
-## Support Strata
-
-Strata is free and MIT-licensed. I build it and test it on whatever hardware I can get. If it runs well on your PC, a coffee helps
-me keep testing new cards and fixing what you report. No pressure. Using it and reporting what you find helps just as much.
-
-<a href="https://buymeacoffee.com/strataengine"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="50"></a>
-
-Interested in sponsoring Strata? Contact me via [GitHub](https://github.com/Niko1221).
+* **Upstream Strata Engine:** [Niko1221/Strata](https://github.com/Niko1221/Strata)
+* **Models & Quantizations:** [Qwen Team](https://huggingface.co/Qwen/Qwen3.8-Flash-Next), [DeepSeek-AI](https://huggingface.co/deepseek-ai), [ISTA-DASLab](https://huggingface.co/ISTA-DASLab) (`GSQ-RCO` quantizations for Qwen3.8-Flash-Next & DeepSeek-V4.1-Flash-1017), UkisAI, agentionai, Unsloth.
+* **License:** [MIT License](LICENSE).
