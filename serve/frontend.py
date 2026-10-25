@@ -40,7 +40,7 @@ class TemplateRequestError(jinja2.exceptions.TemplateError, ValueError):
 class ChatTemplate:
     """The model's chat template, rendered with the same Jinja settings as transformers' apply_chat_template."""
 
-    def __init__(self, path: str | Path):
+    def __init__(self, path: str | Path, bos_token: str = ""):
         def raise_exception(message):
             raise TemplateRequestError(message)
 
@@ -52,6 +52,9 @@ class ChatTemplate:
         env.globals["raise_exception"] = raise_exception
         self.source = Path(path).read_text(encoding="utf-8")
         self.template = env.from_string(self.source)
+        # the tokenizer's BOS text for a template that writes {{ bos_token }} (DeepSeek-V4.1's): undefined, Jinja wrote
+        # nothing and every chat ran without the BOS the model was trained with - fluent, but its knowledge gone
+        self.bos_token = bos_token
         self.caps = self._detect_caps()
 
     def render(self, messages: list[dict], tools: list[dict] | None = None, add_generation_prompt: bool = True,
@@ -62,6 +65,8 @@ class ChatTemplate:
                     if i == len(messages) - 1 or os.environ.get("STRATA_KEEP_EMPTY_TURNS") == "1" or not (isinstance(m, dict) and m.get("role") == "assistant"
                                                       and not _text_of(m.get("content")).strip()
                                                       and not _has_image(m.get("content")) and not m.get("tool_calls"))]
+        if self.bos_token and "bos_token" not in kwargs:
+            kwargs["bos_token"] = self.bos_token
         return self.template.render(messages=messages, tools=tools, add_generation_prompt=add_generation_prompt,
                                     **kwargs)
 

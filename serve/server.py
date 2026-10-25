@@ -8052,7 +8052,9 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
         if swapped:
             print("[strata] this pack's chat template spells the tool-call block differently from the V4.1 model's; "
                   "using the V4.1 template so tool calls come back as real calls", flush=True)
-    svc = Service(engine, tok, ChatTemplate(tpl if tpl.exists() else ROOT / "serve/chat_template.jinja"),
+    bos = (getattr(tok, "special_ids", None) or {}).get("bos")
+    bos_text = tok.tokens[bos] if bos is not None and hasattr(tok, "tokens") and 0 <= bos < len(tok.tokens) else ""
+    svc = Service(engine, tok, ChatTemplate(tpl if tpl.exists() else ROOT / "serve/chat_template.jinja", bos_token=bos_text),
                   model_name=default_model_name(cfg), vision=vision,
                   sampling_defaults=sampling_defaults,
                   fit_max_tokens=a.fit_max_tokens or (not a.no_fit_max_tokens and cfg.get("fit_max_tokens") is not False))
