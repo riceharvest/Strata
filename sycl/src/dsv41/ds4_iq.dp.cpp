@@ -8,6 +8,7 @@
 #include "ds4_sycl.hpp"
 #if defined(STRATA_XMX_SG16)
 #include <sycl/ext/oneapi/matrix/matrix.hpp>
+#include <sycl/ext/intel/experimental/grf_size_properties.hpp>
 #endif
 
 #define GGML_COMMON_DECL_SYCL
@@ -1219,15 +1220,204 @@ void launch_set_xmx3(const SetArgs& a, cudaStream_t s) {
         });
     });
 }
+// v4: v3's tiles with what bounded v3 fixed (DS4_XMX_DBG probe of IQ1_M at 40 experts x 390 rows, 2026-10-25: of 86 ms the SLM
+// stores + barriers took 28.6, the decode 25.5, the DPAS 26.7, the activations 2.5 - one after the other):
+// - the weights go into SLM VNNI-packed ([K/2][N][2]; a B fragment's ext_intel_packed load is as fast as row-major) with a
+//   sub-group's 16 lanes on 16 adjacent columns: 4 dword stores of 64 B a work item a matrix where v3 did 8 two-byte ones
+// - the activations as 16-byte vectors (2 float4 / 1 half8 loads, 1 store)
+// - two SLM buffers, one barrier a K step: step s + 1's weights decoded into registers before step s's DPAS and stored after
+//   it, so a sub-group's decode overlaps the others' DPAS
+// - the results straight from the accumulators (work item lane: column lane, element i row i) - no scratch
+// - 256 registers (grf_size): the 128-register mode spilled gate_up (51 ms against 34 for IQ1_M at 40 x 390)
+// BM x BN tiles of 512 work items (sub-group: 32 rows x 16 outputs of gate and of up): 128 x 128, v3's shape, or 256 x 64 -
+// each weight decoded once for 256 rows, half the decode a FLOP (IQ1_M's gate / up).  ~120 KB of SLM.
+// ds4_xmx_test --bench at 40 experts x 390 rows, TFLOP/s v3 -> v4: IQ1_M 15.5 -> 24.4, IQ2_XXS 18.2 -> 30.2, IQ2_XS 18.3 -> 31.3
+template <bool GATE_UP, int BM, int BN>
+struct Buf4 {
+    sycl::half x[BM][kXLd3], wg[KS3 / 2][2 * BN + 16], wu[GATE_UP ? KS3 / 2 : 1][2 * BN + 16];
+};
+template <int T, bool GATE_UP, int BM, int BN>
+void set_xmx4_kernel(const SetArgs a, sycl::nd_item<3> it, uint8_t* smem, uint32_t* tab, int* src) {
+    static_assert(BM * BN == 128 * 128 && BN >= 64 && BM >= 64, "512 work items, sub-groups of 32 x 16");
+    constexpr int kWP = 2 * BN + 16;   // a packed K pair's pitch, in halfs
+    constexpr int TPR = 512 / BM;      // work items an activation row
+    using Buf = Buf4<GATE_UP, BM, BN>;
+    Buf* bf = reinterpret_cast<Buf*>(smem);
+    const sycl::sub_group sg = it.get_sub_group();
+    const int e = (int) it.get_group(0);
+    const int lo = a.bounds[e] - a.row0, hi = a.bounds[e + 1] - a.row0;
+    const int r0 = lo + (int) it.get_group(2) * BM;
+    if (r0 >= hi || hi - lo <= a.skip_le) return;   // (uniform)
+    const int tid = (int) it.get_local_id(2), sgi = tid >> 4, lane = tid & 15;
+    load_tab<T>(tab);
+    const int nr = sycl::min(BM, hi - r0);
+    const int c0 = (int) it.get_group(1) * BN;
+    const uint8_t* blob = a.wbase + (size_t) e * a.stride;
+    const int K = GATE_UP ? a.n_embd : a.n_ff, ns = K / KS3;
+    const size_t rb = row_bytes_t<T>(K);
+    if (tid < BM) src[tid] = tid < nr ? (GATE_UP ? a.idx[r0 + tid] : r0 + tid) : -1;
+    it.barrier(sycl::access::fence_space::local_space);
+    const int mr = (sgi / (BN / 16)) * 32, nc = (sgi % (BN / 16)) * 16;
+    const bool live = mr < nr;
+    // the decode: weight row dn (a sub-group 16 adjacent ones), (sub-block, eighth) pairs slot + i 512 / BN of the step's 2 x 4;
+    // the activations: row tr, eighths tc + j TPR of its 8
+    const int dn = tid % BN, slot = tid / BN, tr = tid / TPR, tc = tid % TPR;
+    const int sr = src[tr];
+    const uint8_t* wrow0 = blob + a.tr[GATE_UP ? 0 : 2] + (size_t) (c0 + dn) * rb;
+    const uint8_t* wrow1 = blob + a.tr[1] + (size_t) (c0 + dn) * rb;
+    uint32_t wr[BN / 64][GATE_UP ? 2 : 1][4];
+    sycl::vec<sycl::half, 8> xr[GATE_UP ? 1 : 8 / TPR];
+    auto xload = [&](int k) {   // (8 values at k of row sr)
+        sycl::vec<sycl::half, 8> v(sycl::half(0.0f));
+        if (sr >= 0) {
+            const size_t at = (size_t) sr * a.ldx + (size_t) k;
+            if (GATE_UP) {
+                const sycl::float4 f0 = *reinterpret_cast<const sycl::float4*>(a.xf + at);
+                const sycl::float4 f1 = *reinterpret_cast<const sycl::float4*>(a.xf + at + 4);
+                v = sycl::vec<sycl::half, 8>(sycl::half(f0.x()), sycl::half(f0.y()), sycl::half(f0.z()), sycl::half(f0.w()),
+                                             sycl::half(f1.x()), sycl::half(f1.y()), sycl::half(f1.z()), sycl::half(f1.w()));
+            } else
+                v = *reinterpret_cast<const sycl::vec<sycl::half, 8>*>(a.xh + at);
+        }
+        return v;
+    };
+    int kf = 0;   // (the K step fetch() took; gate_up loads its activations at put(): its registers hold two accumulator sets)
+    auto fetch = [&](int k0) {
+        kf = k0;
+#pragma unroll
+        for (int i = 0; i < BN / 64; ++i) {
+            const int pr = slot + i * (512 / BN), kb = k0 / 32 + (pr >> 2), dq = pr & 3;
+#pragma unroll
+            for (int m = 0; m < (GATE_UP ? 2 : 1); ++m) {
+                float w8[8];
+                deq8<T>(m == 0 ? wrow0 : wrow1, kb, dq, tab, w8);
+#pragma unroll
+                for (int p = 0; p < 4; ++p)
+                    wr[i][m][p] = (uint32_t) sycl::bit_cast<uint16_t>(sycl::half(w8[2 * p])) |
+                                  (uint32_t) sycl::bit_cast<uint16_t>(sycl::half(w8[2 * p + 1])) << 16;
+            }
+        }
+        if constexpr (!GATE_UP)
+#pragma unroll
+            for (int j = 0; j < 8 / TPR; ++j) xr[j] = xload(k0 + (tc + j * TPR) * 8);
+    };
+    auto put = [&](Buf& b) {
+#pragma unroll
+        for (int i = 0; i < BN / 64; ++i) {
+            const int pr = slot + i * (512 / BN);
+#pragma unroll
+            for (int p = 0; p < 4; ++p) {
+                const int kp = pr * 4 + p;   // (K pair: (sub-block 32 + eighth 8 + 2 p) / 2)
+                reinterpret_cast<uint32_t*>(&b.wg[kp][0])[dn] = wr[i][0][p];
+                if constexpr (GATE_UP) reinterpret_cast<uint32_t*>(&b.wu[kp][0])[dn] = wr[i][GATE_UP ? 1 : 0][p];
+            }
+        }
+#pragma unroll
+        for (int j = 0; j < 8 / TPR; ++j) {
+            const int c = (tc + j * TPR) * 8;
+            *reinterpret_cast<sycl::vec<sycl::half, 8>*>(&b.x[tr][c]) = GATE_UP ? xload(kf + c) : xr[GATE_UP ? 0 : j];
+        }
+    };
+    xjm::joint_matrix<sycl::sub_group, float, xjm::use::accumulator, 8, 16> fg[4], fu[4];
+    for (int m = 0; m < 4; ++m) {
+        xjm::joint_matrix_fill(sg, fg[m], 0.0f);
+        xjm::joint_matrix_fill(sg, fu[m], 0.0f);
+    }
+    auto lp = [](const sycl::half* p) {
+        return sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(const_cast<sycl::half*>(p));
+    };
+    fetch(0);
+    put(bf[0]);
+    it.barrier(sycl::access::fence_space::local_space);
+    for (int s = 0; s < ns; ++s) {
+        const bool more = s + 1 < ns;   // (uniform)
+        if (more) fetch((s + 1) * KS3);
+        const Buf& cb = bf[s & 1];
+        if (live) {
+#pragma unroll
+            for (int kk = 0; kk < KS3; kk += 16) {
+                xjm::joint_matrix<sycl::sub_group, sycl::half, xjm::use::b, 16, 16, xjm::layout::ext_intel_packed> bg, bu;
+                xjm::joint_matrix_load(sg, bg, lp(&cb.wg[kk / 2][2 * nc]), kWP);
+                if constexpr (GATE_UP) xjm::joint_matrix_load(sg, bu, lp(&cb.wu[kk / 2][2 * nc]), kWP);
+#pragma unroll
+                for (int m = 0; m < 4; ++m) {
+                    xjm::joint_matrix<sycl::sub_group, sycl::half, xjm::use::a, 8, 16, xjm::layout::row_major> fa;
+                    xjm::joint_matrix_load(sg, fa, lp(&cb.x[mr + 8 * m][kk]), kXLd3);
+                    xjm::joint_matrix_mad(sg, fg[m], fa, bg, fg[m]);
+                    if constexpr (GATE_UP) xjm::joint_matrix_mad(sg, fu[m], fa, bu, fu[m]);
+                }
+            }
+        }
+        if (more) put(bf[(s + 1) & 1]);
+        it.barrier(sycl::access::fence_space::local_space);
+    }
+    if (!live) return;   // (no barrier after this)
+#pragma unroll
+    for (int m = 0; m < 4; ++m) {
+        if constexpr (GATE_UP) {
+            const float lim = a.limit;
+            xjm::joint_matrix_apply(sg, fg[m], fu[m], [=](float& g, float& u) { g = swiglu(g, u, lim); });
+        }
+        float v[8];
+        int i = 0;
+        xjm::joint_matrix_apply(sg, fg[m], [&](float& x) {
+            v[i] = x;
+            ++i;
+        });
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const int r = mr + 8 * m + j;
+            if (r >= nr) break;
+            const size_t o = (size_t) (r0 + r) * a.ldo + c0 + nc + lane;
+            if (GATE_UP) a.h[o] = __half_as_ushort(__float2half_rn(v[j]));
+            else a.y[o] = v[j];
+        }
+    }
+}
+template <int T, bool GU, int BM, int BN>
+void launch_set_xmx4(const SetArgs& a, cudaStream_t s) {
+    const int nc = GU ? a.n_ff : a.n_embd;
+    const sycl::range<3> local(1, 1, 512),
+        global((size_t) a.n_exp, (size_t) (nc / BN), (size_t) ((a.max_rows + BM - 1) / BM) * 512);
+    strata::q_of(s)->submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<uint8_t, 1> sm(sycl::range<1>(2 * sizeof(Buf4<GU, BM, BN>)), cgh);
+        sycl::local_accessor<uint32_t, 1> tb(sycl::range<1>(Ty<T>::TAB > 0 ? Ty<T>::TAB : 1), cgh);
+        sycl::local_accessor<int, 1> sr(sycl::range<1>(BM), cgh);
+        // (256 registers: 8 accumulators of 8 x 16 and step s + 1's weights in flight)
+        cgh.parallel_for(sycl::nd_range<3>(global, local),
+                         sycl::ext::oneapi::experimental::properties{sycl::ext::intel::experimental::grf_size<256>},
+                         [=](sycl::nd_item<3> it) [[sycl::reqd_sub_group_size(16)]] {
+            set_xmx4_kernel<T, GU, BM, BN>(a, it, sm.get_multi_ptr<sycl::access::decorated::no>().get(),
+                                           tb.get_multi_ptr<sycl::access::decorated::no>().get(),
+                                           sr.get_multi_ptr<sycl::access::decorated::no>().get());
+        });
+    });
+}
 static int xmx_bm() {
-    // (3: v3, the default - 15.6-18.3 TFLOP/s at a prompt chunk's shape (40 experts x 390 rows) against v1's 10.6-11.5 and v2's
-    //  11.2-12.8, ds4_xmx_test --bench on the B70; 128: v2; 64: v1)
-    static const int bm = std::getenv("DS4_XMX_BM") != nullptr ? std::atoi(std::getenv("DS4_XMX_BM")) : 3;
+    // (4: v4, the default; 3: v3 - 15.6-18.3 TFLOP/s at a prompt chunk's shape (40 experts x 390 rows) against v1's 10.6-11.5 and
+    //  v2's 11.2-12.8, ds4_xmx_test --bench on the B70; 128: v2; 64: v1)
+    static const int bm = std::getenv("DS4_XMX_BM") != nullptr ? std::atoi(std::getenv("DS4_XMX_BM")) : 4;
     return bm;
 }
 template <int T, bool GU>
 void launch_set_xmx(const SetArgs& a, dim3 grid, cudaStream_t s) {
-    if (xmx_bm() == 3 && a.max_rows >= 64 && (GU ? a.n_ff : a.n_embd) % BN3 == 0 && a.n_embd % KS3 == 0 && a.n_ff % KS3 == 0) {
+    // (v4's 16-byte activation loads: the rows' pitch and base 16-byte aligned)
+    if (xmx_bm() == 4 && a.max_rows >= 64 && (GU ? a.n_ff : a.n_embd) % BN3 == 0 && a.n_embd % KS3 == 0 && a.n_ff % KS3 == 0 &&
+        a.ldx % 8 == 0 && (GU ? (uintptr_t) a.xf : (uintptr_t) a.xh) % 16 == 0) {
+        // (256 x 64 for IQ1_M's gate / up, whose decode bounds it: 24.4 TFLOP/s against 23.0 at 40 x 390, 30.3 against 28.6
+        //  at 40 x 256; 128 x 128 the others - IQ2_XXS / IQ2_XS and every down 5-15% slower at 256 x 64.  DS4_XMX_TILE=128 / 256:
+        //  that shape for all)
+        static const int tile = std::getenv("DS4_XMX_TILE") != nullptr ? std::atoi(std::getenv("DS4_XMX_TILE")) : 0;
+        if (tile == 128 || (tile != 256 && !(GU && T == kIQ1_M))) launch_set_xmx4<T, GU, 128, 128>(a, s);
+        else launch_set_xmx4<T, GU, 256, 64>(a, s);
+        return;
+    }
+    if (xmx_bm() == 4 && a.max_rows >= 64) {
+        static bool said = false;
+        if (!said) std::fprintf(stderr, "ds4: v4 expert tiles not usable here (ldx %d, alignment or shape): v3 instead\n", a.ldx);
+        said = true;
+    }
+    if ((xmx_bm() == 3 || xmx_bm() == 4) && a.max_rows >= 64 && (GU ? a.n_ff : a.n_embd) % BN3 == 0 && a.n_embd % KS3 == 0 && a.n_ff % KS3 == 0) {
         launch_set_xmx3<T, GU>(a, s);   // (v3: 128 x 128 tiles, 512 work items)
         return;
     }
