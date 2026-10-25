@@ -440,6 +440,11 @@ class Api(ApiBase):
             status, r = self.chat(reasoning_effort=bad)
             self.assertEqual(status, 400, bad)
 
+    def test_health_offers_the_effort_slider(self):
+        self.start("ok")
+        with urllib.request.urlopen(self.base + "/health", timeout=10) as r:
+            self.assertEqual(json.loads(r.read())["effort_max"], 100)   # (the page's 1..100 slider)
+
     def test_effort_numbers_as_defaults_and_on_other_models(self):
         from serve.server import clean_shared_defaults
         import serve.frontend as fe

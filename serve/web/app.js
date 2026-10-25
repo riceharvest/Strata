@@ -1009,8 +1009,14 @@ function openDrawer(open) {
   $("scrim").hidden = !open;
   if (open) { loadDrawer(); loadShared(); loadMcp(); }
 }
+// the model's reasoning effort as a number (DeepSeek-V4.1: health.effort_max): a slider beside the words, which set it
+const EFFORT_OF = {low: 50, medium: 62, high: 75};
+function effortShown() { return !!(health && health.effort_max); }
 function loadDrawer(s = settings) {
   for (const b of $("s-thinking").children) b.setAttribute("aria-checked", String(b.dataset.v === s.thinking));
+  $("effort-row").hidden = !effortShown();
+  $("s-effort").value = typeof s.thinking === "number" ? s.thinking : (EFFORT_OF[s.thinking] || 75);
+  $("s-effort").disabled = s.thinking === "none";
   $("s-temp").value = s.temperature; $("s-topp").value = s.top_p; $("s-topk").value = s.top_k;
   $("s-max").value = s.max; $("s-seed").value = s.seed;
   $("s-show").setAttribute("aria-checked", String(!!s.show));
@@ -1059,10 +1065,20 @@ function outputs() {
   $("o-topp").textContent = (+$("s-topp").value).toFixed(2);
   $("o-topk").textContent = $("s-topk").value;
   const sel = [...$("s-thinking").children].find((b) => b.getAttribute("aria-checked") === "true");
-  $("o-thinking").textContent = sel ? {none: "answers right away", low: "short", medium: "medium", high: "thorough (default)"}[sel.dataset.v] : "";
+  $("o-thinking").textContent = sel ? {none: "answers right away", low: "short", medium: "medium", high: "thorough (default)"}[sel.dataset.v]
+                                    : effortShown() ? `effort ${$("s-effort").value}` : "";
   for (const id of ["s-topp", "s-topk"]) $(id).disabled = t === 0;
 }
-for (const b of $("s-thinking").children) b.onclick = () => { for (const x of $("s-thinking").children) x.setAttribute("aria-checked", String(x === b)); outputs(); };
+for (const b of $("s-thinking").children) b.onclick = () => {
+  for (const x of $("s-thinking").children) x.setAttribute("aria-checked", String(x === b));
+  if (EFFORT_OF[b.dataset.v]) $("s-effort").value = EFFORT_OF[b.dataset.v];   // (the words' numbers on the slider)
+  $("s-effort").disabled = b.dataset.v === "none";
+  outputs();
+};
+$("s-effort").oninput = () => {   // (a number of one's own: no word is selected then)
+  for (const x of $("s-thinking").children) x.setAttribute("aria-checked", "false");
+  outputs();
+};
 for (const id of ["s-temp", "s-topp", "s-topk"]) $(id).oninput = outputs;
 $("s-show").onclick = () => $("s-show").setAttribute("aria-checked", String($("s-show").getAttribute("aria-checked") !== "true"));
 $("s-esp").onclick = () => $("s-esp").setAttribute("aria-checked", String($("s-esp").getAttribute("aria-checked") !== "true"));
@@ -1071,7 +1087,7 @@ $("s-share").onclick = () => $("s-share").setAttribute("aria-checked", String($(
 $("s-reset").onclick = () => loadDrawer(DEFAULTS);
 $("s-apply").onclick = async () => {
   const sel = [...$("s-thinking").children].find((b) => b.getAttribute("aria-checked") === "true");
-  settings = {thinking: sel ? sel.dataset.v : "high", temperature: +$("s-temp").value, top_p: +$("s-topp").value,
+  settings = {thinking: sel ? sel.dataset.v : effortShown() ? +$("s-effort").value : "high", temperature: +$("s-temp").value, top_p: +$("s-topp").value,
               top_k: +$("s-topk").value, max: $("s-max").value.trim(), seed: $("s-seed").value.trim(),
               show: $("s-show").getAttribute("aria-checked") === "true",
               esp: $("s-esp").getAttribute("aria-checked") === "true",

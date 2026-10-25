@@ -6240,6 +6240,8 @@ def make_handler(svc: Service):
                 self._json(200, {"status": "ok", "max_context": svc.reported_ctx(), "model": svc.model,
                                  "images": svc.vision is not None, "api_key": bool(svc.api_key),
                                  "image_generation": svc.images is not None,
+                                 # (a model that takes its reasoning effort as a number: the page's effort slider)
+                                 **({"effort_max": 100} if svc.family == "deepseek41" else {}),
                                  "loaded": svc.loaded(), "service": "strata"})
             elif path.startswith("/v1/images/files/"):
                 # response_format url: the name (32 random hex digits) is the access, as an OpenAI image URL is

@@ -221,6 +221,10 @@
         <button type="button" role="radio" data-v="none">Off</button><button type="button" role="radio" data-v="low">Low</button>
         <button type="button" role="radio" data-v="medium">Medium</button><button type="button" role="radio" data-v="high">High</button>
       </div>
+      <div id="effort-row" hidden>
+        <input class="st-slider" type="range" id="s-effort" min="1" max="100" step="1" aria-label="Reasoning effort">
+        <span class="muted small">Effort 1-100: low 50, medium 62, high 75, max 100. 60-80 keeps most of the quality with far less thinking.</span>
+      </div>
     </div>
     <div class="st-field">
       <label class="st-label" for="s-temp">Temperature <output id="o-temp"></output></label>
