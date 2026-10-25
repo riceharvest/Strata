@@ -16,6 +16,12 @@
 #include "strata/sycl_math.hpp"
 
 #include <algorithm>
+#include <atomic>
+#include <exception>
+#include <execinfo.h>
+#if defined(__linux__)
+#include <sys/mman.h>
+#endif
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -528,6 +534,107 @@ inline bool pageable(const void* p, const sycl::context& ctx) {
     return sycl::get_pointer_type(p, ctx) == sycl::usm::alloc::unknown && !registered(p);
 }
 constexpr size_t kBigFill = (size_t) 256 << 20;   // memsets of zero past this go through strata::big_fill_zero (xe: no multi-GiB blit)
+// DS4_COPY_CHECK=1: every copy's and memset's device side must lie inside one cudaMalloc'd buffer, a USM host range inside
+// its allocation - else the call is printed with its stack before it is queued (a bad one kills the copy engine: DEVICE_LOST)
+inline bool copy_check_on() {
+    static const bool on = std::getenv("DS4_COPY_CHECK") != nullptr && std::atoi(std::getenv("DS4_COPY_CHECK")) != 0;
+    return on;
+}
+inline bool in_dev_alloc(const void* p, size_t n) {
+    std::lock_guard<std::mutex> lk(st().mu);
+    for (const auto& a : st().dev_allocs)
+        if ((const char*) p >= (const char*) a.first && (const char*) p + n <= (const char*) a.first + a.second.second) return true;
+    return false;
+}
+inline void check_range(const char* what, const void* p, size_t n, bool device_side, const sycl::context& ctx) {
+    if (!copy_check_on() || n == 0) return;
+    const sycl::usm::alloc t = sycl::get_pointer_type(p, ctx);
+    bool ok = true;
+    if (t == sycl::usm::alloc::device) ok = in_dev_alloc(p, n);
+    else if (t == sycl::usm::alloc::unknown) ok = !device_side && (!registered(p) || registered((const char*) p + n - 1));
+    else ok = sycl::get_pointer_type((const char*) p + n - 1, ctx) == t;
+    if (ok) return;
+    static std::atomic<int> reported{0};
+    if (reported.fetch_add(1) >= 20) return;
+    std::fprintf(stderr, "DS4_COPY_CHECK: bad %s %p + %zu (usm type %d, device side %d)\n", what, p, n, (int) t, (int) device_side);
+    void* bt[32];
+    const int k = backtrace(bt, 32);
+    backtrace_symbols_fd(bt, k, 2);
+}
+// (DS4_COPY_CHECK: the last 256 copies, with their callers, printed when the process dies - with the buffers nearest
+//  DS4_FAULT_VA, the address the kernel's xe fault line names)
+struct CopyRec {
+    const void *dst, *src;
+    size_t n;
+    int kind;
+    void* bt[4];
+};
+inline CopyRec* copy_ring() {
+    static CopyRec r[256];
+    return r;
+}
+inline std::atomic<unsigned>& copy_ring_i() {
+    static std::atomic<unsigned> i{0};
+    return i;
+}
+inline void copy_dump() {
+    std::fprintf(stderr, "DS4_COPY_CHECK: the last copies (oldest first):\n");
+    const unsigned e = copy_ring_i().load();
+    for (unsigned k = e > 256 ? e - 256 : 0; k < e; ++k) {
+        const CopyRec& c = copy_ring()[k % 256];
+        std::fprintf(stderr, "  #%u kind %d dst %p src %p n %zu  callers %p %p %p\n", k, c.kind, c.dst, c.src, c.n, c.bt[1], c.bt[2],
+                     c.bt[3]);
+    }
+    if (const char* v = std::getenv("DS4_FAULT_VA")) {
+        uintptr_t a = (uintptr_t) std::strtoull(v, nullptr, 16);
+        if (a < ((uintptr_t) 1 << 48) && (a >> 47) != 0) a |= ~(((uintptr_t) 1 << 48) - 1);   // (xe prints 48 bits: canonical form)
+        for (const auto& d : st().dev_allocs)
+            std::fprintf(stderr, "DS4_ALLOC %p + %zu\n", d.first, d.second.second);
+        uintptr_t best_lo = 0, best_hi = ~(uintptr_t) 0;
+        std::string lo_s = "-", hi_s = "-";
+        for (const auto& d : st().dev_allocs) {
+            const uintptr_t b = (uintptr_t) d.first, end = b + d.second.second;
+            char t[128];
+            std::snprintf(t, sizeof t, "device %p + %zu", d.first, d.second.second);
+            if (b <= a && a < end) std::fprintf(stderr, "DS4_FAULT_VA %p: INSIDE %s\n", (void*) a, t);
+            if (end <= a && end > best_lo) best_lo = end, lo_s = t;
+            if (b > a && b < best_hi) best_hi = b, hi_s = t;
+        }
+        for (const auto& r : st().registered) {
+            const uintptr_t b = (uintptr_t) r.first, end = b + r.second;
+            char t[128];
+            std::snprintf(t, sizeof t, "host range %p + %zu", (const void*) r.first, r.second);
+            if (b <= a && a < end) std::fprintf(stderr, "DS4_FAULT_VA %p: INSIDE %s\n", (void*) a, t);
+            if (end <= a && end > best_lo) best_lo = end, lo_s = t;
+            if (b > a && b < best_hi) best_hi = b, hi_s = t;
+        }
+        std::fprintf(stderr, "DS4_FAULT_VA %p: below it %s (ends %p), above it %s\n", (void*) a, lo_s.c_str(), (void*) best_lo,
+                     hi_s.c_str());
+    }
+}
+inline void copy_record(const void* dst, const void* src, size_t n, int kind) {
+    static const bool hooked = [] {
+        static std::terminate_handler prev = std::set_terminate([] {
+            copy_dump();
+            if (prev) prev();
+            std::abort();
+        });
+        return true;
+    }();
+    (void) hooked;
+    const unsigned k = copy_ring_i().fetch_add(1);
+    CopyRec& c = copy_ring()[k % 256];
+    c.dst = dst, c.src = src, c.n = n, c.kind = kind;
+    backtrace(c.bt, 4);
+    static const bool all = std::getenv("DS4_COPY_LOG") != nullptr;   // (every copy as it is queued)
+    if (all) std::fprintf(stderr, "DS4_COPY #%u kind %d dst %p src %p n %zu callers %p %p %p\n", k, kind, dst, src, n, c.bt[1], c.bt[2], c.bt[3]);
+}
+inline void check_copy(void* dst, const void* src, size_t n, int kind, const sycl::context& ctx) {
+    if (!copy_check_on()) return;
+    copy_record(dst, src, n, kind);
+    check_range("copy dst", dst, n, kind == 1 || kind == 3, ctx);
+    check_range("copy src", src, n, kind == 2 || kind == 3, ctx);
+}
 }  // namespace ds4_shim
 
 // USM allocations.  Device memory through strata::malloc_device_guarded (a big buffer is checked for aliased pages, as the main
@@ -541,6 +648,11 @@ inline cudaError_t cudaMalloc(T** p, size_t n) {
     const unsigned d = ds4_shim::cur_dev();
     ds4_shim::st().dev_allocs[v] = {d, n};
     ds4_shim::st().dev_used[d] += n;
+    if (ds4_shim::copy_check_on() && std::getenv("DS4_COPY_LOG")) {
+        void* bt[5];
+        backtrace(bt, 5);
+        std::fprintf(stderr, "DS4_MALLOC %p n %zu callers %p %p %p %p\n", v, n, bt[1], bt[2], bt[3], bt[4]);
+    }
     return cudaSuccess;
 }
 inline cudaError_t cudaFree(void* p) {
@@ -550,6 +662,11 @@ inline cudaError_t cudaFree(void* p) {
         std::lock_guard<std::mutex> lk(ds4_shim::st().mu);
         auto it = ds4_shim::st().dev_allocs.find(p);
         if (it != ds4_shim::st().dev_allocs.end()) {
+            if (ds4_shim::copy_check_on() && std::getenv("DS4_COPY_LOG")) {
+                void* bt[5];
+                backtrace(bt, 5);
+                std::fprintf(stderr, "DS4_FREE %p n %zu callers %p %p %p %p\n", p, it->second.second, bt[1], bt[2], bt[3], bt[4]);
+            }
             ds4_shim::st().dev_used[it->second.first] -= it->second.second;
             ds4_shim::st().dev_allocs.erase(it);
         }
@@ -599,6 +716,9 @@ inline cudaError_t cudaHostUnregister(void* p) {
 // pointer import: a copy from it is a DMA as from USM host memory, where cudaHostRegister above is bookkeeping only (it is what
 // the model files' mappings get - 100+ GB the import would pin).  For the RAM store's arena chunks (2 GB each).
 inline bool ds4_host_import(void* p, size_t n) {
+#if defined(__linux__)
+    if (!(std::getenv("DS4_THP") != nullptr && std::atoi(std::getenv("DS4_THP")) != 0)) madvise(p, n, MADV_NOHUGEPAGE);   // (ds4_os.hpp thp_on)
+#endif
     try {
         sycl::ext::oneapi::experimental::prepare_for_device_copy(p, n, dpct::get_in_order_queue().get_context());
     } catch (const sycl::exception&) {
@@ -628,15 +748,17 @@ enum cudaMemcpyKind {
     cudaMemcpyDefault = 4
 };
 
-inline cudaError_t cudaMemcpy(void* dst, const void* src, size_t n, cudaMemcpyKind) {
+inline cudaError_t cudaMemcpy(void* dst, const void* src, size_t n, cudaMemcpyKind kind) {
     auto& q = dpct::get_in_order_queue();
+    ds4_shim::check_copy(dst, src, n, (int) kind, q.get_context());
     q.memcpy(dst, src, n).wait();
     return cudaSuccess;
 }
 // CUDA: an async copy to or from pageable host memory returns once the host side is no longer needed - a temporary may be
 // reused or freed right after (the RAM store's table, ds4_model 4752).  SYCL's copy reads it later, so those wait.
-inline cudaError_t cudaMemcpyAsync(void* dst, const void* src, size_t n, cudaMemcpyKind, cudaStream_t s = nullptr) {
+inline cudaError_t cudaMemcpyAsync(void* dst, const void* src, size_t n, cudaMemcpyKind kind, cudaStream_t s = nullptr) {
     auto q = strata::q_of(s);
+    ds4_shim::check_copy(dst, src, n, (int) kind, q->get_context());
     sycl::event e = q->memcpy(dst, src, n);
     const sycl::context ctx = q->get_context();
     if (ds4_shim::pageable(src, ctx) || ds4_shim::pageable(dst, ctx)) e.wait();
@@ -644,12 +766,16 @@ inline cudaError_t cudaMemcpyAsync(void* dst, const void* src, size_t n, cudaMem
 }
 inline cudaError_t cudaMemset(void* p, int v, size_t n) {
     auto& q = dpct::get_in_order_queue();
+    ds4_shim::check_range("memset", p, n, true, q.get_context());
+    if (ds4_shim::copy_check_on()) ds4_shim::copy_record(p, nullptr, n, 9);
     if (v == 0 && n > ds4_shim::kBigFill) strata::big_fill_zero(q, p, n);
     else q.memset(p, v, n).wait();
     return cudaSuccess;
 }
 inline cudaError_t cudaMemsetAsync(void* p, int v, size_t n, cudaStream_t s = nullptr) {
     auto q = strata::q_of(s);
+    ds4_shim::check_range("memset", p, n, true, q->get_context());
+    if (ds4_shim::copy_check_on()) ds4_shim::copy_record(p, nullptr, n, 9);
     if (v == 0 && n > ds4_shim::kBigFill) strata::big_fill_zero(*q, p, n);   // (waits: compute kernels, not one huge blit)
     else q->memset(p, v, n);
     return cudaSuccess;
@@ -660,14 +786,22 @@ inline sycl::event ds4_copy2d(sycl::queue& q, void* dst, size_t dpitch, const vo
     for (size_t r = 0; r < height; ++r) e = q.memcpy((char*) dst + r * dpitch, (const char*) src + r * spitch, width);
     return e;
 }
-inline cudaError_t cudaMemcpy2D(void* dst, size_t dpitch, const void* src, size_t spitch, size_t width, size_t height, cudaMemcpyKind) {
+inline cudaError_t cudaMemcpy2D(void* dst, size_t dpitch, const void* src, size_t spitch, size_t width, size_t height, cudaMemcpyKind kind) {
     auto& q = dpct::get_in_order_queue();
+    if (ds4_shim::copy_check_on() && height > 0) {
+        ds4_shim::check_range("copy2d dst", dst, dpitch * (height - 1) + width, kind == 1 || kind == 3, q.get_context());
+        ds4_shim::check_range("copy2d src", src, spitch * (height - 1) + width, kind == 2 || kind == 3, q.get_context());
+    }
     ds4_copy2d(q, dst, dpitch, src, spitch, width, height);
     q.wait();
     return cudaSuccess;
 }
-inline cudaError_t cudaMemcpy2DAsync(void* dst, size_t dpitch, const void* src, size_t spitch, size_t width, size_t height, cudaMemcpyKind, cudaStream_t s = nullptr) {
+inline cudaError_t cudaMemcpy2DAsync(void* dst, size_t dpitch, const void* src, size_t spitch, size_t width, size_t height, cudaMemcpyKind kind, cudaStream_t s = nullptr) {
     auto q = strata::q_of(s);
+    if (ds4_shim::copy_check_on() && height > 0) {
+        ds4_shim::check_range("copy2d dst", dst, dpitch * (height - 1) + width, kind == 1 || kind == 3, q->get_context());
+        ds4_shim::check_range("copy2d src", src, spitch * (height - 1) + width, kind == 2 || kind == 3, q->get_context());
+    }
     sycl::event e = ds4_copy2d(*q, dst, dpitch, src, spitch, width, height);
     const sycl::context ctx = q->get_context();
     if (height > 0 && (ds4_shim::pageable(src, ctx) || ds4_shim::pageable(dst, ctx))) e.wait();   // (in order: the last row's)

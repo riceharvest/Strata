@@ -398,6 +398,21 @@ inline bool in_ram(const void* p, size_t n) {
 #endif
 }
 
+/// The arenas without transparent huge pages (MADV_NOHUGEPAGE; DS4_THP=1: on huge pages as before) - khugepaged's collapse and
+/// the compaction THP faults ask for migrate their pages, and a page of a range imported for device copies that moved under a
+/// running copy faulted the copy engine (xe "CAT error", DEVICE_LOST: 3 of 4 unpruned runs, 0 of 3 without; decode and a 128K
+/// prompt the same speed either way, REAP144 on one B70)
+inline bool thp_on() {
+    static const bool on = std::getenv("DS4_THP") != nullptr && std::atoi(std::getenv("DS4_THP")) != 0;
+    return on;
+}
+inline int thp_advice() {
+#if defined(_WIN32)
+    return 0;
+#else
+    return thp_on() ? MADV_HUGEPAGE : MADV_NOHUGEPAGE;
+#endif
+}
 /// Anonymous memory on NUMA node `node` of `nodes` (node < 0 or nodes < 2: wherever the first touch puts it), on huge
 /// pages where the OS gives them; nullptr if it cannot be had.
 inline void* anon_alloc(size_t bytes, int node, int nodes) {
@@ -409,7 +424,7 @@ inline void* anon_alloc(size_t bytes, int node, int nodes) {
 #else
     void* m = ::mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (m == MAP_FAILED) return nullptr;
-    madvise(m, bytes, MADV_HUGEPAGE);
+    madvise(m, bytes, thp_advice());
     if (node >= 0 && nodes > 1) {
         unsigned long mask[4] = {0, 0, 0, 0};
         mask[node / 64] = 1ul << (node % 64);
@@ -448,7 +463,7 @@ inline bool range_commit(void* p, size_t bytes) {
     return VirtualAlloc(p, bytes, MEM_COMMIT, PAGE_READWRITE) != nullptr;
 #else
     if (::mprotect(p, bytes, PROT_READ | PROT_WRITE) != 0) return false;
-    ::madvise(p, bytes, MADV_HUGEPAGE);
+    ::madvise(p, bytes, thp_advice());
     return true;
 #endif
 }
