@@ -255,7 +255,8 @@ static void run(const Set& S, float limit, cudaStream_t s, std::vector<uint16_t>
 }
 
 static int check_main() {
-    setenv("STRATA_DS4_NO_LIGHT", "1", 1);   // (every expert through the tiles, the few-row ones too)
+    if (std::getenv("DS4_TEST_LIGHT") == nullptr)   // (DS4_TEST_LIGHT=1: the light kernels take the experts of <= 64 rows)
+        setenv("STRATA_DS4_NO_LIGHT", "1", 1);   // (every expert through the tiles, the few-row ones too)
     std::printf("device: %s\n", dpct::get_current_device().get_info<sycl::info::device::name>().c_str());
     cudaStream_t s = nullptr;
     cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking);
@@ -291,6 +292,7 @@ static int check_main() {
         double eh = 0, ey = 0, fh = 0, fy = 0;
         for (int e = 0; e < S.E; ++e) {
             const Err a = check_expert(S, e, hx, yx, true, limit, s);    // XMX against F16 rows
+            if (std::getenv("DS4_TEST_LIGHT")) std::printf("   expert %d (%d rows): h %.2e y %.2e\n", e, S.cnt[(size_t) e], a.h, a.y);
             const Err b = check_expert(S, e, hf, yf, false, limit, s);   // F32 kernel against F32 rows
             eh = std::max(eh, a.h), ey = std::max(ey, a.y), fh = std::max(fh, b.h), fy = std::max(fy, b.y);
         }
@@ -597,7 +599,7 @@ static int ix_bench(int T, int n) {
 static int bench_main(int type, int E, int R, int N) {
     std::printf("device: %s; %s, %d experts x %d rows, n_embd %d n_ff %d, light kernels %s\n",
                 dpct::get_current_device().get_info<sycl::info::device::name>().c_str(), iq::name(type), E, R, kD, kF,
-                std::getenv("STRATA_DS4_NO_LIGHT") ? "off" : "on (experts <= 16 rows)");
+                std::getenv("STRATA_DS4_NO_LIGHT") ? "off" : "on (experts <= 64 rows)");
     cudaStream_t s = nullptr;
     cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking);
     std::mt19937 rng(11);

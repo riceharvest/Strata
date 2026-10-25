@@ -1498,8 +1498,10 @@ __global__ void __launch_bounds__(kThreads) mv_kernel(const Jobs J) {
 // rows' work for them.  Each expert by its own rows: the light kernels take the experts of <= kLightRows rows, the tiles
 // the others (SetArgs::skip_le: they skip the light ones) - every expert's sums in one fixed order whatever the set.
 // Expert e's row i is input row e kLightRows + i of the scratch, output (local) row bounds[e] - row0 + i.
-constexpr int kLightRows = 16;
-constexpr int kLightMaxExp = 512;   // a set's experts at most (the scratch: kLightMaxExp kLightRows rows)
+// (64: a short prompt's experts of 17..64 rows took the 64-row tiles, a whole tile's decode and work for each - a 242-token prompt's
+//  experts were 1.25 s of its 1.6; the light kernels take them in passes of 16 rows, each reading the weights once)
+constexpr int kLightRows = 64;
+constexpr int kLightMaxExp = 128;   // a set's experts at most (the scratch: kLightMaxExp kLightRows rows)
 
 // grid (k / 32 / 8, n_exp kLightRows): the light experts' rows of k values (gate / up: F32 x[idx[lr]]; down: F16 h[lr],
 // ldx apart) -> int8 q[e kLightRows + i][k], scales d[..][k / 32]
@@ -1591,11 +1593,11 @@ __global__ void __launch_bounds__(kThreads) light_kernel(const SetArgs a, const 
 // row of the expert a pass -> h16 (the F16 swiglu) or y
 template <int T, int NE, bool GATE_UP>
 __global__ void __launch_bounds__(kThreads) light_kernel_rows(const SetArgs a, const int8_t* __restrict__ xq,
-                                                          const float* __restrict__ xd) {
+                                                          const float* __restrict__ xd, int r_off) {
     SYCL_SHARED(uint32_t[Ty<T>::TAB > 0 ? Ty<T>::TAB : 1], tab);
-    const int e = blockIdx.y;
-    const int lo = a.bounds[e] - a.row0, ne = a.bounds[e + 1] - a.bounds[e];
-    if (ne <= 0 || ne > NE) return;   // (uniform: the tiles take an expert of more rows)
+    const int e = blockIdx.y;   // (rows r_off .. + NE of each light expert: a pass of launch_light's)
+    const int all = a.bounds[e + 1] - a.bounds[e], lo = a.bounds[e] - a.row0 + r_off, ne = sycl::min(NE, all - r_off);
+    if (ne <= 0 || all > kLightRows) return;   // (uniform: the tiles take an expert of more rows)
     load_tab<T>(tab);
     __syncthreads();
     const int K = GATE_UP ? a.n_embd : a.n_ff, N = GATE_UP ? a.n_ff : a.n_embd, nsb = K / 32;
@@ -1605,7 +1607,7 @@ __global__ void __launch_bounds__(kThreads) light_kernel_rows(const SetArgs a, c
     const size_t rb = row_bytes_t<T>(K);
     const uint8_t* w0 = blob + a.tr[GATE_UP ? 0 : 2] + (size_t) row * rb;
     const uint8_t* w1 = blob + a.tr[1] + (size_t) row * rb;
-    const size_t q0 = (size_t) e * kLightRows;
+    const size_t q0 = (size_t) e * kLightRows + (size_t) r_off;
     float a0[NE], a1[NE];
 #pragma unroll
     for (int i = 0; i < NE; ++i) a0[i] = a1[i] = 0.0f;
@@ -1813,11 +1815,13 @@ void launch_light(const SetArgs& a, const LightBuf& b, cudaStream_t s) {
         if constexpr (kPersist<T>)
             STRATA_LAUNCH(s, items_grid<T>(a.n_exp * tiles, resident_ctas<light_kernel<T, 4, GU>>()), kThreads, 0, (light_kernel<T, 4, GU>), a, b.q, b.d);
         else   // (a small codebook: the release's kernel, which is the faster there)
-            STRATA_LAUNCH(s, dim3((unsigned) tiles, (unsigned) a.n_exp), kThreads, 0, (light_kernel_rows<T, 4, GU>), a, b.q, b.d);
-    } else {   // more rows: compute bound, the release's kernel and grid
+            STRATA_LAUNCH(s, dim3((unsigned) tiles, (unsigned) a.n_exp), kThreads, 0, (light_kernel_rows<T, 4, GU>), a, b.q, b.d, 0);
+    } else {   // more rows: compute bound, the release's kernel and grid - 16 rows a pass
         const dim3 grid((unsigned) tiles, (unsigned) a.n_exp);
-        if (a.max_rows <= 8) STRATA_LAUNCH(s, grid, kThreads, 0, (light_kernel_rows<T, 8, GU>), a, b.q, b.d);
-        else STRATA_LAUNCH(s, grid, kThreads, 0, (light_kernel_rows<T, kLightRows, GU>), a, b.q, b.d);
+        if (a.max_rows <= 8) STRATA_LAUNCH(s, grid, kThreads, 0, (light_kernel_rows<T, 8, GU>), a, b.q, b.d, 0);
+        else
+            for (int r = 0; r < std::min(a.max_rows, kLightRows); r += 16)
+                STRATA_LAUNCH(s, grid, kThreads, 0, (light_kernel_rows<T, 16, GU>), a, b.q, b.d, r);
     }
 }
 bool light_set(const SetArgs& a, bool gu, cudaStream_t s) {

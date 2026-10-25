@@ -1122,6 +1122,10 @@ struct Model::Impl {
 #endif
     }
     bool copy_mode = false;
+    bool copy_import_failed = false;
+    // (the copies imported before they are filled, the prompt's streams and the cache's swaps DMA them straight from RAM - on by
+    //  default since that order no longer hangs; DS4_COPY_DMA=0: through the staging memcpy, as before)
+    static bool copy_dma_wanted() { return !(std::getenv("DS4_COPY_DMA") != nullptr && std::atoi(std::getenv("DS4_COPY_DMA")) == 0); }
     bool copy_dma = false;   // (copy_mode's RAM imported for device copies: the prompt's streams DMA from it)
     std::vector<std::array<uint8_t*, 2>> ram_part;   // slot -> its parts
     std::vector<std::array<size_t, 4>> cp_lay;       // layer -> part offsets of gate, up, down rows; a part's bytes
@@ -4510,6 +4514,10 @@ struct Model::Impl {
                 n_copy[(size_t) l.il] = 0;
                 continue;
             }
+            if (NH == 1 && chunk > 0 && copy_dma_wanted()) {   // (imported before it is filled, as the store's arena is: imported
+                                                              //  after, the prompt's first layer never finished)
+                if (!ds4_host_import(base[0], bytes)) copy_import_failed = true;
+            }
             first[(size_t) l.il] = (int) ram_part.size();
             for (int i = 0; i < ns; ++i)
                 ram_part.push_back({base[0] + (size_t) i * part, NH > 1 ? base[1] + (size_t) i * part : nullptr});
@@ -4561,14 +4569,10 @@ struct Model::Impl {
         }
         for (const Job& j : jobs) L[(size_t) j.layer].ram[(size_t) j.e] = j.slot;
         copy_mode = true;
-        // the copies imported for the copy engines (one NUMA part): the prompt's streams DMA them from where they lie
-        // (opt-in, DS4_COPY_DMA=1: on the B70 the prompt's first layer never finished with it - the copies from these pages never
-        //  ran - while the RAM store's imported arena works; the staged copies read the prompt as fast at 16K)
-        if (NH == 1 && chunk > 0 && std::getenv("DS4_COPY_DMA") != nullptr && std::atoi(std::getenv("DS4_COPY_DMA")) != 0) {
-            bool all_in = true;
-            for (size_t i = 0; i < ram_chunks.size(); ++i) all_in = ds4_host_import(ram_chunks[i], ram_chunk_bytes[i]) && all_in;
-            copy_dma = all_in;
-        }
+        // the copies imported for the copy engines (one NUMA part): the prompt's streams and the cache's swaps DMA them from where
+        // they lie (imported after the fill, the prompt's first layer never finished on the B70; imported before it, as the RAM
+        // store's arena: 128K prompt 1310 -> 1355 tok/s, every expert straight from RAM; DS4_COPY_DMA=0: the staged copies)
+        if (NH == 1 && chunk > 0 && copy_dma_wanted()) copy_dma = !copy_import_failed && !ram_chunks.empty();
         ram_held = (int) jobs.size();
         double cb = 0;
         for (const Job& j : jobs) cb += (double) L[(size_t) j.layer].blob;
@@ -6184,9 +6188,22 @@ struct Model::Impl {
                 }
             }
         }
-        bool ok = copy_mode ? read_mx(l, sw.in, sw_a) : read_mx_file(l, sw.in, sw_a);   // (a copy holds its slot till
-                                                                                          // this swap's switch)
-        for (int m = 0; m < l.nm && ok; ++m) {
+        // (its RAM copy imported for device copies, DS4_COPY_DMA: DMA'd straight from it, part by part - no staging memcpy; the
+        //  settle after a prompt moved ~600 experts at ~2.7 ms each through the staging buffer)
+        const bool direct = copy_dma && copy_mode && l.nm == 1 && NH == 1 && !l.ram.empty() && l.ram[(size_t) sw.in] >= 0;
+        bool ok = direct || (copy_mode ? read_mx(l, sw.in, sw_a) : read_mx_file(l, sw.in, sw_a));   // (a copy holds its slot
+                                                                                                    //  till this swap's switch)
+        if (direct) {
+            cudaSetDevice(devs[(size_t) l.dev].id);
+            cudaStream_t cs = copy_st[(size_t) l.dev];
+            uint8_t* dst = l.vram_base + (size_t) l.spare_vram * unit(l);
+            const int rs = l.ram[(size_t) sw.in];
+            for (int r = 0; r < 3 && ok; ++r)
+                ok = cudaMemcpyAsync(dst + l.lay.trellis[r], ram_part[(size_t) rs][0] + cp_lay[(size_t) l.il][(size_t) r],
+                                     (size_t) mx_n(r) * mx_row_b(l, r), cudaMemcpyHostToDevice, cs) == cudaSuccess;
+            ok = ok && cudaStreamSynchronize(cs) == cudaSuccess;
+        }
+        for (int m = 0; m < l.nm && ok && !direct; ++m) {
             const Layer& x = member(l, m);
             cudaSetDevice(devs[(size_t) x.dev].id);
             cudaStream_t cs = copy_st[(size_t) x.dev];
@@ -6243,7 +6260,10 @@ struct Model::Impl {
         if (!o.expert_cache || cache_ths.empty()) return;
         // (6 s: at 1.5 the decode after a 120K-token prompt ran 8.6 tok/s against 11.2 - 76 swaps against 343, more of each
         //  token's experts on the CPU lane - so the swaps keep their time; the RAM store's refill below no longer blocks)
-        static const double budget = env_f("DS4_SETTLE_MS", 6000.0f);
+        // (a tenth of the prompt's own time, at most 6 s - DS4_SETTLE_MS sets it: a 242-token prompt waited 1.6 s here for 605
+        //  swaps, half its time to the first token; the decode's own ticks go on with them)
+        static const bool fixed = std::getenv("DS4_SETTLE_MS") != nullptr;
+        const double budget = fixed ? env_f("DS4_SETTLE_MS", 6000.0f) : std::min(6000.0, 0.1 * (now_ms() - prompt_t0));
         if (settle_th.joinable()) settle_th.join();   // (the refill the prompt before started)
         if (budget <= 0.0) return;
         const double t0 = now_ms();
@@ -8133,6 +8153,7 @@ struct Model::Impl {
         double sum = 0, cold = 0;
         n_cold = 0;
         for (int e = 0; e < l.n_exp; ++e) {
+            if (!l.masked.empty() && l.masked[(size_t) e]) continue;   // (pruned: never picked)
             sum += pr[e];
             if (l.slot[(size_t) e] < 0) cold += pr[e], ++n_cold;
         }
@@ -8184,7 +8205,7 @@ struct Model::Impl {
             int sampled = 0, res = 0, seen = 0;
             const int step = std::max(1, nc / 32);
             for (int e = 0; e < l.n_exp; ++e) {
-                if (l.slot[(size_t) e] >= 0 || seen++ % step != 0) continue;
+                if (l.slot[(size_t) e] >= 0 || (!l.masked.empty() && l.masked[(size_t) e]) || seen++ % step != 0) continue;
                 bool r = !l.ram.empty() && l.ram[(size_t) e] >= 0;
                 if (!r) {
                     r = true;
@@ -8365,8 +8386,10 @@ struct Model::Impl {
 
     // n tokens at positions pos .. in chunks of equal size (at most `chunk`), pipelined over the groups; the logits of
     // the last min(logits_rows, 16) rows (logits_rows > 16: a run of one chunk, every row's into chunk_logits)
+    double prompt_t0 = 0.0;   // (when the last chunked prompt began: cache_settle's budget)
     bool forward_chunks(const int* tk, int n, int logits_rows, std::string& err, int snap_slot = -1) {
         if (n < 1) return true;
+        prompt_t0 = now_ms();
         ov_evict();   // (the decode tier's experts back to the CPU lane: the chunk buffers are the prompt's again)
         if (pos + n > o.max_context) {
             err = "the context is full";
