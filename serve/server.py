@@ -7334,9 +7334,13 @@ def clean_shared_defaults(d) -> dict:
         if value is None or value == "":
             continue
         number = isinstance(value, (int, float)) and not isinstance(value, bool)
-        if key == "reasoning_effort":
-            if value not in ("none", "low", "medium", "high"):
-                raise ValueError("reasoning_effort: none, low, medium or high")
+        if key == "reasoning_effort":   # (a number 1..100: DeepSeek-V4.1's scale; other models take the nearest word)
+            from serve.frontend import effort_number
+            num = effort_number(value)
+            if num is not None and 1 <= num <= 100:
+                value = num
+            elif value not in ("none", "low", "medium", "high", "xhigh", "max"):
+                raise ValueError("reasoning_effort: none, low, medium, high, max or 1..100")
         elif key == "temperature":
             if not number or not 0 <= value <= 2:
                 raise ValueError("temperature: 0..2")

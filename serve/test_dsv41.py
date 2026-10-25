@@ -433,6 +433,28 @@ class Api(ApiBase):
         self.assertIn("Reasoning Effort: 75 ", self.prompt())
         status, r = self.chat(reasoning_effort="extreme")
         self.assertEqual(status, 400)
+        status, r = self.chat(reasoning_effort="40")   # (a number as a string, as some clients send it)
+        self.assertEqual(status, 200, r)
+        self.assertIn("Reasoning Effort: 40 ", self.prompt())
+        for bad in (0, 101, "0", "250"):
+            status, r = self.chat(reasoning_effort=bad)
+            self.assertEqual(status, 400, bad)
+
+    def test_effort_numbers_as_defaults_and_on_other_models(self):
+        from serve.server import clean_shared_defaults
+        import serve.frontend as fe
+        self.assertEqual(clean_shared_defaults({"reasoning_effort": "60"}), {"reasoning_effort": 60})
+        self.assertEqual(clean_shared_defaults({"reasoning_effort": 85}), {"reasoning_effort": 85})
+        self.assertEqual(clean_shared_defaults({"reasoning_effort": "max"}), {"reasoning_effort": "max"})
+        with self.assertRaises(ValueError):
+            clean_shared_defaults({"reasoning_effort": 0})
+        fe.use_family(None)   # (a model without the 1..100 scale: the nearest word)
+        try:
+            self.assertEqual(fe.effort_kwargs(40), {"reasoning_effort": "low"})
+            self.assertEqual(fe.effort_kwargs("70"), {"reasoning_effort": "medium"})
+            self.assertEqual(fe.effort_kwargs(90), {"reasoning_effort": "xhigh"})
+        finally:
+            fe.use_family("deepseek41")
 
     def test_anthropic_budget_picks_the_effort(self):
         self.start("ok")

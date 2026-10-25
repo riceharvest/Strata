@@ -151,16 +151,32 @@ def use_family(family: str | None) -> None:
     _NUMERIC_EFFORT = family == "deepseek41"
 
 
+def effort_number(value):
+    """A reasoning effort given as a number - 40, 40.0 or "40" (clients send it as a string too) - as an int, else None."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return int(value) if float(value).is_integer() else None
+    if isinstance(value, str) and value.strip().isdigit():
+        return int(value.strip())
+    return None
+
+
 def effort_kwargs(value) -> dict:
-    """A reasoning effort as given by a client -> the template's kwargs.  Unknown values are a 400, not a crash."""
+    """A reasoning effort as given by a client -> the template's kwargs.  Unknown values are a 400, not a crash.
+    DeepSeek-V4.1 takes a whole number 1..100 as it is (its prompt's "Reasoning Effort: N"; the API's tiers low / high /
+    max are 50 / 75 / 100); a model without that scale gets the nearest word for one."""
     if value is None or value == "":
         return {}
     if value is False:
         return {"enable_thinking": False}
-    if _NUMERIC_EFFORT and isinstance(value, int) and not isinstance(value, bool):
-        if not 1 <= value <= 100:
+    num = effort_number(value)
+    if num is not None:
+        if not 1 <= num <= 100:
             raise ValueError(f"unknown reasoning effort {value!r}: use none, low, medium, high, max or 1..100")
-        return {"reasoning_effort": value}
+        if _NUMERIC_EFFORT:
+            return {"reasoning_effort": num}
+        value = "low" if num <= 55 else "medium" if num < 75 else "high"
     key = str(value).strip().lower()
     if key not in EFFORT:
         raise ValueError(f"unknown reasoning effort {value!r}: use none, low, medium or high"
