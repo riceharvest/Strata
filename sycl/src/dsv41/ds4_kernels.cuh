@@ -161,6 +161,9 @@ struct AttnRows {
     // then the chunk's), selecting min(kcap, (its position + 1) / R) compressed rows when R > 0
     int gen = 0, t0 = 0, win = 0, R = 0, kcap = 0;
     long long p0 = 0;
+    // (gen) SWA Bounded Replay (the V4.1 report, 3.2.2): a replay from position swa_lo attends to window rows in
+    // [max(swa_lo, p - win + 1), p] - the decoder layers' rows before it were never computed; -1: no bound
+    long long swa_lo = -1;
 };
 /// (tests) a prompt chunk's sparse attention over packed rows: 1 XMX (an AOT bmg build), 0 the FMA kernel, -1 the default
 void attn_force_xmx(int mode);

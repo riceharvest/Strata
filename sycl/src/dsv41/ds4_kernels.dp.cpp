@@ -883,7 +883,7 @@ __global__ void __launch_bounds__(kThreads) sparse_attn_kernel(const float* __re
     int n_win, n_sel, w0;
     if (ar.gen) {
         const long long ta = ar.t0 + t, pa = ar.p0 + ta;
-        const long long first = max((long long) ar.win - ar.p0, ta + 1);   // the window buffer row of max(0, pa - win + 1)
+        const long long first = max(max((long long) ar.win - ar.p0, ta + 1), ar.swa_lo >= 0 ? ar.swa_lo - ar.p0 + ar.win : 0ll);   // the window buffer row of max(0, pa - win + 1)
         w0 = (int) first;
         n_win = (int) (ar.win + ta - first + 1);
         n_sel = ar.R > 0 ? (int) min((long long) ar.kcap, (pa + 1) / ar.R) : 0;
@@ -1065,7 +1065,7 @@ __global__ void __launch_bounds__(kThreads) sparse_attn_packed_kernel(const floa
     int n_win, n_sel, w0;
     if (ar.gen) {
         const long long ta = ar.t0 + t, pa = ar.p0 + ta;
-        const long long first = max((long long) ar.win - ar.p0, ta + 1);
+        const long long first = max(max((long long) ar.win - ar.p0, ta + 1), ar.swa_lo >= 0 ? ar.swa_lo - ar.p0 + ar.win : 0ll);
         w0 = (int) first;
         n_win = (int) (ar.win + ta - first + 1);
         n_sel = ar.R > 0 ? (int) min((long long) ar.kcap, (pa + 1) / ar.R) : 0;
@@ -2297,7 +2297,7 @@ void sparse_attn_xmx_kernel(sycl::nd_item<2> it, const float* __restrict__ q, co
     const int t = (int) it.get_group(0), hb = (int) it.get_group(1) * kAxH;
     // the query's rows (as sparse_attn_packed_kernel's gen path)
     const long long ta = ar.t0 + t, pa = ar.p0 + ta;
-    const long long first = sycl::max((long long) ar.win - ar.p0, ta + 1);
+    const long long first = sycl::max(sycl::max((long long) ar.win - ar.p0, ta + 1), ar.swa_lo >= 0 ? ar.swa_lo - ar.p0 + ar.win : 0ll);
     const int w0 = (int) first, n_win = (int) (ar.win + ta - first + 1);
     const int n_sel = ar.R > 0 ? (int) sycl::min((long long) ar.kcap, (pa + 1) / ar.R) : 0;
     const uint16_t* wbase = win + (size_t) w0 * d;
@@ -2433,7 +2433,7 @@ void sparse_attn_xmx64_kernel(sycl::nd_item<2> it, const float* __restrict__ q, 
     const int tid = (int) it.get_local_id(1), sgi = tid >> 4;
     const int t = (int) it.get_group(0);
     const long long ta = ar.t0 + t, pa = ar.p0 + ta;
-    const long long first = sycl::max((long long) ar.win - ar.p0, ta + 1);
+    const long long first = sycl::max(sycl::max((long long) ar.win - ar.p0, ta + 1), ar.swa_lo >= 0 ? ar.swa_lo - ar.p0 + ar.win : 0ll);
     const int w0 = (int) first, n_win = (int) (ar.win + ta - first + 1);
     const int n_sel = ar.R > 0 ? (int) sycl::min((long long) ar.kcap, (pa + 1) / ar.R) : 0;
     const uint16_t* wbase = win + (size_t) w0 * d;

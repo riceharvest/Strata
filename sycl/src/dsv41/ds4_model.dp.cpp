@@ -830,6 +830,7 @@ struct Model::Impl {
     size_t eg_cap = kWin;             // tokens h_eg holds
     int tap_cap = kWin;               // rows h_taps holds (a chunk seeds the drafter with its last 128)
     static constexpr int kYocoMin = 1024;   // a long prompt's skip (forward_chunks): the fewest rows worth skipping
+    static constexpr int kYocoMin2 = 16;    // (DeepSeek's bounded replay, the default: any prompt past its 128 rows)
     bool logits_all = false;          // the last feed was a chunk with logits for every row (chunk_logits)
     std::vector<float> chunk_logits;
     std::function<void(int64_t)> progress;   // a run of chunks: the tokens done so far (the main thread, while it waits)
@@ -1026,6 +1027,8 @@ struct Model::Impl {
     static constexpr int kOvSlot = 1 << 30;
     std::vector<std::pair<uint8_t*, size_t>> ov_pieces;   // (device 0's idle-in-decode chunk buffers)
     std::vector<std::pair<int, int>> ov_live;             // (layer, expert) held there now
+    bool ov_pending = false;                              // (a chunked prompt ran: ov_load at the next decoded token)
+    std::vector<std::pair<unsigned long long*, unsigned long long>> ov_tab;   // (ov_load: table entries to write after the copies)
     uint8_t* ov_stage = nullptr;
     size_t ov_stage_bytes = 0;
     // the swap rule: a CPU-lane expert in when its heat passes the coldest VRAM one's x margin + bonus; heat x decay
@@ -1125,6 +1128,11 @@ struct Model::Impl {
     bool copy_import_failed = false;
     // (the copies imported before they are filled, the prompt's streams and the cache's swaps DMA them straight from RAM - on by
     //  default since that order no longer hangs; DS4_COPY_DMA=0: through the staging memcpy, as before)
+    bool copy_whole(const Layer& l) const {   // (a RAM copy's parts lie as in a VRAM slot: one copy moves it)
+        for (int r = 0; r < 3; ++r)
+            if (cp_lay[(size_t) l.il][(size_t) r] - cp_lay[(size_t) l.il][0] != l.lay.trellis[r] - l.lay.trellis[0]) return false;
+        return NH == 1 && l.nm == 1;
+    }
     static bool copy_dma_wanted() { return !(std::getenv("DS4_COPY_DMA") != nullptr && std::atoi(std::getenv("DS4_COPY_DMA")) == 0); }
     bool copy_dma = false;   // (copy_mode's RAM imported for device copies: the prompt's streams DMA from it)
     std::vector<std::array<uint8_t*, 2>> ram_part;   // slot -> its parts
@@ -3564,15 +3572,24 @@ struct Model::Impl {
             const Layer& l = L[(size_t) it.il];
             uint8_t* dst = c.ring + r * c.ring_stride;
             const x3::ExpertLayout& lay = l.nm > 1 ? l.hlay : l.lay;
-            for (int p = 0; p < 2; ++p)
-                CK(cudaMemcpyAsync(dst + lay.trellis[p], it.src[p], mx_read_len(l, p), cudaMemcpyHostToDevice, c.cs));
-            if (l.nm > 1) {   // (the down's part: in each of its rows the member's blocks)
-                const int t2 = gg::expert_type(l.lay, 2);
-                const size_t dr = gg::type_row_bytes(t2, g.ff), dh = gg::type_row_bytes(t2, g.ff / l.nm);
-                CK(cudaMemcpy2DAsync(dst + lay.trellis[2], dh, it.src[2] + (size_t) it.mi * dh, dr, dh, (size_t) g.dim,
-                                     cudaMemcpyHostToDevice, c.cs));
-            } else
-                CK(cudaMemcpyAsync(dst + lay.trellis[2], it.src[2], mx_part_bytes(l, 2), cudaMemcpyHostToDevice, c.cs));
+            const bool whole = l.nm == 1 && mx_read_len(l, 0) == mx_part_bytes(l, 0) && mx_read_len(l, 1) == mx_part_bytes(l, 1) &&
+                               it.src[1] == it.src[0] + (lay.trellis[1] - lay.trellis[0]) &&
+                               it.src[2] == it.src[0] + (lay.trellis[2] - lay.trellis[0]);
+            if (whole) {   // (its parts lie as in the slot - a RAM copy's, the store's: one copy of the blob, not three of ~2.9 MB - the
+                           //  copy engine took ~200 us each, half the DMA's rate)
+                CK(cudaMemcpyAsync(dst + lay.trellis[0], it.src[0], lay.trellis[2] - lay.trellis[0] + mx_part_bytes(l, 2),
+                                   cudaMemcpyHostToDevice, c.cs));
+            } else {
+                for (int p = 0; p < 2; ++p)
+                    CK(cudaMemcpyAsync(dst + lay.trellis[p], it.src[p], mx_read_len(l, p), cudaMemcpyHostToDevice, c.cs));
+                if (l.nm > 1) {   // (the down's part: in each of its rows the member's blocks)
+                    const int t2 = gg::expert_type(l.lay, 2);
+                    const size_t dr = gg::type_row_bytes(t2, g.ff), dh = gg::type_row_bytes(t2, g.ff / l.nm);
+                    CK(cudaMemcpy2DAsync(dst + lay.trellis[2], dh, it.src[2] + (size_t) it.mi * dh, dr, dh, (size_t) g.dim,
+                                         cudaMemcpyHostToDevice, c.cs));
+                } else
+                    CK(cudaMemcpyAsync(dst + lay.trellis[2], it.src[2], mx_part_bytes(l, 2), cudaMemcpyHostToDevice, c.cs));
+            }
             CK(cudaEventRecord(c.ring_fill[r], c.cs));
             if (it.stage >= 0) CK(cudaEventRecord(c.stage_ev[(size_t) it.stage], c.cs));
             c.stream_bytes += (double) unit(l);
@@ -6198,9 +6215,13 @@ struct Model::Impl {
             cudaStream_t cs = copy_st[(size_t) l.dev];
             uint8_t* dst = l.vram_base + (size_t) l.spare_vram * unit(l);
             const int rs = l.ram[(size_t) sw.in];
-            for (int r = 0; r < 3 && ok; ++r)
-                ok = cudaMemcpyAsync(dst + l.lay.trellis[r], ram_part[(size_t) rs][0] + cp_lay[(size_t) l.il][(size_t) r],
-                                     (size_t) mx_n(r) * mx_row_b(l, r), cudaMemcpyHostToDevice, cs) == cudaSuccess;
+            if (copy_whole(l))
+                ok = cudaMemcpyAsync(dst + l.lay.trellis[0], ram_part[(size_t) rs][0] + cp_lay[(size_t) l.il][0],
+                                     l.lay.trellis[2] - l.lay.trellis[0] + mx_part_bytes(l, 2), cudaMemcpyHostToDevice, cs) == cudaSuccess;
+            else
+                for (int r = 0; r < 3 && ok; ++r)
+                    ok = cudaMemcpyAsync(dst + l.lay.trellis[r], ram_part[(size_t) rs][0] + cp_lay[(size_t) l.il][(size_t) r],
+                                         (size_t) mx_n(r) * mx_row_b(l, r), cudaMemcpyHostToDevice, cs) == cudaSuccess;
             ok = ok && cudaStreamSynchronize(cs) == cudaSuccess;
         }
         for (int m = 0; m < l.nm && ok && !direct; ++m) {
@@ -6359,19 +6380,48 @@ struct Model::Impl {
             const size_t u = align256(unit(l));
             while (pi < ov_pieces.size() && off + u > ov_pieces[pi].second) ++pi, off = 0;
             if (pi >= ov_pieces.size()) break;
-            if (!read_mx(l, e, ov_stage)) continue;
             uint8_t* dst = ov_pieces[pi].first + off;
-            const unsigned long long a = (unsigned long long) dst;
-            if (cudaMemcpy(dst, ov_stage, unit(l), cudaMemcpyHostToDevice) != cudaSuccess ||
-                cudaMemcpy(l.vram_tab + e, &a, 8, cudaMemcpyHostToDevice) != cudaSuccess) {
-                (void) cudaGetLastError();
-                break;
+            const bool direct = copy_dma && copy_mode && !l.ram.empty() && l.ram[(size_t) e] >= 0 && copy_whole(l);
+            if (direct) {   // (straight from its imported RAM copy, queued: ~27 GB/s, where the staged copies one by one ran ~8)
+                if (cudaMemcpyAsync(dst + l.lay.trellis[0], ram_part[(size_t) l.ram[(size_t) e]][0] + cp_lay[(size_t) l.il][0],
+                                    l.lay.trellis[2] - l.lay.trellis[0] + mx_part_bytes(l, 2), cudaMemcpyHostToDevice, d.st) !=
+                    cudaSuccess) {
+                    (void) cudaGetLastError();
+                    break;
+                }
+            } else {
+                if (!read_mx(l, e, ov_stage)) continue;
+                if (cudaMemcpy(dst, ov_stage, unit(l), cudaMemcpyHostToDevice) != cudaSuccess) {
+                    (void) cudaGetLastError();
+                    break;
+                }
             }
+            ov_tab.push_back({l.vram_tab + e, (unsigned long long) dst});
             off += u;
             bytes += unit(l);
             l.slot[(size_t) e] = kOvSlot;
             set_vm_at(l, e, dst);
             ov_live.push_back(h.second);
+        }
+        {   // (the table entries after the copies: the stream's order)
+            static unsigned long long* pin = nullptr;
+            static size_t pin_n = 0;
+            if (pin_n < ov_tab.size()) {
+                if (pin != nullptr) cudaFreeHost(pin);
+                pin = nullptr;
+                std::string e2;
+                if (!halloc(pin, ov_tab.size(), e2)) pin = nullptr;
+                pin_n = pin != nullptr ? ov_tab.size() : 0;
+            }
+            for (size_t i = 0; i < ov_tab.size(); ++i) {
+                if (pin != nullptr) {
+                    pin[i] = ov_tab[i].second;
+                    (void) cudaMemcpyAsync(ov_tab[i].first, &pin[i], 8, cudaMemcpyHostToDevice, d.st);
+                } else
+                    (void) cudaMemcpy(ov_tab[i].first, &ov_tab[i].second, 8, cudaMemcpyHostToDevice);
+            }
+            (void) cudaStreamSynchronize(d.st);
+            ov_tab.clear();
         }
         if (o.verbose)
             std::fprintf(stderr, "ds4: decode tier: %zu CPU-lane experts (%.2f GB) into the idle prompt buffers (%.0f ms)\n", ov_live.size(),
@@ -6379,6 +6429,7 @@ struct Model::Impl {
     }
     // back to the CPU lane before a chunked prompt takes its buffers (stream order: after the decode's last reads)
     void ov_evict() {
+        ov_pending = false;
         if (ov_live.empty()) return;
         Dev& d = devs[0];
         cudaSetDevice(d.id);
@@ -7425,6 +7476,7 @@ struct Model::Impl {
             prof_mark(d, 8);
             AttnRows ar;
             ar.gen = 1;
+            ar.swa_lo = swa_from;   // (a long prompt's decoder layers: their window from the replay's start)
             ar.p0 = p0;
             ar.t0 = a0;
             ar.win = g.win;
@@ -7683,6 +7735,9 @@ struct Model::Impl {
     // buffers seen from that row (the yoco layer: its kv_only over the rows before it first)
     bool run_layer(Layer& L0, int mi, int64_t p0, int T, const WinPlan& wp, Streamer& S, std::string& err,
                    const Run& run, int k, int il) {
+        // the decoder layers (from yoco) over a prompt with the skip: their windows from the replay's first row - the rows
+        // before it they never computed (SWA Bounded Replay; the ring's rows there were another prompt's or zeros)
+        swa_from = run.yoco >= 0 && il >= run.yoco ? run.p0[(size_t) run.cut_k] + run.cut_r : -1;
         if (prof_chunk) {
             prof_live = prof_ks.empty() || std::find(prof_ks.begin(), prof_ks.end(), k) != prof_ks.end();
             if (prof_live) ++prof_seg;
@@ -8360,13 +8415,14 @@ struct Model::Impl {
     // the first layer of a long prompt's second half (forward_chunks' two passes), or -1: the first with compress ratio 1
     // (V4.1: 20), every one after it ratio 1 too and owning no compressed KV or index keys of its own (they read its),
     // every trunk layer on one GPU.  The settings' MAYA_DS4_PROMPT_SKIP (STRATA_DS4_PROMPT_SKIP; DS4_YOCO for tests):
-    // 1 (the default) the skip, 2 DeepSeek's own serving's (the last 128 rows only: faster, the answers shift a
-    // little), 0 off
+    // 1 the exact skip (the last (nl - yoco)(win - 1) + win rows), 2 (the default) DeepSeek's own serving's, Decoder SWA
+    // Bounded Replay of the V4.1 report (3.2.2): the last 128 rows only, the decoder's windows truncated to them - what the
+    // model was post-trained with; 0 off
     static int yoco_mode() {
         static const int m = [] {
             const char* v = std::getenv("DS4_YOCO");
             if (v == nullptr) v = std::getenv("STRATA_DS4_PROMPT_SKIP");
-            return v != nullptr ? std::atoi(v) : 1;
+            return v != nullptr ? std::atoi(v) : 2;
         }();
         return m;
     }
@@ -8387,6 +8443,7 @@ struct Model::Impl {
     // n tokens at positions pos .. in chunks of equal size (at most `chunk`), pipelined over the groups; the logits of
     // the last min(logits_rows, 16) rows (logits_rows > 16: a run of one chunk, every row's into chunk_logits)
     double prompt_t0 = 0.0;   // (when the last chunked prompt began: cache_settle's budget)
+    long long swa_from = -1;  // (run_layer: the replay's first position for the decoder layers' windows, -1: none)
     bool forward_chunks(const int* tk, int n, int logits_rows, std::string& err, int snap_slot = -1) {
         if (n < 1) return true;
         prompt_t0 = now_ms();
@@ -8415,7 +8472,7 @@ struct Model::Impl {
         const int keep = yl <= 0 ? 0
                          : keep_env > 0 ? std::max(keep_env, g.win)
                          : yoco_mode() == 2 ? g.win : (g.nl - yl) * (g.win - 1) + g.win;
-        const int a = yl > 0 && n - keep >= kYocoMin ? n - keep : 0;
+        const int a = yl > 0 && n - keep >= (yoco_mode() == 2 ? kYocoMin2 : kYocoMin) ? n - keep : 0;
         const int nc = (n + chunk - 1) / chunk, per = (n + nc - 1) / nc;
         Run run;
         for (int x = 0; x < n; x += per) {
@@ -8646,7 +8703,8 @@ struct Model::Impl {
             lm_end_.on = false;
         }
         cache_settle();
-        ov_load();
+        ov_pending = true;   // (the decode tier at the first decoded token: the prompt's checkpoint below and a server's
+                             //  feed_mark still read the chunk buffers - loaded here, the slots kept the experts' bytes)
         const int nr = std::min(T_last, tap_cap);
         if (!seed_drafter(pos - nr, nr, 0, err)) return false;
         if (snap_slot >= 0) {   // checkpoint `snap_slot` from what the layers kept (the drafter's blocks: as they are -
@@ -8848,6 +8906,10 @@ struct Model::Impl {
         for (int t = 0; t < T; ++t)   // (h_emb is written again by the next window, after this one's last sync)
             std::memcpy(h_emb + (size_t) t * D, emb_row(p0 + t, tk[t]), (size_t) D * 2);
         plan_window(p0, T, wplan);
+        if (ov_pending && T == 1) {   // (the decode tier into the prompt's buffers: nothing reads them until the next prompt)
+            ov_pending = false;
+            ov_load();
+        }
         prof_window = prof_on && T == 1 && (!prof_sync || st.tokens % 8 == 0);   // (sync: every 8th token - the run's tok/s stays near)
         n_logits = std::min(logits_rows, T);
         if (prof_sync && prof_window) {   // (the token's start: everything before it done)

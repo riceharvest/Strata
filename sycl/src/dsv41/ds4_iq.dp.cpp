@@ -1638,6 +1638,7 @@ __global__ void __launch_bounds__(kThreads) light_kernel_rows(const SetArgs a, c
         }
 }
 
+
 #if defined(SYCL_LANGUAGE_VERSION) && defined(STRATA_XMX_SG16)
 // Xe2's matrix engines for the prompt sets' tiles (set_xmx_kernel; an AOT bmg / lnl build): on unless STRATA_DS4_NO_TC=1, as tc_ok
 bool xmx_ok() {
@@ -1816,7 +1817,8 @@ void launch_light(const SetArgs& a, const LightBuf& b, cudaStream_t s) {
             STRATA_LAUNCH(s, items_grid<T>(a.n_exp * tiles, resident_ctas<light_kernel<T, 4, GU>>()), kThreads, 0, (light_kernel<T, 4, GU>), a, b.q, b.d);
         else   // (a small codebook: the release's kernel, which is the faster there)
             STRATA_LAUNCH(s, dim3((unsigned) tiles, (unsigned) a.n_exp), kThreads, 0, (light_kernel_rows<T, 4, GU>), a, b.q, b.d, 0);
-    } else {   // more rows: compute bound, the release's kernel and grid - 16 rows a pass
+    } else {   // more rows: compute bound, the release's kernel and grid - 16 rows a pass (a lane a weight row, the
+               //  activations shared by the warp, ran 1.7x slower: the dot products are the cost, not their loads)
         const dim3 grid((unsigned) tiles, (unsigned) a.n_exp);
         if (a.max_rows <= 8) STRATA_LAUNCH(s, grid, kThreads, 0, (light_kernel_rows<T, 8, GU>), a, b.q, b.d, 0);
         else
