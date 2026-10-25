@@ -70,9 +70,13 @@ void rows(const x3::Mat& m, uint16_t* dst, bool bf16, cudaStream_t s);
 /// roles' types in lay.K, see expert_type).
 void moe_gate_up(const x3::MoeArgs& a, const float* x, float* h, cudaStream_t s);
 void moe_down(const x3::MoeArgs& a, const float* h, const float* sh_out, float* out, cudaStream_t s);
+/// moe_down in two: the VRAM experts' down (into the stream's scratch), then the sum with the CPU lane's part and the shared
+/// expert - the wait for the CPU lane goes between them (decode: the GPU's down under the CPU lane's time)
+void moe_down_part(const x3::MoeArgs& a, const float* h, cudaStream_t s);
+void moe_combine(const x3::MoeArgs& a, const float* sh_out, float* out, cudaStream_t s);
 bool win_experts(const x3::WinArgs& a, cudaStream_t s);
 void set_gate_up(const x3::SetArgs& a, const float* x, int ldx, const int* row_idx, uint16_t* h16, int ldh,
-                 cudaStream_t s);
+                 cudaStream_t s, const uint16_t* x16 = nullptr);   // (x16: x's rows in F16 too, ldx - the XMX tiles read those)
 void set_down(const x3::SetArgs& a, const uint16_t* h16, int ldh, float* y, int ldy, cudaStream_t s);
 
 /// Launch failures of these kernels since the process started (each is also printed).

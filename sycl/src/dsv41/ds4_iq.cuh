@@ -85,7 +85,7 @@ struct SetArgs {
     float limit = 0.0f;
     const float* xf = nullptr;
     const int* idx = nullptr;
-    const uint16_t* xh = nullptr;
+    const uint16_t* xh = nullptr;   // (gate / up: xf's rows in F16 as well, or null - the XMX tiles v4 read them)
     int ldx = 0;
     uint16_t* h = nullptr;
     float* y = nullptr;
@@ -120,6 +120,8 @@ struct MvJob {
     float alpha = 1.0f;
 };
 bool mv(const MvJob* jobs, int n, cudaStream_t s);
+/// (tests) 1: mv's one row a warp whatever the rows' length; 0: by the length (several rows a warp for short ones)
+void mv_rows_per_warp(int rw);
 
 /// n rows of k values of a matrix of the type (ld bytes a row) as BF16 (bf16) or F16 bits, dst[n][k]: the chunked prompt path's
 /// dense GEMM operand.  false: a type not covered.

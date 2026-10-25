@@ -66,6 +66,10 @@ void hc_split(const float* mixes, const float* scale, const float* base, int hc,
 /// x[t][e] = sum_s mix[t][s] h[t][s][e], then x = rmsnorm(x) * w (w null: no norm).
 void hc_pre_norm(const float* h, const float* mix, const float* w, int dim, int hc, int T, float eps, float* x,
                  cudaStream_t s);
+/// hc_split (into pre / post / comb) and hc_pre_norm (with mix, not that pre) in one launch: the decode's two a layer.
+void hc_split_pre_norm(const float* mixes, const float* scale, const float* base, int iters, float hc_eps, float* pre,
+                       float* post, float* comb, const float* h, const float* mix, const float* w, int dim, int hc, int T,
+                       float eps, float* x, cudaStream_t s);
 /// out[t][k][e] = post[t][k] y[t][e] + sum_j comb[t][j][k] res[t][j][e]  (out must not alias res).
 void hc_post(const float* y, const float* res, const float* post, const float* comb, int dim, int hc, int T,
              float* out, cudaStream_t s);
@@ -86,6 +90,9 @@ void gemv_f16_rows(const uint16_t* W, const float* x, size_t ldx, int n, int k, 
 /// inference computes them (linear(x.float(), weight.float())) - a warp a row, the same summing order for any T, so
 /// the token, window and chunk paths get the same bits.
 void gemv_f32(const float* W, const float* x, int n, int k, int T, float* y, int ldy, cudaStream_t s);
+/// gemv_f32 over BF16 weights (W as bits; k % 4 == 0): the same sums.  bf16_to_f32: out[i] = a[i] as F32.
+void gemv_bf16(const uint16_t* W, const float* x, int n, int k, int T, float* y, int ldy, cudaStream_t s);
+void bf16_to_f32(const uint16_t* a, size_t n, float* out, cudaStream_t s);
 
 /// The router, row t: scores = sqrt(softplus(logits[t])) (n experts, rows 1024 apart), the top `k` of scores + bias;
 /// weights from the unbiased scores, normalized to sum 1 (+1e-20) and times route_scale -> idx[t][i], w[t][i] (rows

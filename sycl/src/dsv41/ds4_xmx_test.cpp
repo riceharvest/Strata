@@ -11,6 +11,7 @@
 #include "ds4_kernels.cuh"
 
 #include <chrono>
+#include <functional>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -72,6 +73,7 @@ struct Set {
     int* d_bounds = nullptr;
     int* d_idx = nullptr;
     float* d_x = nullptr;     // [ntok][kD]
+    uint16_t* d_x16 = nullptr;  // [ntok][kD] the same in F16 (the model's c.x16; DS4_TEST_X16=0: the tiles get the F32 rows only)
     uint16_t* d_h = nullptr;  // [rows][kF] gate/up out
     uint16_t* d_hin = nullptr;  // [rows][kF] down in
     float* d_y = nullptr;     // [rows][kD]
@@ -121,10 +123,16 @@ static bool make_set(Set& S, int type, const std::vector<int>& cnt, std::mt19937
     cudaMemcpy(S.d_idx, S.idx.data(), S.idx.size() * 4, cudaMemcpyHostToDevice);
     cudaMemcpy(S.d_x, S.x.data(), S.x.size() * 4, cudaMemcpyHostToDevice);
     cudaMemcpy(S.d_hin, S.hin.data(), S.hin.size() * 2, cudaMemcpyHostToDevice);
+    {
+        std::vector<uint16_t> x16(S.x.size());
+        for (size_t i = 0; i < x16.size(); ++i) x16[i] = f2h(S.x[i]);
+        cudaMalloc(&S.d_x16, x16.size() * 2);
+        cudaMemcpy(S.d_x16, x16.data(), x16.size() * 2, cudaMemcpyHostToDevice);
+    }
     return true;
 }
 static void free_set(Set& S) {
-    for (void* p : {(void*) S.w, (void*) S.d_bounds, (void*) S.d_idx, (void*) S.d_x, (void*) S.d_h, (void*) S.d_hin, (void*) S.d_y}) cudaFree(p);
+    for (void* p : {(void*) S.w, (void*) S.d_bounds, (void*) S.d_idx, (void*) S.d_x, (void*) S.d_x16, (void*) S.d_h, (void*) S.d_hin, (void*) S.d_y}) cudaFree(p);
 }
 static iq::SetArgs args(const Set& S, bool gu, float limit) {
     iq::SetArgs a;
@@ -141,6 +149,8 @@ static iq::SetArgs args(const Set& S, bool gu, float limit) {
     a.tg = a.td = S.type;
     if (gu) {
         a.xf = S.d_x;
+        static const bool x16 = !(std::getenv("DS4_TEST_X16") && std::atoi(std::getenv("DS4_TEST_X16")) == 0);
+        if (x16) a.xh = S.d_x16;
         a.idx = S.d_idx;
         a.ldx = kD;
         a.h = S.d_h;
@@ -530,6 +540,55 @@ static int ix_bench(int T, int n) {
                     2.0 * T * (double) n * 32 * 128 / (ms * 1e-3) / 1e12);
     }
     ds4k::index_force_xmx(-1);
+    if (T <= 4) {   // the decode's top-k over the scores: the 512 positions, and the candidate source's 2048 blocks of 8
+        int *idx = nullptr, *cand = nullptr;
+        float* bm = nullptr;
+        cudaMalloc(&idx, (size_t) T * 512 * 4), cudaMalloc(&cand, (size_t) T * 2048 * 4), cudaMalloc(&bm, (size_t) T * (n / 8 + 64) * 4);
+        ds4k::Rows r, rc;
+        for (int t = 0; t < T; ++t) r.n[t] = rc.n[t] = n, r.k[t] = 512, rc.k[t] = 2048;
+        auto tm = [&](const char* nm, const std::function<void()>& f) {
+            f();
+            cudaStreamSynchronize(s);
+            const auto t0 = std::chrono::steady_clock::now();
+            for (int i = 0; i < 20; ++i) f();
+            cudaStreamSynchronize(s);
+            std::printf("%-28s %d x %d: %.1f us\n", nm, T, n,
+                        std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / 20);
+        };
+        tm("topk 512", [&] { ds4k::topk(x.out, n, T, r, nullptr, 0, 1, idx, 512, s); });
+        {   // against the host's: the 512 largest (ties: the lowest positions) in position order
+            std::vector<float> sc((size_t) n);
+            std::vector<int> got(512);
+            cudaMemcpy(sc.data(), x.out, (size_t) n * 4, cudaMemcpyDeviceToHost);
+            cudaMemcpy(got.data(), idx, 512 * 4, cudaMemcpyDeviceToHost);
+            std::vector<int> ord((size_t) n);
+            for (int i = 0; i < n; ++i) ord[(size_t) i] = i;
+            auto key = [&](int i) {   // (the kernel's order: the float's bits, -0 below +0)
+                uint32_t u;
+                std::memcpy(&u, &sc[(size_t) i], 4);
+                return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+            };
+            std::stable_sort(ord.begin(), ord.end(), [&](int a2, int b2) { return key(a2) > key(b2); });
+            std::vector<int> want(ord.begin(), ord.begin() + 512);
+            std::sort(want.begin(), want.end());
+            std::sort(got.begin(), got.end());   // (the kernel's: the ones above the threshold in position order, then its ties)
+            std::printf("   topk vs host: %s\n", want == got ? "same" : "FAIL (differs)");
+            if (want != got) {
+                int shown = 0;
+                for (int i = 0; i < 512 && shown < 4; ++i)
+                    if (want[(size_t) i] != got[(size_t) i]) {
+                        std::printf("     [%d] want %d (%g) got %d (%g)\n", i, want[(size_t) i], sc[(size_t) want[(size_t) i]], got[(size_t) i],
+                                    got[(size_t) i] >= 0 && got[(size_t) i] < n ? sc[(size_t) got[(size_t) i]] : 0.0);
+                        ++shown;
+                    }
+                std::printf("     512th largest %g, 513th %g\n", sc[(size_t) ord[511]], sc[(size_t) ord[512]]);
+            }
+            if (want != got) ++fails;
+        }
+        tm("cand_blocks 2048 of 8", [&] { ds4k::cand_blocks(x.out, n, T, rc, 8, bm, n / 8 + 64, cand, 2048, s); });
+        tm("index_score FMA (default T=1)", [&] { ds4k::index_score(x.q, x.w, x.k, 32, 128, T, n, nullptr, 0, 1, lim, x.out, n, s, ds4k::kKvFp4p); });
+        cudaFree(idx), cudaFree(cand), cudaFree(bm);
+    }
     free_ix(x);
     cudaStreamDestroy(s);
     return 0;
@@ -571,6 +630,120 @@ static int bench_main(int type, int E, int R, int N) {
     return 0;
 }
 
+
+// --gemv: the decode's GEMVs at their shapes (one token): the dense Q5_K matrices (iq::mv) and 6 experts' gate / up and down
+// (iq::gate_up / down, plan of 6) - GB/s of weights read
+static int gemv_bench(int iters) {
+    std::FILE* dump = std::getenv("DS4_GEMV_DUMP") ? std::fopen(std::getenv("DS4_GEMV_DUMP"), "wb") : nullptr;   // (outputs, to cmp two builds)
+    auto put = [&](const void* dp, size_t bytes) {
+        if (dump == nullptr) return;
+        std::vector<uint8_t> v(bytes);
+        cudaMemcpy(v.data(), dp, bytes, cudaMemcpyDeviceToHost);
+        std::fwrite(v.data(), 1, bytes, dump);
+    };
+    cudaStream_t s = nullptr;
+    cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking);
+    std::mt19937 rng(7);
+    auto timeit = [&](const std::function<void()>& f) {
+        f();
+        cudaStreamSynchronize(s);
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < iters; ++i) f();
+        cudaStreamSynchronize(s);
+        return std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / iters;
+    };
+    struct Sh {
+        int n, k, cnt;
+        const char* nm;
+    } shapes[] = {{32768, 1280, 1, "wq_b"}, {5120, 8192, 1, "wo_b"}, {1024, 4096, 8, "wo_a x8"}, {2304, 5120, 2, "s1+s3"},
+                  {5120, 2304, 1, "s2"}, {1280, 5120, 1, "wq_a"}};
+    for (const Sh& sh : shapes) {
+        const size_t rb = iq::row_bytes(iq::kQ5_K, sh.k), mb = rb * sh.n;
+        constexpr int kRot = 8;   // (8 copies taken in turn: the smaller matrices otherwise come from the L2 cache)
+        std::vector<uint8_t> hw(mb * sh.cnt * kRot);
+        for (size_t i = 0; i < hw.size(); ++i) hw[i] = (uint8_t) rng();
+        for (size_t b = 0; b < hw.size(); b += 176) hw[b] = 0x00, hw[b + 1] = 0x20, hw[b + 2] = 0x00, hw[b + 3] = 0x20;   // (d, dmin small)
+        std::vector<int8_t> hx((size_t) sh.cnt * sh.k);
+        for (int8_t& v : hx) v = (int8_t) (rng() % 255 - 127);
+        std::vector<float> hd((size_t) sh.cnt * sh.k / 32, 0.01f);
+        uint8_t* w;
+        int8_t* xq;
+        float *xd, *y;
+        cudaMalloc(&w, hw.size()), cudaMalloc(&xq, hx.size()), cudaMalloc(&xd, hd.size() * 4), cudaMalloc(&y, (size_t) sh.cnt * sh.n * 4);
+        cudaMemcpy(w, hw.data(), hw.size(), cudaMemcpyHostToDevice);
+        cudaMemcpy(xq, hx.data(), hx.size(), cudaMemcpyHostToDevice);
+        cudaMemcpy(xd, hd.data(), hd.size() * 4, cudaMemcpyHostToDevice);
+        iq::MvJob J[8];
+        int rot = 0;
+        for (int i = 0; i < sh.cnt; ++i) {
+            J[i].w = w + (size_t) i * mb;
+            J[i].ld = rb;
+            J[i].type = iq::kQ5_K;
+            J[i].k = sh.k;
+            J[i].n = sh.n;
+            J[i].ncol = 1;
+            J[i].xq = xq + (size_t) i * sh.k;
+            J[i].xd = xd + (size_t) i * sh.k / 32;
+            J[i].y = y + (size_t) i * sh.n;
+            J[i].ycs = (size_t) sh.n;
+        }
+        auto turn = [&] {   // (the next copy)
+            rot = (rot + 1) % kRot;
+            for (int i = 0; i < sh.cnt; ++i) J[i].w = w + ((size_t) rot * sh.cnt + i) * mb;
+        };
+        const double us = timeit([&] { turn(); iq::mv(J, sh.cnt, s); });
+        std::printf("mv Q5_K %-8s %5d x %5d x %d: %8.1f us  %6.1f GB/s\n", sh.nm, sh.n, sh.k, sh.cnt, us, mb * sh.cnt / us / 1e3);
+        put(y, (size_t) sh.cnt * sh.n * 4);
+        {   // the rows-a-warp forms against one row a warp: the same sums in another order
+            std::vector<float> y0((size_t) sh.cnt * sh.n), y1(y0.size());
+            iq::mv(J, sh.cnt, s);   // (this copy's, both forms)
+            cudaStreamSynchronize(s);
+            cudaMemcpy(y0.data(), y, y0.size() * 4, cudaMemcpyDeviceToHost);
+            iq::mv_rows_per_warp(1);
+            iq::mv(J, sh.cnt, s);
+            cudaStreamSynchronize(s);
+            iq::mv_rows_per_warp(0);
+            cudaMemcpy(y1.data(), y, y1.size() * 4, cudaMemcpyDeviceToHost);
+            double mx = 0, ref = 0;
+            for (size_t i = 0; i < y0.size(); ++i) mx = std::max(mx, (double) std::fabs(y0[i] - y1[i])), ref = std::max(ref, (double) std::fabs(y1[i]));
+            std::printf("   vs one row a warp: worst %.2e of the largest %.3e%s\n", mx / (ref + 1e-30), ref, mx <= 1e-5 * ref ? "" : "  FAIL");
+        }
+        cudaFree(w), cudaFree(xq), cudaFree(xd), cudaFree(y);
+    }
+    for (int type : {iq::kIQ2_XXS, iq::kIQ2_XS, iq::kIQ1_M, iq::kIQ2_XXS}) {
+        Set S;
+        if (!make_set(S, type, std::vector<int>(6, 1), rng)) continue;
+        std::vector<unsigned long long> plan(8, 0ull);
+        for (int e = 0; e < 6; ++e) plan[(size_t) e] = (unsigned long long) (S.w + (size_t) e * S.stride);
+        unsigned long long* dplan;
+        int8_t *xq, *hq;
+        float *xd, *hd, *h, *part;
+        cudaMalloc(&dplan, 64), cudaMalloc(&xq, kD), cudaMalloc(&xd, kD / 32 * 4), cudaMalloc(&hq, 8 * kF), cudaMalloc(&hd, 8 * kF / 32 * 4);
+        cudaMalloc(&h, 8 * kF * 4), cudaMalloc(&part, 8 * kD * 4);
+        cudaMemcpy(dplan, plan.data(), 64, cudaMemcpyHostToDevice);
+        std::vector<int8_t> hx(8 * kF);
+        for (int8_t& v : hx) v = (int8_t) (rng() % 255 - 127);
+        std::vector<float> hs(8 * kF / 32, 0.01f);
+        cudaMemcpy(xq, hx.data(), kD, cudaMemcpyHostToDevice), cudaMemcpy(hq, hx.data(), 8 * kF, cudaMemcpyHostToDevice);
+        cudaMemcpy(xd, hs.data(), kD / 32 * 4, cudaMemcpyHostToDevice), cudaMemcpy(hd, hs.data(), 8 * kF / 32 * 4, cudaMemcpyHostToDevice);
+        iq::Args a;
+        a.plan_ptr = dplan;
+        for (int r = 0; r < 3; ++r) a.tr[r] = S.tr[r];
+        a.n_embd = kD, a.n_ff = kF, a.limit = 10.0f, a.xq = xq, a.xd = xd, a.hq = hq, a.hd = hd, a.h = h, a.part = part;
+        a.tg = a.td = type;
+        const double gu = timeit([&] { iq::gate_up(a, 6, 1, s); }), dn = timeit([&] { iq::down(a, 6, 1, s); });
+        std::printf("experts %-8s x6: gate_up %7.1f us %6.1f GB/s | down %7.1f us %6.1f GB/s\n", iq::name(type), gu,
+                    6.0 * 2 * kF * S.rbD / gu / 1e3, dn, 6.0 * kD * S.rbF / dn / 1e3);
+        put(h, 6 * kF * 4);
+        put(part, 6 * kD * 4);
+        cudaFree(dplan), cudaFree(xq), cudaFree(xd), cudaFree(hq), cudaFree(hd), cudaFree(h), cudaFree(part);
+        free_set(S);
+    }
+    cudaStreamDestroy(s);
+    if (dump != nullptr) std::fclose(dump);
+    return 0;
+}
+
 int main(int argc, char** argv) {
     std::setvbuf(stdout, nullptr, _IOLBF, 0);   // (a line at a time: a timeout keeps what was printed)
     if (argc >= 5 && std::strcmp(argv[1], "--bench") == 0) {
@@ -578,6 +751,7 @@ int main(int argc, char** argv) {
         const int type = t == "IQ2_XS" ? iq::kIQ2_XS : t == "IQ1_M" ? iq::kIQ1_M : t == "IQ3_XXS" ? iq::kIQ3_XXS : iq::kIQ2_XXS;
         return bench_main(type, std::atoi(argv[3]), std::atoi(argv[4]), argc > 5 ? std::atoi(argv[5]) : 20);
     }
+    if (argc >= 2 && std::strcmp(argv[1], "--gemv") == 0) return gemv_bench(argc > 2 ? std::atoi(argv[2]) : 200);
     if (argc >= 3 && std::strcmp(argv[1], "--attnbench") == 0) return attn_bench(std::atoi(argv[2]));
     if (argc >= 4 && std::strcmp(argv[1], "--ixbench") == 0) return ix_bench(std::atoi(argv[2]), std::atoi(argv[3]));
     return check_main();

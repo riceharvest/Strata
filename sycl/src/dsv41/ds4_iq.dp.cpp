@@ -116,16 +116,20 @@ __device__ __forceinline__ int2 tab16(uint32_t q4, const uint32_t* t) {   // vec
 // iq1s_grid_gpu's 8 values in 4 bytes, 4 bits each (low nibbles: values 0..3, high: 4..7; 0 is -1, 2 is +1) -> the 4
 // values as int8 codes 8 (n - 1) + 1, or - 1 when the group's delta is negative: ggml's weight dl ((n - 1) +- 0.125), whose
 // dl (2 sc + 1) / 8 is this kernel's per-sub-block scale, is then d * (s0 lo + s1 hi) exactly
+// (n <= 2, the grid's nibbles: 8 n + 0x79 (or 0x77) stays below 0x100 in each byte, so one add and the top bits flipped give the
+//  bytes 8 n - 7 (or 8 n - 9) - the same codes as __vsub4's, which dpct emulates byte by byte; checked over all 4096 entries)
 __device__ __forceinline__ uint32_t iq1_codes(uint32_t n, bool neg) {
-    const uint32_t c = (uint32_t) __vsub4((int) (n * 8u), 0x07070707);   // (n * 8 - 7) in each byte: no carry (n <= 15)
-    return neg ? (uint32_t) __vsub4((int) c, 0x02020202) : c;
+    return ((n << 3) + (neg ? 0x77777777u : 0x79797979u)) ^ 0x80808080u;
 }
 // IQ1_M has no d field: its F16 scale is the top nibbles of its four u16 scales (ggml's dequantize_row_iq1_m)
-__device__ __forceinline__ uint16_t iq1m_d(const uint8_t* b) {
-    const uint32_t s0 = (uint32_t) b[48] | (uint32_t) b[49] << 8, s1 = (uint32_t) b[50] | (uint32_t) b[51] << 8;
-    const uint32_t s2 = (uint32_t) b[52] | (uint32_t) b[53] << 8, s3 = (uint32_t) b[54] | (uint32_t) b[55] << 8;
+// (its blocks are 56 bytes in rows at 256-aligned offsets: 8-byte aligned - the scales one 8-byte load; read a byte at a time,
+//  as the compiler did without being told, the token kernels ran IQ1_M at ~95 GB/s against ~380 for IQ2_XXS)
+__device__ __forceinline__ uint2 iq1m_scales(const uint8_t* b) { return *(const uint2*) __builtin_assume_aligned(b + 48, 8); }
+__device__ __forceinline__ uint16_t iq1m_d(const uint2 sw) {
+    const uint32_t s0 = sw.x & 0xffffu, s1 = sw.x >> 16, s2 = sw.y & 0xffffu, s3 = sw.y >> 16;
     return (uint16_t) ((s0 >> 12) | ((s1 >> 8) & 0x00f0u) | ((s2 >> 4) & 0x0f00u) | (s3 & 0xf000u));
 }
+__device__ __forceinline__ uint16_t iq1m_d(const uint8_t* b) { return iq1m_d(iq1m_scales(b)); }
 __device__ __forceinline__ int q3k_scale(const uint8_t* sc, int is) {
     const int lo = is < 8 ? sc[is] & 15 : sc[is - 8] >> 4;
     const int hi = (sc[8 + (is & 3)] >> (2 * (is >> 2))) & 3;
@@ -256,9 +260,12 @@ __device__ __forceinline__ void decode_b(const uint8_t* __restrict__ b, int ib, 
         s.s0 = s.s1 = 2 * (int) ((qh >> 12) & 7u) + 1;
         s.d = h2f(b) * 0.125f;
     } else if constexpr (T == kIQ1_M) {   // qs[32], qh[16], scales[8]: no d field; 11-bit grid, two 3-bit scales a 32
-        const uint8_t* qs = b + 4 * ib;
-        const uint8_t qh0 = b[32 + 2 * ib], qh1 = b[33 + 2 * ib];
-        const uint16_t sc = ((const uint16_t*) (b + 48))[ib >> 1];
+        const uint8_t* ba = (const uint8_t*) __builtin_assume_aligned(b, 8);   // (words, not bytes: see iq1m_scales)
+        const uint32_t qsw = *(const uint32_t*) (ba + 4 * ib), qhw = *(const uint16_t*) (ba + 32 + 2 * ib);
+        const uint2 sw = iq1m_scales(b);
+        const uint8_t qs[4] = {(uint8_t) qsw, (uint8_t) (qsw >> 8), (uint8_t) (qsw >> 16), (uint8_t) (qsw >> 24)};
+        const uint8_t qh0 = (uint8_t) qhw, qh1 = (uint8_t) (qhw >> 8);
+        const uint16_t sc = (uint16_t) (((ib >> 1) < 2 ? sw.x : sw.y) >> (16 * ((ib >> 1) & 1)));
         const int sh = 6 * (ib & 1);
         const uint32_t ii[4] = {qs[0] | ((uint32_t) (qh0 << 8) & 0x700u), qs[1] | ((uint32_t) (qh0 << 4) & 0x700u),
                                 qs[2] | ((uint32_t) (qh1 << 8) & 0x700u), qs[3] | ((uint32_t) (qh1 << 4) & 0x700u)};
@@ -271,7 +278,7 @@ __device__ __forceinline__ void decode_b(const uint8_t* __restrict__ b, int ib, 
         }
         s.s0 = 2 * (int) ((sc >> sh) & 7u) + 1;
         s.s1 = 2 * (int) ((sc >> (sh + 3)) & 7u) + 1;
-        s.d = __half2float(__ushort_as_half(iq1m_d(b))) * 0.125f;
+        s.d = __half2float(__ushort_as_half(iq1m_d(sw))) * 0.125f;
     } else if constexpr (T == kIQ4_NL) {   // d, qs[16]: a block of 32 values, its codebook's int8 a nibble
         const uint8_t* qs = b + 2;   // (18-byte blocks: even, so ld2's 2-byte alignment - not ld4's 4)
 #pragma unroll
@@ -455,13 +462,14 @@ __device__ __forceinline__ void deq8(const uint8_t* __restrict__ row, int kb, in
         for (int j = 0; j < 4; ++j) w[4 + j] = dl * (float) (int8_t) (c1 >> (8 * j));
     } else if constexpr (T == kIQ1_M) {
         const uint8_t* qs = b + 4 * ib;
-        const uint8_t qh0 = b[32 + 2 * ib], qh1 = b[33 + 2 * ib], qh = p < 2 ? qh0 : qh1;
-        const uint16_t sc = ((const uint16_t*) (b + 48))[ib >> 1];
+        const uint8_t qh = b[32 + 2 * ib + (p < 2 ? 0 : 1)];
+        const uint2 sw = iq1m_scales(b);
+        const uint16_t sc = (uint16_t) (((ib >> 1) < 2 ? sw.x : sw.y) >> (16 * ((ib >> 1) & 1)));
         const uint32_t g = tab[qs[p] | ((uint32_t) (qh << (p & 1 ? 4 : 8)) & 0x700u)];
         const bool neg = (p & 1 ? qh & 0x80u : qh & 0x08u) != 0;
         const uint32_t c0 = iq1_codes(g & 0x0F0F0F0Fu, neg), c1 = iq1_codes((g >> 4) & 0x0F0F0F0Fu, neg);
         const int sh = (int) ((sc >> (6 * (ib & 1) + (p < 2 ? 0 : 3))) & 7u);
-        const float dl = __half2float(__ushort_as_half(iq1m_d(b))) * (float) (2 * sh + 1) * 0.125f;
+        const float dl = __half2float(__ushort_as_half(iq1m_d(sw))) * (float) (2 * sh + 1) * 0.125f;
 #pragma unroll
         for (int j = 0; j < 4; ++j) w[j] = dl * (float) (int8_t) (c0 >> (8 * j));
 #pragma unroll
@@ -1266,12 +1274,12 @@ void set_xmx4_kernel(const SetArgs a, sycl::nd_item<3> it, uint8_t* smem, uint32
     const uint8_t* wrow0 = blob + a.tr[GATE_UP ? 0 : 2] + (size_t) (c0 + dn) * rb;
     const uint8_t* wrow1 = blob + a.tr[1] + (size_t) (c0 + dn) * rb;
     uint32_t wr[BN / 64][GATE_UP ? 2 : 1][4];
-    sycl::vec<sycl::half, 8> xr[GATE_UP ? 1 : 8 / TPR];
+    sycl::vec<sycl::half, 8> xr[8 / TPR];
     auto xload = [&](int k) {   // (8 values at k of row sr)
         sycl::vec<sycl::half, 8> v(sycl::half(0.0f));
         if (sr >= 0) {
             const size_t at = (size_t) sr * a.ldx + (size_t) k;
-            if (GATE_UP) {
+            if (GATE_UP && a.xh == nullptr) {
                 const sycl::float4 f0 = *reinterpret_cast<const sycl::float4*>(a.xf + at);
                 const sycl::float4 f1 = *reinterpret_cast<const sycl::float4*>(a.xf + at + 4);
                 v = sycl::vec<sycl::half, 8>(sycl::half(f0.x()), sycl::half(f0.y()), sycl::half(f0.z()), sycl::half(f0.w()),
@@ -1281,9 +1289,9 @@ void set_xmx4_kernel(const SetArgs a, sycl::nd_item<3> it, uint8_t* smem, uint32
         }
         return v;
     };
-    int kf = 0;   // (the K step fetch() took; gate_up loads its activations at put(): its registers hold two accumulator sets)
+    // (step s + 1's activations are loaded with its weights, before step s's DPAS: the gate / up ones were loaded at put(), their
+    //  latency after the DPAS and before the barrier - 8 accumulators are 64 of the 256 registers, room for them)
     auto fetch = [&](int k0) {
-        kf = k0;
 #pragma unroll
         for (int i = 0; i < BN / 64; ++i) {
             const int pr = slot + i * (512 / BN), kb = k0 / 32 + (pr >> 2), dq = pr & 3;
@@ -1297,9 +1305,8 @@ void set_xmx4_kernel(const SetArgs a, sycl::nd_item<3> it, uint8_t* smem, uint32
                                   (uint32_t) sycl::bit_cast<uint16_t>(sycl::half(w8[2 * p + 1])) << 16;
             }
         }
-        if constexpr (!GATE_UP)
 #pragma unroll
-            for (int j = 0; j < 8 / TPR; ++j) xr[j] = xload(k0 + (tc + j * TPR) * 8);
+        for (int j = 0; j < 8 / TPR; ++j) xr[j] = xload(k0 + (tc + j * TPR) * 8);
     };
     auto put = [&](Buf& b) {
 #pragma unroll
@@ -1315,7 +1322,7 @@ void set_xmx4_kernel(const SetArgs a, sycl::nd_item<3> it, uint8_t* smem, uint32
 #pragma unroll
         for (int j = 0; j < 8 / TPR; ++j) {
             const int c = (tc + j * TPR) * 8;
-            *reinterpret_cast<sycl::vec<sycl::half, 8>*>(&b.x[tr][c]) = GATE_UP ? xload(kf + c) : xr[GATE_UP ? 0 : j];
+            *reinterpret_cast<sycl::vec<sycl::half, 8>*>(&b.x[tr][c]) = xr[j];
         }
     };
     xjm::joint_matrix<sycl::sub_group, float, xjm::use::accumulator, 8, 16> fg[4], fu[4];
@@ -1403,7 +1410,7 @@ template <int T, bool GU>
 void launch_set_xmx(const SetArgs& a, dim3 grid, cudaStream_t s) {
     // (v4's 16-byte activation loads: the rows' pitch and base 16-byte aligned)
     if (xmx_bm() == 4 && a.max_rows >= 64 && (GU ? a.n_ff : a.n_embd) % BN3 == 0 && a.n_embd % KS3 == 0 && a.n_ff % KS3 == 0 &&
-        a.ldx % 8 == 0 && (GU ? (uintptr_t) a.xf : (uintptr_t) a.xh) % 16 == 0) {
+        a.ldx % 8 == 0 && (GU ? (uintptr_t) a.xf | (uintptr_t) a.xh : (uintptr_t) a.xh) % 16 == 0) {
         // (256 x 64 for IQ1_M's gate / up, whose decode bounds it: 24.4 TFLOP/s against 23.0 at 40 x 390, 30.3 against 28.6
         //  at 40 x 256; 128 x 128 the others - IQ2_XXS / IQ2_XS and every down 5-15% slower at 256 x 64.  DS4_XMX_TILE=128 / 256:
         //  that shape for all)
@@ -1443,20 +1450,30 @@ constexpr int kMaxJobs = 8;
 struct Jobs {
     MvJob j[kMaxJobs];
 };
-template <int T, int NC>
+// RW rows a warp, 32 / RW lanes a row: a short row (wq_b's 1280 values: 40 sub-blocks) kept 8 of a warp's 32 lanes idle
+template <int T, int NC, int RW = 1>
 __global__ void __launch_bounds__(kThreads) mv_kernel(const Jobs J) {
+    constexpr int LPR = 32 / RW;
     SYCL_SHARED(uint32_t[Ty<T>::TAB > 0 ? Ty<T>::TAB : 1], tab);
     load_tab<T>(tab);
     __syncthreads();
-    const MvJob& b = J.j[blockIdx.y];
-    const int row = blockIdx.x * kWarps + (threadIdx.x >> 5), lane = threadIdx.x & 31;
-    if (row >= b.n) return;
-    const uint8_t* w = b.w + (size_t) row * b.ld;
-    const int nsb = b.k / 32;
+    // (the block's job by a uniform select: J.j[blockIdx.y] indexed the by-value argument at run time, which made every work item
+    //  copy all 8 jobs to its private memory - 20 KB a thread (unitrace's kernel properties); wq_b's GEMV 141 -> 56 us with the
+    //  rows a warp below)
+    MvJob b = J.j[0];
+#pragma unroll
+    for (int i = 1; i < kMaxJobs; ++i)
+        if ((int) blockIdx.y == i) b = J.j[i];
+    const int lane32 = threadIdx.x & 31, lane = lane32 % LPR;
+    const int row = (blockIdx.x * kWarps + (threadIdx.x >> 5)) * RW + lane32 / LPR;
+    if ((blockIdx.x * kWarps + (threadIdx.x >> 5)) * RW >= b.n) return;   // (the warp's rows all past the end; else every lane
+    const bool live = row < b.n;                                          //  takes part in the sums below)
+    const uint8_t* w = b.w + (size_t) (live ? row : 0) * b.ld;
+    const int nsb = live ? b.k / 32 : 0;
     float acc[NC];
 #pragma unroll
     for (int c = 0; c < NC; ++c) acc[c] = 0.0f;
-    for (int kb = lane; kb < nsb; kb += 32) {
+    for (int kb = lane; kb < nsb; kb += LPR) {
         Sub s;
         decode<T>(w, kb, tab, s);
 #pragma unroll
@@ -1469,8 +1486,8 @@ __global__ void __launch_bounds__(kThreads) mv_kernel(const Jobs J) {
 #pragma unroll
     for (int c = 0; c < NC; ++c)
         if (c < b.ncol) {
-            const float v = warp_sum(acc[c]);
-            if (lane == 0) b.y[c * b.ycs + row] = b.alpha * v + (b.bias != nullptr ? b.bias[row] : 0.0f);
+            const float v = RW == 1 ? warp_sum(acc[c]) : lanes_sum<RW>(acc[c]);
+            if (lane == 0 && live) b.y[c * b.ycs + row] = b.alpha * v + (b.bias != nullptr ? b.bias[row] : 0.0f);
         }
 }
 
@@ -1830,8 +1847,14 @@ bool light_set(const SetArgs& a, bool gu, cudaStream_t s) {
     return true;
 }
 
+std::atomic<int> g_mv_rw{0};
 template <int T>
-void mv_nc(const Jobs& J, int nj, int max_n, int max_c, cudaStream_t s) {
+void mv_nc(const Jobs& J, int nj, int max_n, int max_c, cudaStream_t s, int max_k = 1 << 30) {
+    if (g_mv_rw.load(std::memory_order_relaxed) == 1) max_k = 1 << 30;   // (tests: one row a warp)
+    if (max_c <= 1 && max_k <= 2048) {   // (rows of a few sub-blocks: 4 a warp - wq_b's 1280 values 141 -> 50 us; 2304 not faster)
+        STRATA_LAUNCH(s, dim3((unsigned) ((max_n + 4 * kWarps - 1) / (4 * kWarps)), (unsigned) nj), kThreads, 0, (mv_kernel<T, 1, 4>), J);
+        return;
+    }
     const dim3 grid((unsigned) ((max_n + kWarps - 1) / kWarps), (unsigned) nj);
     if (max_c <= 1) STRATA_LAUNCH(s, grid, kThreads, 0, (mv_kernel<T, 1>), J);
     else if (max_c <= 4) STRATA_LAUNCH(s, grid, kThreads, 0, (mv_kernel<T, 4>), J);
@@ -2027,6 +2050,7 @@ bool set_down(const SetArgs& a, cudaStream_t s) {
     return true;
 }
 
+void mv_rows_per_warp(int rw) { g_mv_rw.store(rw); }
 bool mv(const MvJob* jobs, int n, cudaStream_t s) {
     {   // the trellis jobs go to their kernels, the others on
         MvJob tqj[64], oth[64];
@@ -2046,16 +2070,17 @@ bool mv(const MvJob* jobs, int n, cudaStream_t s) {
         while (!done[i]) {
             const int t = jobs[i].type;
             Jobs J{};
-            int nj = 0, max_n = 0, max_c = 1;
+            int nj = 0, max_n = 0, max_c = 1, max_k = 0;
             for (int k = i; k < n && nj < kMaxJobs; ++k) {
                 if (done[k] || jobs[k].type != t) continue;
                 if (jobs[k].k % 256 != 0 || jobs[k].ncol < 1 || jobs[k].ncol > 16) return false;
                 J.j[nj++] = jobs[k];
                 max_n = std::max(max_n, jobs[k].n);
                 max_c = std::max(max_c, jobs[k].ncol);
+                max_k = std::max(max_k, jobs[k].k);
                 done[k] = true;
             }
-#define MV_(T) mv_nc<T>(J, nj, max_n, max_c, s)
+#define MV_(T) mv_nc<T>(J, nj, max_n, max_c, s, max_k)
             switch (t) {   // the experts' types and the dense matrices' 5- and 6-bit ones
                 case kQ5_K: MV_(kQ5_K); break;
                 case kQ6_K: MV_(kQ6_K); break;

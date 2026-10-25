@@ -21,6 +21,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <string>
 #include <cstring>
 #include <map>
 #include <mutex>
@@ -443,8 +444,8 @@ inline cudaError_t cudaEventQuery(cudaEvent_t e) {
     return st == sycl::info::event_command_status::complete ? cudaSuccess : cudaErrorNotReady;
 }
 // DS4_PROF: the streams cudaStreamCreate* makes are created with profiling, so an event's barrier carries the GPU's timestamp
-inline bool ds4_prof_queues() {
-    static const bool on = std::getenv("DS4_PROF") != nullptr;
+inline bool ds4_prof_queues() {   // (DS4_PROF=sync: none - the host's clock at a sync after each stage instead)
+    static const bool on = std::getenv("DS4_PROF") != nullptr && std::string(std::getenv("DS4_PROF")) != "sync";
     return on;
 }
 // The GPU's time between the two barriers where their queues profile (DS4_PROF), else the host's between the records: the

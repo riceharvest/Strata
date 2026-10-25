@@ -10,6 +10,9 @@
 #include "ds4_sycl.hpp"
 #if defined(STRATA_XMX_SG16)
 #include <sycl/ext/oneapi/matrix/matrix.hpp>
+#if defined(STRATA_XMX_SG16)
+#include <sycl/ext/intel/experimental/grf_size_properties.hpp>
+#endif
 #endif
 
 #include <algorithm>
@@ -267,10 +270,9 @@ __global__ void __launch_bounds__(kThreads) hc_mix_kernel(const float* __restric
 }
 
 // a warp a token: lane j * hc + k holds comb[j][k] (hc <= 4: lanes 0..15; wider streams fall back to lane 0 alone)
-__global__ void hc_split_kernel(const float* __restrict__ mixes, const float* __restrict__ scale,
-                                const float* __restrict__ base, int hc, int iters, float eps, float* pre, float* post,
-                                float* comb) {
-    const int t = blockIdx.x, lane = threadIdx.x;
+__device__ __forceinline__ void hc_split_body(const float* __restrict__ mixes, const float* __restrict__ scale,
+                                              const float* __restrict__ base, int hc, int iters, float eps, float* pre,
+                                              float* post, float* comb, int t, int lane) {
     const float* mx = mixes + (size_t) t * 32;
     pre += (size_t) t * 8;
     post += (size_t) t * 8;
@@ -339,7 +341,42 @@ __global__ void hc_split_kernel(const float* __restrict__ mixes, const float* __
     for (int j = 0; j < hc; ++j)
         for (int k = 0; k < hc; ++k) comb[j * hc + k] = c[j][k];
 }
+__global__ void hc_split_kernel(const float* __restrict__ mixes, const float* __restrict__ scale,
+                                const float* __restrict__ base, int hc, int iters, float eps, float* pre, float* post,
+                                float* comb) {
+    hc_split_body(mixes, scale, base, hc, iters, eps, pre, post, comb, blockIdx.x, threadIdx.x);
+}
 
+// hc_split and hc_pre_norm in one launch (a block a token: its first 32 work items the split, as hc_split_kernel's warp).  The
+// norm's weights are not the split's: the attention's are the layer before's f_pre, the FFN's the attention's a_pre
+struct HcSplit {
+    const float *mixes, *scale, *base;
+    int iters;
+    float eps;
+    float *pre, *post, *comb;
+};
+__global__ void __launch_bounds__(1024) hc_split_pre_norm_kernel(HcSplit sp, const float* __restrict__ h,
+                                                                 const float* __restrict__ mix, const float* __restrict__ w,
+                                                                 int dim, int hc, float eps, float* __restrict__ x) {
+    const int t = blockIdx.x;
+    if (threadIdx.x < 32)
+        hc_split_body(sp.mixes, sp.scale, sp.base, hc, sp.iters, sp.eps, sp.pre, sp.post, sp.comb, t, (int) threadIdx.x);
+    h += (size_t) t * hc * dim;
+    mix += (size_t) t * 8;
+    x += (size_t) t * dim;
+    float r[8];
+    float ss = 0.0f;
+    int n = 0;
+    for (int e = threadIdx.x; e < dim; e += blockDim.x, ++n) {
+        float a = 0.0f;
+        for (int s = 0; s < hc; ++s) a += mix[s] * h[(size_t) s * dim + e];
+        r[n] = a;
+        ss += a * a;
+    }
+    const float inv = rsqrtf(block_sum(ss) / (float) dim + eps);
+    n = 0;
+    for (int e = threadIdx.x; e < dim; e += blockDim.x, ++n) x[e] = w != nullptr ? r[n] * inv * w[e] : r[n];
+}
 __global__ void __launch_bounds__(1024) hc_pre_norm_kernel(const float* __restrict__ h, const float* __restrict__ mix,
                                                            const float* __restrict__ w, int dim, int hc, float eps,
                                                            float* __restrict__ x) {
@@ -457,6 +494,31 @@ __global__ void __launch_bounds__(kThreads) gemv_f32_kernel(const float* __restr
     }
     acc = warp_sum(acc);
     if (lane == 0) y[(size_t) t * ldy + row] = acc;
+}
+
+// the same over BF16 weights (the router's as the file has them: exact in F32, the products and their order gemv_f32's)
+__global__ void __launch_bounds__(kThreads) gemv_bf16_kernel(const uint16_t* __restrict__ W, const float* __restrict__ x,
+                                                             int n, int k, float* __restrict__ y, int ldy) {
+    const int row = blockIdx.x * (kThreads / 32) + (threadIdx.x >> 5);
+    const int lane = threadIdx.x & 31, t = blockIdx.y;
+    if (row >= n) return;
+    const uint2* w = (const uint2*) (W + (size_t) row * k);
+    const float4* xv = (const float4*) (x + (size_t) t * k);
+    float acc = 0.0f;
+    for (int c = lane; c < k / 4; c += 32) {
+        const uint2 q = w[c];
+        const float4 b = xv[c];
+        acc = fmaf(__uint_as_float(q.x << 16), b.x, acc);
+        acc = fmaf(__uint_as_float(q.x & 0xffff0000u), b.y, acc);
+        acc = fmaf(__uint_as_float(q.y << 16), b.z, acc);
+        acc = fmaf(__uint_as_float(q.y & 0xffff0000u), b.w, acc);
+    }
+    acc = warp_sum(acc);
+    if (lane == 0) y[(size_t) t * ldy + row] = acc;
+}
+__global__ void bf16_to_f32_kernel(const uint16_t* __restrict__ a, size_t n, float* __restrict__ out) {
+    const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = __uint_as_float((uint32_t) a[i] << 16);
 }
 
 // ---------------------------------------------------------------- the router
@@ -654,6 +716,9 @@ __global__ void __launch_bounds__(1024) topk_kernel(const float* __restrict__ va
                                                     const int* __restrict__ cand, int cand_stride, int blk,
                                                     int* __restrict__ out, int out_stride) {
     SYCL_SHARED(unsigned[256], hist);
+    // (each warp its own histogram, summed after: the 1024 work items' atomics on one histogram's few bins - a score's top byte
+    //  is its exponent, most fall in a handful - made the decode's top-k 135 us over 16K scores)
+    SYCL_SHARED(unsigned[32 * 256], histw);
     SYCL_SHARED(uint32_t, prefix_s);
     SYCL_SHARED(uint32_t, mask_s);
     SYCL_SHARED(int, remaining_s);
@@ -678,13 +743,21 @@ __global__ void __launch_bounds__(1024) topk_kernel(const float* __restrict__ va
         cnt_eq = 0;
     }
     __syncthreads();
+    const int nwh = (int) (blockDim.x >> 5);
+    unsigned* myh = histw + (threadIdx.x >> 5) * 256;
     for (int shift = 24; shift >= 0; shift -= 8) {
-        for (int i = threadIdx.x; i < 256; i += blockDim.x) hist[i] = 0u;
+        for (int i = threadIdx.x; i < nwh * 256; i += blockDim.x) histw[i] = 0u;
         __syncthreads();
         const uint32_t prefix = prefix_s, mask = mask_s;
         for (int i = threadIdx.x; i < n; i += blockDim.x) {
             const uint32_t u = ord_key(vals[i]);
-            if ((u & mask) == prefix) atomicAdd(&hist[(u >> shift) & 0xffu], 1u);
+            if ((u & mask) == prefix) atomicAdd(&myh[(u >> shift) & 0xffu], 1u);
+        }
+        __syncthreads();
+        for (int b = threadIdx.x; b < 256; b += blockDim.x) {
+            unsigned c = 0u;
+            for (int w = 0; w < nwh; ++w) c += histw[w * 256 + b];
+            hist[b] = c;
         }
         __syncthreads();
         if (threadIdx.x == 0) {
@@ -706,50 +779,72 @@ __global__ void __launch_bounds__(1024) topk_kernel(const float* __restrict__ va
     const uint32_t thr = prefix_s;
     const int remaining = remaining_s;
     const int n_gt = k - remaining;
-    // the picks in index order (a scan a pass of 1024 values), so the attention sums them in the same order every run
-    // and the ties kept are the lowest positions
+    // the picks in index order, so the attention sums them in the same order every run and the ties kept are the lowest
+    // positions: a pass of 8 consecutive values a work item (8192 a pass: a third of the barriers' passes of one value a
+    // work item, which were most of the decode's top-k) - each item's counts, their exclusive sums over the block (a warp's
+    // by shuffles, the warps' in shared memory), then its picks into their slots
+    constexpr int kPer = 8;
     SYCL_SHARED(int[32], wgt);
     SYCL_SHARED(int[32], weq);
     const int lane = threadIdx.x & 31, wid = threadIdx.x >> 5, nw = blockDim.x >> 5;
-    const unsigned below = (1u << lane) - 1u;
-    for (int i0 = 0; i0 < n; i0 += blockDim.x) {
-        const int i = i0 + threadIdx.x;
-        const uint32_t u = i < n ? ord_key(vals[i]) : 0u;
-        const bool gt = i < n && u > thr, eq = i < n && u == thr;
-        const unsigned bg = __ballot_sync(0xffffffffu, gt), be = __ballot_sync(0xffffffffu, eq);
-        if (lane == 0) {
-            wgt[wid] = __popc(bg);
-            weq[wid] = __popc(be);
+    for (int i0 = 0; i0 < n; i0 += (int) blockDim.x * kPer) {
+        const int base = i0 + (int) threadIdx.x * kPer;
+        uint32_t uu[kPer];
+        int ng = 0, ne = 0;
+#pragma unroll
+        for (int j = 0; j < kPer; ++j) {
+            const int i = base + j;
+            uu[j] = i < n ? ord_key(vals[i]) : 0u;
+            ng += i < n && uu[j] > thr;
+            ne += i < n && uu[j] == thr;
+        }
+        int gs = ng, es = ne;   // (the warp's inclusive sums)
+        for (int o = 1; o < 32; o <<= 1) {
+            const int a = __shfl_up_sync(0xffffffffu, gs, o), b = __shfl_up_sync(0xffffffffu, es, o);
+            if (lane >= o) {
+                gs += a;
+                es += b;
+            }
+        }
+        if (lane == 31) {
+            wgt[wid] = gs;
+            weq[wid] = es;
         }
         __syncthreads();
-        if (wid == 0) {
+        if (wid == 0) {   // (the warps' exclusive sums, after the passes before)
             const int g0 = lane < nw ? wgt[lane] : 0, e0 = lane < nw ? weq[lane] : 0;
-            int gs = g0, es = e0;
+            int ga = g0, ea = e0;
             for (int o = 1; o < 32; o <<= 1) {
-                const int a = __shfl_up_sync(0xffffffffu, gs, o), b = __shfl_up_sync(0xffffffffu, es, o);
+                const int a = __shfl_up_sync(0xffffffffu, ga, o), b = __shfl_up_sync(0xffffffffu, ea, o);
                 if (lane >= o) {
-                    gs += a;
-                    es += b;
+                    ga += a;
+                    ea += b;
                 }
             }
             if (lane < nw) {
-                wgt[lane] = cnt_gt + gs - g0;
-                weq[lane] = cnt_eq + es - e0;
+                wgt[lane] = cnt_gt + ga - g0;
+                weq[lane] = cnt_eq + ea - e0;
             }
             __syncwarp();
             if (lane == 31) {
-                cnt_gt += gs;
-                cnt_eq += es;
+                cnt_gt += ga;
+                cnt_eq += ea;
             }
         }
         __syncthreads();
-        int slot = -1;
-        if (gt) slot = wgt[wid] + __popc(bg & below);
-        else if (eq) {
-            const int e = weq[wid] + __popc(be & below);
-            if (e < remaining) slot = n_gt + e;
+        int sg = wgt[wid] + gs - ng, se = weq[wid] + es - ne;   // (this item's first slots)
+#pragma unroll
+        for (int j = 0; j < kPer; ++j) {
+            const int i = base + j;
+            if (i >= n) break;
+            int slot = -1;
+            if (uu[j] > thr) slot = sg++;
+            else if (uu[j] == thr) {
+                if (se < remaining) slot = n_gt + se;
+                ++se;
+            }
+            if (slot >= 0) out[slot] = cd != nullptr ? cd[i / blk] * blk + i % blk : i;
         }
-        if (slot >= 0) out[slot] = cd != nullptr ? cd[i / blk] * blk + i % blk : i;
         __syncthreads();
     }
 }
@@ -1779,15 +1874,19 @@ __global__ void moe_combine_kernel(float* acc, const float* __restrict__ y, cons
                                    const float* __restrict__ w, int k, int r0, int r1, int dim) {
     const int e = blockIdx.x * blockDim.x + threadIdx.x, t = blockIdx.y;
     if (e >= dim) return;
+    bool any = false;   // (the token's picks first: a set of a few experts touches about half of them - the others' acc not read)
+    for (int i = 0; i < k; ++i) {
+        const int r = pos[(size_t) t * kPicks + i];
+        any = any || (r >= r0 && r < r1);
+    }
+    if (!any) return;
     float a = acc[(size_t) t * dim + e];
-    bool any = false;
     for (int i = 0; i < k; ++i) {
         const int r = pos[(size_t) t * kPicks + i];
         if (r < r0 || r >= r1) continue;
         a = __fmaf_rn(w[(size_t) t * kPicks + i], y[(size_t) (r - r0) * dim + e], a);
-        any = true;
     }
-    if (any) acc[(size_t) t * dim + e] = a;
+    acc[(size_t) t * dim + e] = a;
 }
 
 int cdiv(int a, int b) { return (a + b - 1) / b; }
@@ -1903,6 +2002,12 @@ void hc_pre_norm(const float* h, const float* mix, const float* w, int dim, int 
                  cudaStream_t s) {
     STRATA_LAUNCH(s, T, 1024, 0, hc_pre_norm_kernel, h, mix, w, dim, hc, eps, x);
 }
+void hc_split_pre_norm(const float* mixes, const float* scale, const float* base, int iters, float hc_eps, float* pre,
+                       float* post, float* comb, const float* h, const float* mix, const float* w, int dim, int hc, int T,
+                       float eps, float* x, cudaStream_t s) {
+    const HcSplit sp{mixes, scale, base, iters, hc_eps, pre, post, comb};
+    STRATA_LAUNCH(s, T, 1024, 0, hc_split_pre_norm_kernel, sp, h, mix, w, dim, hc, eps, x);
+}
 void hc_post(const float* y, const float* res, const float* post, const float* comb, int dim, int hc, int T,
              float* out, cudaStream_t s) {
     STRATA_LAUNCH(s, dim3(cdiv(dim * hc, kThreads), T), kThreads, 0, hc_post_kernel, y, res, post, comb, dim, hc, out);
@@ -1964,6 +2069,12 @@ void gemv_f16_rows(const uint16_t* W, const float* x, size_t ldx, int n, int k, 
                       y, ldy);
 }
 
+void gemv_bf16(const uint16_t* W, const float* x, int n, int k, int T, float* y, int ldy, cudaStream_t s) {
+    if (T > 0) STRATA_LAUNCH(s, dim3(cdiv(n, kThreads / 32), T), kThreads, 0, gemv_bf16_kernel, W, x, n, k, y, ldy);
+}
+void bf16_to_f32(const uint16_t* a, size_t n, float* out, cudaStream_t s) {
+    if (n > 0) STRATA_LAUNCH(s, (unsigned) ((n + kThreads - 1) / kThreads), kThreads, 0, bf16_to_f32_kernel, a, n, out);
+}
 void gemv_f32(const float* W, const float* x, int n, int k, int T, float* y, int ldy, cudaStream_t s) {
     if (T > 0) STRATA_LAUNCH(s, dim3(cdiv(n, kThreads / 32), T), kThreads, 0, gemv_f32_kernel, W, x, n, k, y, ldy);
 }
@@ -2212,6 +2323,13 @@ void sparse_attn_xmx_kernel(sycl::nd_item<2> it, const float* __restrict__ q, co
     auto lp = [](bf16* p) {
         return sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(p);
     };
+    // this sub-group's S operand Q^T (its quarter of the dims, all 16 heads) held in registers for every tile - read once,
+    // not once a tile (64 of the 256 registers; it was a third of the tiles' SLM reads)
+    const int mq = sgi & 3, kq = sgi >> 2;
+    it.barrier(sycl::access::fence_space::local_space);   // (sq written)
+    axm::joint_matrix<sycl::sub_group, bf16, axm::use::b, 16, 16, axm::layout::row_major> qb[8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) axm::joint_matrix_load(sg, qb[i], lp(sq + (kq * 128 + i * 16) * kAxH), kAxH);
     auto lpf = [](float* p) {
         return sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(p);
     };
@@ -2231,15 +2349,13 @@ void sparse_attn_xmx_kernel(sycl::nd_item<2> it, const float* __restrict__ q, co
         }
         it.barrier(sycl::access::fence_space::local_space);
         {   // S^T: sub-group g rows 8 (g % 4) of the tile (all 16 heads) over the dims' quarter g / 4 - ss[quarter][row][head]
-            const int mq = sgi & 3, kq = sgi >> 2;
             axm::joint_matrix<sycl::sub_group, float, axm::use::accumulator, 8, 16> s_acc;
             axm::joint_matrix_fill(sg, s_acc, 0.0f);
-            for (int kk = kq * 128; kk < kq * 128 + 128; kk += 16) {
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
                 axm::joint_matrix<sycl::sub_group, bf16, axm::use::a, 8, 16, axm::layout::row_major> fa;
-                axm::joint_matrix<sycl::sub_group, bf16, axm::use::b, 16, 16, axm::layout::row_major> fb;
-                axm::joint_matrix_load(sg, fa, lp(sk + mq * 8 * kAxLd + kk), kAxLd);
-                axm::joint_matrix_load(sg, fb, lp(sq + kk * kAxH), kAxH);
-                axm::joint_matrix_mad(sg, s_acc, fa, fb, s_acc);
+                axm::joint_matrix_load(sg, fa, lp(sk + mq * 8 * kAxLd + kq * 128 + i * 16), kAxLd);
+                axm::joint_matrix_mad(sg, s_acc, fa, qb[i], s_acc);
             }
             axm::joint_matrix_store(sg, s_acc, lpf(ss + (size_t) kq * kAxN * kAxH + mq * 8 * kAxH), kAxH, axm::layout::row_major);
         }
@@ -2464,7 +2580,10 @@ static void launch_attn_xmx(const float* q, const uint16_t* win, const uint8_t* 
         sycl::local_accessor<bf16, 1> sp(sycl::range<1>((size_t) kAxH * (kAxN + 8)), cgh);
         sycl::local_accessor<float, 1> ss(sycl::range<1>((size_t) 4 * kAxH * kAxN), cgh);  // 8 KB
         sycl::local_accessor<float, 1> st(sycl::range<1>((size_t) 3 * kAxH), cgh);
-        cgh.parallel_for(sycl::nd_range<2>(global, local), [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(16)]] {
+        // (256 registers: the Q fragments stay in them; 2 work groups a core either way - SLM holds two)
+        cgh.parallel_for(sycl::nd_range<2>(global, local),
+                         sycl::ext::oneapi::experimental::properties{sycl::ext::intel::experimental::grf_size<256>},
+                         [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(16)]] {
             sparse_attn_xmx_kernel(it, q, win, ckv, sel, sel_stride, a, sink, heads, scale, out,
                                    sq.get_multi_ptr<sycl::access::decorated::no>().get(),
                                    sk.get_multi_ptr<sycl::access::decorated::no>().get(),

@@ -1049,6 +1049,36 @@ bool mv(const x3::MvJob* jobs, int n, cudaStream_t s) {
     bool vec[3] = {true, true, true};
     iq::MvJob IJ[x3::kMaxMvJobs];   // the low-bit ones (ds4_iq: a launch a type)
     int nij = 0;
+    // the int8 inputs: one rounding a run of inputs, not a launch a job - jobs on the same x (wq_a, wkv, the compressor's; the
+    // shared expert's gate and up) share it, and jobs on adjacent slices of one vector (wo_a's groups) take one launch over the
+    // whole run (its blocks of 32 rounded as each slice's alone); launched after the jobs are read, before their GEMVs
+    struct QRun {
+        const float* x;
+        size_t ldx, at;
+        int ncol, k;
+    } qr[x3::kMaxMvJobs];
+    int nq = 0;
+    size_t q_next = 0;
+    const size_t q_cap = (size_t) x3::kMaxMvJobs * x3::kMaxMvCols * kMaxQK;
+    auto q_at = [&](const x3::MvJob& q, int k) -> size_t {   // where job q's int8 rows go (~0: past the scratch)
+        if (q.ncol == 1)
+            for (int r = 0; r < nq; ++r) {
+                QRun& u = qr[r];
+                if (u.ncol != 1) continue;
+                const ptrdiff_t off = q.xf - u.x;
+                if (off >= 0 && off % 32 == 0 && off + k <= u.k) return u.at + (size_t) off;   // (inside: the same rows)
+                if (off == u.k && u.at + (size_t) u.k == q_next && q_next + (size_t) k <= q_cap) {   // (right after: the run grows)
+                    u.k += k;
+                    q_next += (size_t) k;
+                    return u.at + (size_t) off;
+                }
+            }
+        const size_t need = (size_t) k * (size_t) q.ncol;
+        if (nq >= x3::kMaxMvJobs || q_next + need > q_cap) return ~(size_t) 0;
+        qr[nq++] = {q.xf, q.ncol > 1 ? q.xf_cs : (size_t) k, q_next, q.ncol, k};
+        q_next += need;
+        return q_next - need;
+    };
     for (int i = 0; i < n; ++i) {
         const x3::MvJob& q = jobs[i];
         const x3::Mat& m = *q.m;
@@ -1060,8 +1090,11 @@ bool mv(const x3::MvJob* jobs, int n, cudaStream_t s) {
                 g_errors.fetch_add(1, std::memory_order_relaxed);
                 return false;
             }
-            const size_t at = (size_t) i * x3::kMaxMvCols * kMaxQK;
-            q8_quant(q.xf, q.ncol > 1 ? q.xf_cs : (size_t) m.k, q.ncol, m.k, sc->mq + at, sc->md + at / 32, s);
+            const size_t at = q_at(q, m.k);
+            if (at == ~(size_t) 0) {
+                fail("mv: int8 inputs past the scratch");
+                return false;
+            }
             iq::MvJob& b = IJ[nij++];
             b.w = (const uint8_t*) m.raw;
             b.ld = row_stride(m);
@@ -1107,14 +1140,22 @@ bool mv(const x3::MvJob* jobs, int n, cudaStream_t s) {
                 fail("mv: Q8_0 inputs past the scratch");
                 return false;
             }
-            const size_t at = (size_t) i * x3::kMaxMvCols * kMaxQK;
+            const size_t at = q_at(q, m.k);
+            if (at == ~(size_t) 0) {
+                fail("mv: Q8_0 inputs past the scratch");
+                return false;
+            }
             b.xq = sc->mq + at;
             b.xd = sc->md + at / 32;
-            q8_quant(q.xf, q.ncol > 1 ? q.xf_cs : (size_t) m.k, q.ncol, m.k, sc->mq + at, sc->md + at / 32, s);
             vec[f] = vec[f] && b.ld % 4 == 0 && ((uintptr_t) b.w & 3u) == 0 && (m.k / 32) % 2 == 0;
         } else {
             vec[f] = vec[f] && xa && (f != 0 || (m.k % 8 == 0 && b.ld % 8 == 0 && ((uintptr_t) b.w & 15u) == 0));
         }
+    }
+    if (nq > 0) {
+        Scratch* sc = scratch(s);
+        if (sc == nullptr) return false;
+        for (int r = 0; r < nq; ++r) q8_quant(qr[r].x, qr[r].ldx, qr[r].ncol, qr[r].k, sc->mq + qr[r].at, sc->md + qr[r].at / 32, s);
     }
     for (int f = 0; f < 3; ++f) mv_set(f, J[f], nj[f], max_n[f], max_c[f], vec[f], s);
     if (nij > 0 && !iq::mv(IJ, nij, s)) {
@@ -1204,6 +1245,11 @@ void moe_gate_up(const x3::MoeArgs& a, const float* x, float* h, cudaStream_t s)
 }
 
 void moe_down(const x3::MoeArgs& a, const float* h, const float* sh_out, float* out, cudaStream_t s) {
+    moe_down_part(a, h, s);
+    moe_combine(a, sh_out, out, s);
+}
+
+void moe_down_part(const x3::MoeArgs& a, const float* h, cudaStream_t s) {
     if (!mx_geometry("moe_down", a.k, a.n_embd, a.n_ff) || h == nullptr) return;
     Scratch* sc = scratch(s);
     if (sc == nullptr) return;
@@ -1225,6 +1271,12 @@ void moe_down(const x3::MoeArgs& a, const float* h, const float* sh_out, float* 
     } else {
         launch_groups<DownK>(m, a.n_embd, a.k, 1, s);
     }
+    check("moe_down");
+}
+
+void moe_combine(const x3::MoeArgs& a, const float* sh_out, float* out, cudaStream_t s) {
+    Scratch* sc = scratch(s);
+    if (sc == nullptr) return;
     CombArgs c{};
     c.plan_ptr = a.plan_ptr;
     c.plan_w = a.plan_w;
@@ -1320,7 +1372,7 @@ iq::SetArgs iq_set(const x3::SetArgs& sa) {   // a set as ds4_iq's arguments (th
 }  // namespace
 
 void set_gate_up(const x3::SetArgs& sa, const float* x, int ldx, const int* row_idx, uint16_t* h16, int ldh,
-                 cudaStream_t s) {
+                 cudaStream_t s, const uint16_t* x16) {
     if (sa.n_exp <= 0 || sa.max_rows <= 0) return;
     if (!mx_geometry("set_gate_up", 1, sa.n_embd, sa.n_ff)) return;
     if (!mx_experts(sa.lay)) {   // low-bit experts: ds4_iq's sets
@@ -1328,6 +1380,7 @@ void set_gate_up(const x3::SetArgs& sa, const float* x, int ldx, const int* row_
         if (!iq_args(sa.lay, sa.n_embd, sa.n_ff, sa.limit, ia, "set_gate_up")) return;
         iq::SetArgs q = iq_set(sa);
         q.xf = x;
+        q.xh = x16;
         q.idx = row_idx;
         q.ldx = ldx;
         q.h = h16;

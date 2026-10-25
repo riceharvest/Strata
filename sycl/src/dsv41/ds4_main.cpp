@@ -1442,9 +1442,9 @@ int main(int argc, char** argv) {
         const auto& s1 = m.stats();
         const double nv = (double) std::max<int64_t>(1, s1.drafts_rounds - s0.drafts_rounds);
         std::fprintf(stderr, "dspark: %lld rounds, %lld drafts offered, %lld accepted (%.2f tokens a round); drafting "
-                             "%.2f ms a round, verifying %.1f ms in all (%lld windows)\n",
+                             "%.2f ms a round, verifying %.1f ms in all (%lld drafting rounds)\n",
                      rounds, d_off, d_acc, (double) out.size() / (double) rounds, (s1.draft_ms - s0.draft_ms) / nv,
-                     s1.verify_ms - s0.verify_ms, (long long) (s1.drafts_offered > 0 ? 0 : 0));
+                     s1.verify_ms - s0.verify_ms, (long long) (s1.drafts_rounds - s0.drafts_rounds));
         std::fprintf(stderr, "dspark %s\n", per_position(s0, s1).c_str());
     }
     if (std::getenv("DS4_TOKLOG") != nullptr && tok_ms.size() > 8) {   // the decode's tokens after the first (which carries the prompt's tail)
@@ -1518,12 +1518,18 @@ int main(int argc, char** argv) {
     if (s.prof_tokens > s0.prof_tokens) {   // DS4_PROF
         const double pt = (double) (s.prof_tokens - s0.prof_tokens);
         double sum = 0;
-        for (int i = 0; i < 6; ++i) sum += (s.prof_ms[i] - s0.prof_ms[i]) / pt;
+        for (int i = 0; i < 11; ++i) sum += (s.prof_ms[i] - s0.prof_ms[i]) / pt;
         std::fprintf(stderr, "GPU per token (DS4_PROF): %.2f ms - between layers %.2f, attention %.2f, routing + shared "
-                             "expert %.2f, experts gate/up %.2f, waiting for the CPU lane %.2f, down + post %.2f\n", sum,
+                             "expert %.2f, VRAM experts %.2f, waiting for the CPU lane %.2f, sum + post %.2f\n", sum,
                      (s.prof_ms[0] - s0.prof_ms[0]) / pt, (s.prof_ms[1] - s0.prof_ms[1]) / pt,
                      (s.prof_ms[2] - s0.prof_ms[2]) / pt, (s.prof_ms[3] - s0.prof_ms[3]) / pt,
                      (s.prof_ms[4] - s0.prof_ms[4]) / pt, (s.prof_ms[5] - s0.prof_ms[5]) / pt);
+        if (s.prof_ms[6] + s.prof_ms[7] > s0.prof_ms[6] + s0.prof_ms[7])
+            std::fprintf(stderr, "  (DS4_PROF=sync, host clock, nothing overlapped) before the first layer %.2f ms, after the last (head) %.2f\n",
+                         (s.prof_ms[6] - s0.prof_ms[6]) / pt, (s.prof_ms[7] - s0.prof_ms[7]) / pt);
+        std::fprintf(stderr, "  the attention: Engram + mHC + projections %.2f ms, ring + compressor + indexer %.2f, sparse attention %.2f, "
+                             "the rest (wo, post) %.2f\n", (s.prof_ms[8] - s0.prof_ms[8]) / pt, (s.prof_ms[9] - s0.prof_ms[9]) / pt,
+                     (s.prof_ms[10] - s0.prof_ms[10]) / pt, (s.prof_ms[1] - s0.prof_ms[1]) / pt);
     }
     if (df != nullptr) std::fclose(df);
     m.save_profile();
