@@ -71,16 +71,23 @@ matchMedia("(prefers-color-scheme: dark)").addEventListener("change", (e) => {
   if (!saved) setTheme(e.matches ? "dark" : "light", false);
 });
 
+const TABS = ["chat", "images", "monitor", "requests", "about"];
+const TITLES = {chat: ["Chat", ""], images: ["Images", ""], monitor: ["Dashboard", ""], requests: ["Requests", "every request the server keeps"],
+                about: ["Model and settings", ""]};
 let tab = "chat";
 function showTab(name) {
-  tab = ["chat", "images", "monitor", "about"].includes(name) ? name : "chat";
+  tab = TABS.includes(name) ? name : "chat";
   for (const b of document.querySelectorAll(".st-tab")) b.setAttribute("aria-selected", String(b.dataset.tab === tab));
-  for (const v of ["chat", "images", "monitor", "about"]) $(`view-${v}`).hidden = v !== tab;
+  for (const v of TABS) $(`view-${v}`).hidden = v !== tab;
+  $("page-title").textContent = TITLES[tab][0];
+  $("page-sub").textContent = TITLES[tab][1];
+  document.body.dataset.tab = tab;
   if (tab === "images") $("img-prompt").focus();
   if (location.hash.slice(1) !== tab) history.replaceState(null, "", tab === "chat" ? location.pathname : `#${tab}`);
   if (tab === "chat") $("input").focus();
   if (tab === "monitor") loadMcp();
   if (tab === "about") loadConfig();
+  if (wantsAll()) allReqsAt = 0;                      // the next poll reads every kept request
   if (lastMetrics) render(lastMetrics);
 }
 for (const b of document.querySelectorAll(".st-tab")) b.onclick = () => showTab(b.dataset.tab);
@@ -120,9 +127,9 @@ async function loadHealth() {
   }
 }
 
-// ------------------------------------------------------------------ Monitor
+// ------------------------------------------------------------------ Dashboard
+// Hardware tiles: a number and a sparkline each (the server keeps a minute of history per series)
 const METRICS = [
-  {key: "speed", label: "Speed", icon: "gauge", unit: "t/s", series: "tok_s"},
   {key: "gpu", label: "GPU load", icon: "gpu", unit: "%", series: "gpu_util", max: 100},
   {key: "vram", label: "VRAM", icon: "layers", unit: "GB", series: "gpu_mem_used"},
   {key: "temp", label: "GPU temp", icon: "thermometer", unit: "°C", series: "gpu_temp", tone: "warn"},
@@ -132,46 +139,51 @@ const METRICS = [
   {key: "disk", label: "Disk read", icon: "disk", unit: "MB/s", series: "disk_read_mb", tone: "info"},
 ];
 $("metrics").innerHTML = METRICS.map((m) => `
-  <div class="st-card metric-card"><div class="st-metric">
-    <span class="st-metric__label">${icon(m.icon, "st-icon st-icon--sm")}${esc(m.label)}</span>
-    ${m.key === "speed" ? `<div class="speed-values">
-      <div><span class="st-metric__value" id="mv-speed">-</span><span class="st-metric__sub" id="ms-speed">Decode</span></div>
-      <div class="speed-prefill"><span class="st-metric__value" id="mv-prefill">-</span><span class="st-metric__sub" id="ms-prefill">Prefill</span></div>
-    </div>` : `<span class="st-metric__value" id="mv-${m.key}">–</span>
-    <span class="st-metric__sub" id="ms-${m.key}"></span>`}
-    <svg class="st-metric__spark" id="sp-${m.key}" viewBox="0 0 100 32" preserveAspectRatio="none"${m.tone ? ` data-tone="${m.tone}"` : ""}>
+  <div class="hwtile"><span class="hwtile__label">${icon(m.icon, "st-icon st-icon--sm")}${esc(m.label)}</span>
+    <span class="hwtile__value" id="mv-${m.key}">–</span><span class="hwtile__sub" id="ms-${m.key}"></span>
+    <svg class="spark" id="sp-${m.key}" viewBox="0 0 100 32" preserveAspectRatio="none"${m.tone ? ` data-tone="${m.tone}"` : ""}>
       <path class="area" fill="currentColor" opacity=".12"/><path class="line" fill="none" stroke="currentColor"
-      stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round" vector-effect="non-scaling-stroke"/>
-      ${m.key === "speed" ? `<g id="sp-prefill" class="speed-prefill"><path class="area" fill="currentColor" opacity=".12"/>
-        <path class="line" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"
-        stroke-linecap="round" vector-effect="non-scaling-stroke"/></g>` : ""}</svg>
-  </div></div>`).join("");
+      stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round" vector-effect="non-scaling-stroke"/></svg></div>`).join("");
 
+function sparkPath(v, max, w = 100, h = 32, pad = 3) {
+  v = (v || []).map((x) => (x == null || Number.isNaN(x) ? 0 : x));
+  if (v.length < 2) return ["", ""];
+  const top = Math.max(max || 0, ...v, 1e-9);
+  const pts = v.map((x, i) => [(i / (v.length - 1)) * w, h - pad - (x / top) * (h - 2 * pad)]);
+  const line = pts.map((p, i) => `${i ? "L" : "M"}${p[0].toFixed(2)},${p[1].toFixed(2)}`).join("");
+  return [line, `${line}L${w},${h}L0,${h}Z`];
+}
 function spark(id, values, max) {
   const svg = $(id);
-  const v = (values || []).map((x) => (x == null ? 0 : x));
-  if (v.length < 2) { svg.querySelector(".line").setAttribute("d", ""); svg.querySelector(".area").setAttribute("d", ""); return; }
-  const top = Math.max(max || 0, ...v, 1);
-  const pts = v.map((x, i) => [(i / (v.length - 1)) * 100, 30 - (x / top) * 26]);
-  const line = pts.map((p, i) => `${i ? "L" : "M"}${p[0].toFixed(2)},${p[1].toFixed(2)}`).join("");
+  const [line, area] = sparkPath(values, max);
   svg.querySelector(".line").setAttribute("d", line);
-  svg.querySelector(".area").setAttribute("d", `${line}L100,32L0,32Z`);
+  svg.querySelector(".area").setAttribute("d", area);
 }
 function setMetric(key, value, unit, sub) {
+  $(`mv-${key}`).closest(".hwtile").hidden = value == null && !sub;    // a reading this PC cannot give is not shown as a dash
   $(`mv-${key}`).innerHTML = value == null ? "–" : `${esc(value)}${unit ? `<small>${esc(unit)}</small>` : ""}`;
   $(`ms-${key}`).textContent = sub || "";
 }
 
 let lastMetrics = null, metricsFailures = 0, keyWarned = false, mcpTick = 0;
-let reqShowAll = false;   // the Monitor's request table: the last 12, or every one the server keeps (issue #35)
+let allReqs = [], allReqsAt = 0, polling = false;      // every request the server keeps, fetched at most every 5 s
+const wantsAll = () => tab === "monitor" || tab === "requests";
 async function poll() {
+  if (polling) return;
+  polling = true;
   try {
-    const r = await fetch(reqShowAll ? "metrics?requests=all" : "metrics", {headers: headers()});
+    const full = wantsAll() && Date.now() - allReqsAt > 5000;
+    const r = await fetch(full ? "metrics?requests=all" : "metrics", {headers: headers()});
     if (r.status === 401) {
       setPill("error", "API key needed");
-      if (!keyWarned) { keyWarned = true; toast("warn", "API key needed", "This server needs a key: add it under About > Settings.", 6000); }
+      if (!keyWarned) { keyWarned = true; toast("warn", "API key needed", "This server needs a key: add it under Model and settings.", 6000); }
     } else if (r.ok) {
       lastMetrics = await r.json();
+      if (full) { allReqs = lastMetrics.requests || []; allReqsAt = Date.now(); }
+      else if (allReqs.length) {                         // the newest 12 are always fresh; the rest comes from the last full read
+        const ids = new Set((lastMetrics.requests || []).map((x) => x.id));
+        allReqs = (lastMetrics.requests || []).concat(allReqs.filter((x) => !ids.has(x.id))).slice(0, 500);
+      }
       metricsFailures = 0;
       render(lastMetrics);
     } else {
@@ -180,6 +192,7 @@ async function poll() {
   } catch (e) {
     if (++metricsFailures === 3) setPill("error", "Server not reachable");
   }
+  polling = false;
   if (tab === "monitor" && ++mcpTick % 10 === 0) loadMcp();       // server states change rarely: every 10 s
   setTimeout(poll, 1000);
 }
@@ -191,6 +204,7 @@ function setPill(state, text) {
 
 function render(m) {
   const live = m.live || {}, hw = m.hardware || {}, st = m.hardware_static || {}, eng = m.engine || {}, h = m.history || {};
+  const reqs = wantsAll() && allReqs.length ? allReqs : (m.requests || []);
   const last = (m.requests || [])[0];
   // the header pill
   if (live.state === "reading") {
@@ -199,11 +213,18 @@ function render(m) {
   } else if (live.state === "generating") {
     setPill("generating", `Generating · ${fmt(live.tok_s, 1)} tok/s`);
   } else {
-    setPill("idle", "Idle");
+    setPill("idle", live.state === "unloaded" ? "Unloaded" : "Idle");
   }
   if (live.queued > 0) setPill("queued", `${live.queued} queued`);
-  if (tab === "monitor") renderMonitor(live, hw, st, eng, h, last, m.requests || [], m.totals, m.requests_kept);
-  if (tab === "monitor") renderConvCache(m.conversation_cache);
+  $("side-model-name").textContent = eng.model || "–";
+  $("side-model-sub").textContent = [eng.max_context ? `${ctxfmt(eng.max_context)} context` : null,
+                                     live.state === "unloaded" ? "not loaded" : "loaded"].filter(Boolean).join(" · ");
+  $("side-model").title = eng.model || "";
+  if (tab === "monitor") {
+    renderDash(live, hw, st, eng, h, last, reqs, m);
+    renderConvCache(m.conversation_cache);
+  }
+  if (tab === "requests") renderRequests(reqs, m);
   if (tab === "about") renderAbout(eng, hw, st);
 }
 
@@ -240,21 +261,166 @@ function renderConvCache(c) {
     : "The engine keeps the last conversation's state, so a follow-up reads only what is new. To keep several conversations (agents taking turns), add \"--conversation-cache-mib\", \"8192\" to the run config's args (docs/DETAILS.md).";
 }
 
-function renderTotals(t) {
-  if (!t || !t.requests) return "";
-  const since = new Date(t.since * 1000).toLocaleString([], {weekday: "short", hour: "2-digit", minute: "2-digit"});
-  const read = t.prompt_tokens - t.reused;
-  const pSpeed = t.prompt_ms > 0 && read > 0 ? ` at ${fmt(read / (t.prompt_ms / 1000))} tok/s` : "";
-  const oSpeed = t.decode_ms > 0 && t.output_tokens > 0 ? ` at ${fmt(t.output_tokens / (t.decode_ms / 1000), 1)} tok/s` : "";
-  return `Since ${since}: ${fmt(t.requests)} requests · ${fmt(read)} prompt tokens read${pSpeed} (${fmt(t.reused)} reused) · ` +
-         `${fmt(t.output_tokens)} written${oSpeed}`;
+// ---- numbers behind the tiles and charts
+const big = (n) => (n == null ? "–" : n >= 1e9 ? `${fmt(n / 1e9, 2)}B` : n >= 1e6 ? `${fmt(n / 1e6, n >= 1e7 ? 1 : 2)}M` : n >= 1e4 ? `${fmt(n / 1e3, 1)}k` : fmt(n));
+const median = (a) => { const v = a.filter((x) => x != null && !Number.isNaN(x)).sort((x, y) => x - y); return v.length ? (v.length % 2 ? v[(v.length - 1) / 2] : (v[v.length / 2 - 1] + v[v.length / 2]) / 2) : null; };
+const quant = (a, q) => { const v = a.filter((x) => x != null && !Number.isNaN(x)).sort((x, y) => x - y); return v.length ? v[Math.min(v.length - 1, Math.floor(q * v.length))] : null; };
+const freshOf = (r) => (r.prompt_tokens == null ? null : Math.max(0, r.prompt_tokens - (r.reused || 0)));
+const prefillOf = (r) => { const f = freshOf(r); return f > 0 && r.prompt_ms > 0 ? f / (r.prompt_ms / 1000) : null; };
+const ttftOf = (r) => (r.first_token_s != null ? r.first_token_s : r.first_engine_token_s > 0 ? r.first_engine_token_s : null);
+const clock = (t) => new Date(t * 1000).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit", second: "2-digit"});
+const clockShort = (t) => new Date(t * 1000).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit"});
+const dayLabel = (iso) => new Date(`${iso}T12:00:00`).toLocaleDateString([], {month: "short", day: "numeric"});
+const FINISH = {stop: ["st-badge--generating", "Done"], length: ["st-badge--reading", "Max tokens"], cancel: ["st-badge--queued", "Stopped"],
+                disconnect: ["st-badge--queued", "Closed"], error: ["st-badge--error", "Error"]};
+const COLORS = {decode: "var(--c-decode)", prefill: "var(--c-prefill)", cached: "var(--c-cached)", fresh: "var(--c-fresh)", out: "var(--c-out)"};
+
+// % change of the recent half against the one before it, as a small chip; better = "up" or "down"
+function chip(cur, prev, better = "up", suffix = "") {
+  if (cur == null || prev == null || prev === 0) return "";
+  const d = (100 * (cur - prev)) / Math.abs(prev);
+  if (!Number.isFinite(d)) return "";
+  const good = Math.abs(d) < 0.5 ? "flat" : (d > 0) === (better === "up") ? "good" : "bad";
+  return `<span class="delta delta--${good}">${d >= 0 ? "▲" : "▼"} ${fmt(Math.abs(d), Math.abs(d) < 10 ? 1 : 0)}%${suffix}</span>`;
 }
-function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
-  // model state
-  const on = live.queued > 0 ? "queued" : live.state;
-  for (const b of document.querySelectorAll("#state-badges .st-badge")) b.classList.toggle("on", b.dataset.s === on || b.dataset.s === live.state);
+function tileSpark(values, tone) {
+  const [line, area] = sparkPath(values);
+  if (!line) return `<svg class="spark spark--empty" viewBox="0 0 100 32" preserveAspectRatio="none"><path d="M0,29H100" stroke="currentColor" stroke-width="1" stroke-dasharray="2 3" fill="none" vector-effect="non-scaling-stroke" opacity=".4"/></svg>`;
+  return `<svg class="spark" data-tone="${tone || ""}" viewBox="0 0 100 32" preserveAspectRatio="none"><path d="${area}" fill="currentColor" opacity=".12"/>` +
+    `<path d="${line}" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round" vector-effect="non-scaling-stroke"/></svg>`;
+}
+function tile(label, value, unit, rows, spark, tone, hint) {
+  return `<div class="tile"><div class="tile__head"><span>${esc(label)}</span>${hint ? `<span class="tile__hint" title="${esc(hint)}">?</span>` : ""}</div>` +
+    `<div class="tile__value">${value}${unit ? `<small>${esc(unit)}</small>` : ""}</div>` +
+    `<div class="tile__rows">${rows.filter(Boolean).join("")}</div>${spark ? tileSpark(spark, tone) : ""}</div>`;
+}
+const row = (text) => `<span class="tile__row">${text}</span>`;
+
+// the lifetime counters by day, the last n days (zero-filled)
+function lastDays(life, n = 14) {
+  const days = (life && life.days) || {}, out = [];
+  for (let i = n - 1; i >= 0; i--) {
+    const d = new Date(); d.setDate(d.getDate() - i);
+    const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+    out.push({key, ...(days[key] || {requests: 0, prompt_tokens: 0, reused: 0, output_tokens: 0})});
+  }
+  return out;
+}
+
+// ---- tiny SVG charts (no library): a line chart and a stacked bar chart with a hover read-out
+const chartState = {};
+function niceMax(v) {
+  if (!(v > 0)) return 1;
+  const p = 10 ** Math.floor(Math.log10(v)), f = v / p;
+  return (f <= 1 ? 1 : f <= 2 ? 2 : f <= 2.5 ? 2.5 : f <= 5 ? 5 : 10) * p;
+}
+function drawChart(id, spec) {
+  const el = $(id);
+  const w = el.clientWidth, h = el.clientHeight;
+  if (!w || !h) return;
+  const n = spec.labels.length;
+  if (n < 2 && spec.kind === "line" || n < 1) {
+    el.innerHTML = `<div class="chart__empty muted">${esc(spec.empty || "Waiting for requests")}</div>`;
+    chartState[id] = null;
+    return;
+  }
+  const hasR = spec.series.some((s) => s.axis === "r");
+  const L = 44, R = hasR ? 44 : 10, T = 8, B = 22, pw = w - L - R, ph = h - T - B;
+  const stacked = spec.kind === "bars";
+  const tops = spec.series[0].values.map((_, i) => spec.series.reduce((s, x) => s + (x.values[i] || 0), 0));
+  if (stacked && !tops.some((t) => t > 0)) {   // (an all-zero axis would read 0,0,1,1,1)
+    el.innerHTML = `<div class="chart__empty muted">${esc(spec.empty || "Waiting for requests")}</div>`;
+    chartState[id] = null;
+    return;
+  }
+  const maxOf = (list) => Math.max(...list.flatMap((s) => s.values.map((x) => x || 0)), 0);
+  const rawMax = stacked ? Math.max(...tops, 0) : maxOf(spec.series.filter((s) => s.axis !== "r"));
+  const maxR = hasR ? niceMax(maxOf(spec.series.filter((s) => s.axis === "r")) * 1.04) : 0;
+  const max = niceMax(Math.max(rawMax, spec.ref || 0) * 1.04);
+  const y = (v, axis) => T + ph - (v / (axis === "r" ? maxR : max)) * ph;
+  const x = stacked ? (i) => L + (i + 0.5) * (pw / n) : (i) => L + (i / (n - 1)) * pw;
+  let g = "";
+  for (let k = 0; k <= 4; k++) {
+    const v = (max * k) / 4, yy = y(v);
+    g += `<line class="gl" x1="${L}" x2="${w - R}" y1="${yy.toFixed(1)}" y2="${yy.toFixed(1)}"/>` +
+         `<text class="ytick" x="${L - 6}" y="${(yy + 3.5).toFixed(1)}" text-anchor="end">${spec.yfmt ? spec.yfmt(v) : big(v)}</text>`;
+    if (hasR) g += `<text class="ytick ytick--r" x="${w - R + 6}" y="${(yy + 3.5).toFixed(1)}" text-anchor="start" style="fill:${spec.series.find((q) => q.axis === "r").color}">${big((maxR * k) / 4)}</text>`;
+  }
+  const want = Math.max(2, Math.floor(pw / 96));
+  const step = Math.max(1, Math.ceil(n / want));
+  for (let i = 0; i < n; i += step) {
+    const anchor = i === 0 ? "start" : "middle";
+    g += `<text class="xtick" x="${x(i).toFixed(1)}" y="${h - 6}" text-anchor="${anchor}">${esc(spec.xlabels ? spec.xlabels[i] : spec.labels[i])}</text>`;
+  }
+  if (stacked) {
+    const bw = Math.max(2, Math.min(34, (pw / n) * 0.66));
+    spec.series.forEach(() => {});
+    for (let i = 0; i < n; i++) {
+      let acc = 0;
+      spec.series.forEach((s) => {
+        const v = s.values[i] || 0;
+        if (v > 0) {
+          const y1 = y(acc + v), y0 = y(acc);
+          g += `<rect class="bar" x="${(x(i) - bw / 2).toFixed(1)}" y="${y1.toFixed(1)}" width="${bw.toFixed(1)}" height="${Math.max(0.5, y0 - y1).toFixed(1)}" fill="${s.color}"/>`;
+        }
+        acc += v;
+      });
+    }
+  } else {
+    spec.series.forEach((s, si) => {
+      let d = "", pen = false, first = null, lastX = 0;
+      s.values.forEach((v, i) => {
+        if (v == null) { pen = false; return; }
+        d += `${pen ? "L" : "M"}${x(i).toFixed(1)},${y(v, s.axis).toFixed(1)}`;
+        if (first == null) first = x(i);
+        lastX = x(i); pen = true;
+      });
+      if (si === 0 && spec.area && first != null) g += `<path d="${d}L${lastX.toFixed(1)},${T + ph}L${first.toFixed(1)},${T + ph}Z" fill="${s.color}" opacity=".10"/>`;
+      g += `<path d="${d}" fill="none" stroke="${s.color}" stroke-width="1.8" stroke-linejoin="round" stroke-linecap="round"/>`;
+      if (n <= 30) s.values.forEach((v, i) => { if (v != null) g += `<circle cx="${x(i).toFixed(1)}" cy="${y(v, s.axis).toFixed(1)}" r="2.2" fill="${s.color}"/>`; });
+    });
+  }
+  if (spec.ref != null) {
+    g += `<line class="ref" x1="${L}" x2="${w - R}" y1="${y(spec.ref).toFixed(1)}" y2="${y(spec.ref).toFixed(1)}"/>` +
+         `<text class="reftext" x="${w - R - 2}" y="${(y(spec.ref) - 4).toFixed(1)}" text-anchor="end">${esc(spec.reflabel || "")}</text>`;
+  }
+  el.innerHTML = `<svg viewBox="0 0 ${w} ${h}" width="${w}" height="${h}" aria-hidden="true">${g}<line class="cross" y1="${T}" y2="${T + ph}" x1="-10" x2="-10"/></svg><div class="tip" hidden></div>`;
+  chartState[id] = {spec, x, n, L, pw, stacked};
+}
+function chartHover(e) {
+  const el = e.currentTarget, c = chartState[el.id];
+  const tip = el.querySelector(".tip"), cross = el.querySelector(".cross");
+  if (!c || !tip) return;
+  const rect = el.getBoundingClientRect(), px = e.clientX - rect.left;
+  const i = c.stacked ? Math.floor(((px - c.L) / c.pw) * c.n) : Math.round(((px - c.L) / c.pw) * (c.n - 1));
+  if (i < 0 || i >= c.n) { chartLeave(e); return; }
+  const cx = c.x(i);
+  cross.setAttribute("x1", cx); cross.setAttribute("x2", cx); cross.style.opacity = 1;
+  const s = c.spec;
+  tip.innerHTML = `<b>${esc(s.tips ? s.tips[i] : s.labels[i])}</b>` + s.series.map((x) =>
+    `<span class="tip__row"><i style="background:${x.color}"></i>${esc(x.name)}<em>${x.values[i] == null ? "–" : (x.fmt || fmt)(x.values[i])}</em></span>`).join("");
+  tip.hidden = false;
+  tip.style.left = `${Math.min(Math.max(cx + 12, 4), el.clientWidth - tip.offsetWidth - 4)}px`;
+  tip.style.top = "6px";
+  if (cx + 12 + tip.offsetWidth > el.clientWidth - 4) tip.style.left = `${Math.max(4, cx - tip.offsetWidth - 12)}px`;
+}
+function chartLeave(e) {
+  const el = e.currentTarget, tip = el.querySelector(".tip"), cross = el.querySelector(".cross");
+  if (tip) tip.hidden = true;
+  if (cross) cross.style.opacity = 0;
+}
+for (const id of ["chart-tp", "chart-day", "chart-pr", "chart-ttft"]) {
+  $(id).addEventListener("pointermove", chartHover);
+  $(id).addEventListener("pointerleave", chartLeave);
+}
+const legend = (items) => items.map(([name, color]) => `<span><i style="background:${color}"></i>${esc(name)}</span>`).join("");
+let chartSig = "";
+
+function renderDash(live, hw, st, eng, h, last, reqs, m) {
+  // the live strip
   const prog = $("state-progress");
-  let label = "Waiting for a request", detail = "", pct = 0;
+  const on = live.queued > 0 ? "queued" : live.state;
+  let label = live.state === "unloaded" ? "Model not loaded" : "Waiting for a request", detail = "", pct = 0;
   if (live.state === "reading") {
     label = "Reading prompt";
     prog.dataset.tone = "info";
@@ -273,36 +439,141 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
     delete prog.dataset.tone;
     detail = `last: ${fmt(last.output_tokens)} tokens${last.decode_tok_s ? ` at ${fmt(last.decode_tok_s, 1)} tok/s` : ""}`;
   }
+  if (live.queued > 0) detail += `${detail ? " · " : ""}${live.queued} queued`;
+  $("live-state").dataset.s = on;
   $("state-label").textContent = label;
   $("state-detail").textContent = detail;
   $("state-bar").style.width = `${pct}%`;
+  $("page-sub").textContent = m.lifetime && m.lifetime.since ? `Lifetime counters since ${new Date(m.lifetime.since * 1000).toLocaleDateString([], {year: "numeric", month: "short", day: "numeric"})}` : "";
 
-  // the eight cards
-  const speed = live.state === "generating" ? live.tok_s : last ? last.decode_tok_s : null;
-  setMetric("speed", speed == null ? null : fmt(speed, 1), "t/s",
-            live.state === "generating" ? "Decode now" : last ? "Decode last request" : "Decode");
-  const prefill = live.state !== "idle" ? live.prefill_tok_s_mean
-                : last && last.prompt_ms > 0 ? Math.max(0, last.prompt_tokens - (last.reused || 0)) / (last.prompt_ms / 1000) : null;
-  setMetric("prefill", prefill == null ? null : fmt(prefill), "t/s",
-            live.state === "reading" ? "Prefill now" : live.state === "generating" ? "Prefill this request" : last ? "Prefill last request" : "Prefill");
-  spark("sp-speed", h.tok_s);
-  spark("sp-prefill", h.prefill_tok_s_mean);
-  // a model split across several cards (issue #112): the cards show their total / mean / hottest, and each card's own
+  // data: finished requests, oldest first
+  const done = reqs.filter((r) => r.finish).slice().reverse();
+  const recent = done.slice(-40);
+  const decodes = recent.map((r) => r.decode_tok_s), prefills = recent.map(prefillOf), ttfts = recent.map(ttftOf);
+  const L = m.lifetime || {requests: m.totals.requests, prompt_tokens: m.totals.prompt_tokens, reused: m.totals.reused,
+                           output_tokens: m.totals.output_tokens, prompt_ms: m.totals.prompt_ms, decode_ms: m.totals.decode_ms, days: {}};
+  const days = lastDays(L);
+  const today = days[days.length - 1], yday = days[days.length - 2];
+  const half = (arr, f) => { const v = arr.filter((x) => x != null); const k = Math.min(10, Math.floor(v.length / 2)); return k ? [f(v.slice(-k)), f(v.slice(-2 * k, -k))] : [null, null]; };
+  const [dNow, dPrev] = half(decodes, median), [pNow, pPrev] = half(prefills, median), [tNow, tPrev] = half(ttfts, median);
+  const lifeDecode = L.decode_ms > 0 ? L.output_tokens / (L.decode_ms / 1000) : null;
+  const lifePrefill = L.prompt_ms > 0 && L.prompt_tokens > L.reused ? (L.prompt_tokens - L.reused) / (L.prompt_ms / 1000) : null;
+  const ok = done.filter((r) => r.finish === "stop" || r.finish === "length").length;
+  const errs = done.filter((r) => r.finish === "error").length, cut = done.length - ok - errs;
+  const cacheShare = L.prompt_tokens ? (100 * L.reused) / L.prompt_tokens : null;
+  const day = (f) => days.map(f);
+  const nowSpeed = live.state === "generating" ? live.tok_s : dNow;
+  const tiles = [
+    tile("Input tokens", big(L.prompt_tokens), "", [
+      row(`${chip(today.prompt_tokens, yday.prompt_tokens)} <span class="muted">${big(today.prompt_tokens)} today</span>`),
+      row(`<span class="muted">${big(L.prompt_tokens - L.reused)} read · ${big(L.reused)} reused</span>`)], day((d) => d.prompt_tokens), "", "All prompt tokens the server has processed, lifetime"),
+    tile("Output tokens", big(L.output_tokens), "", [
+      row(`${chip(today.output_tokens, yday.output_tokens)} <span class="muted">${big(today.output_tokens)} today</span>`),
+      row(`<span class="muted">${lifeDecode ? `${fmt(lifeDecode, 1)} tok/s lifetime avg` : "no decode timings yet"}</span>`)], day((d) => d.output_tokens), "out"),
+    tile("Cached prompt tokens", big(L.reused), "", [
+      row(`<span class="${cacheShare >= 50 ? "good" : ""}">${cacheShare == null ? "–" : `${fmt(cacheShare, cacheShare < 10 ? 1 : 0)}%`}</span> <span class="muted">of input reused</span>`),
+      row(`<span class="muted">${big(today.reused)} today</span>`)], day((d) => d.reused), "cached", "Prompt tokens the engine did not have to read again because the conversation cache held them"),
+    tile("Requests", big(L.requests), "", [
+      row(`${chip(today.requests, yday.requests)} <span class="muted">${fmt(today.requests)} today</span>`),
+      row(`<span class="muted">${fmt(m.totals.requests)} since this start</span>`)], day((d) => d.requests)),
+    tile("Decode speed", nowSpeed == null ? "–" : fmt(nowSpeed, 1), "tok/s", [
+      row(`${chip(dNow, dPrev)} <span class="muted">${live.state === "generating" ? "live" : "median of last 10"}</span>`),
+      row(`<span class="muted">${lifeDecode ? `${fmt(lifeDecode, 1)} lifetime avg` : "&nbsp;"}</span>`)], decodes, "decode"),
+    tile("Prefill speed", pNow == null ? "–" : fmt(pNow), "tok/s", [
+      row(`${chip(pNow, pPrev)} <span class="muted">median of last 10</span>`),
+      row(`<span class="muted">${lifePrefill ? `${fmt(lifePrefill)} lifetime avg` : "&nbsp;"}</span>`)], prefills, "prefill", "New prompt tokens per second, not counting tokens served from the cache"),
+    tile("Time to first token", tNow == null ? "–" : fmt(tNow, tNow < 10 ? 2 : 1), "s", [
+      row(`${chip(tNow, tPrev, "down")} <span class="muted">median of last 10</span>`),
+      row(`<span class="muted">p95 ${quant(ttfts, 0.95) == null ? "–" : `${fmt(quant(ttfts, 0.95), 1)} s`}</span>`)], ttfts, "ttft"),
+    tile("Completed", done.length ? fmt((100 * ok) / done.length, ok === done.length ? 0 : 1) : "–", done.length ? "%" : "", [
+      row(`<span class="${errs ? "bad" : "muted"}">${fmt(errs)} errors</span> <span class="muted">· ${fmt(cut)} cut short</span>`),
+      row(`<span class="muted">of ${fmt(done.length)} kept requests</span>`)], null),
+  ].join("");
+  if ($("tiles").dataset.sig !== tiles) { $("tiles").innerHTML = tiles; $("tiles").dataset.sig = tiles; }
+
+  // charts: redraw only when their data changed (or the box did)
+  const dim = `${$("chart-tp").clientWidth}x${$("chart-day").clientWidth}x${$("chart-pr").clientWidth}`;
+  const sig = `${dim}|${done.length}|${done.length ? done[done.length - 1].id : ""}|${JSON.stringify(days.map((d) => d.prompt_tokens + d.output_tokens))}`;
+  if (sig !== chartSig) {
+    chartSig = sig;
+    const pts = done.slice(-60).filter((r) => r.decode_tok_s || prefillOf(r));
+    const lab = (r) => clockShort(r.time);
+    drawChart("chart-tp", {kind: "line", area: true, labels: pts.map(lab), tips: pts.map((r) => `${new Date(r.time * 1000).toLocaleString()}`),
+      series: [{name: "Decode", color: COLORS.decode, values: pts.map((r) => r.decode_tok_s), fmt: (v) => `${fmt(v, 1)} tok/s`},
+               {name: "Prefill", color: COLORS.prefill, axis: "r", values: pts.map(prefillOf), fmt: (v) => `${fmt(v)} tok/s`}]});
+    $("tp-legend").innerHTML = legend([["Decode (left axis)", COLORS.decode], ["Prefill (right axis)", COLORS.prefill]]);
+    const dl = days.map((d) => dayLabel(d.key));
+    drawChart("chart-day", {kind: "bars", labels: dl, xlabels: dl, empty: "No tokens counted yet",
+      series: [{name: "Cached input", color: COLORS.cached, values: days.map((d) => d.reused), fmt: big},
+               {name: "Fresh input", color: COLORS.fresh, values: days.map((d) => d.prompt_tokens - d.reused), fmt: big},
+               {name: "Output", color: COLORS.out, values: days.map((d) => d.output_tokens), fmt: big}]});
+    $("day-legend").innerHTML = legend([["Cached input", COLORS.cached], ["Fresh input", COLORS.fresh], ["Output", COLORS.out]]);
+    const rp = done.slice(-40);
+    drawChart("chart-pr", {kind: "bars", labels: rp.map(lab), tips: rp.map((r) => new Date(r.time * 1000).toLocaleString()),
+      series: [{name: "Cached", color: COLORS.cached, values: rp.map((r) => r.reused || 0), fmt: fmt},
+               {name: "Fresh", color: COLORS.fresh, values: rp.map((r) => freshOf(r) || 0), fmt: fmt}]});
+    $("pr-legend").innerHTML = legend([["Cached", COLORS.cached], ["Fresh", COLORS.fresh]]);
+    const med = median(rp.map(ttftOf));
+    drawChart("chart-ttft", {kind: "bars", labels: rp.map(lab), tips: rp.map((r) => new Date(r.time * 1000).toLocaleString()),
+      yfmt: (v) => `${fmt(v, v < 10 ? 1 : 0)}s`, ref: med, reflabel: med == null ? "" : `median ${fmt(med, 2)} s`,
+      series: [{name: "First token", color: COLORS.fresh, values: rp.map((r) => ttftOf(r) || 0), fmt: (v) => `${fmt(v, 2)} s`}]});
+  }
+
+  // how requests ended
+  const cat = [["Completed", done.filter((r) => r.finish === "stop").length, "var(--c-cached)"],
+               ["Hit max tokens", done.filter((r) => r.finish === "length").length, "var(--c-fresh)"],
+               ["Stopped or closed", done.filter((r) => r.finish === "cancel" || r.finish === "disconnect").length, "var(--st-warn)"],
+               ["Errors", errs, "var(--st-danger)"]];
+  const fin = cat.map(([name, n, color]) => `<div class="fin__row"><i style="background:${color}"></i><span>${name}</span>` +
+    `<b>${fmt(n)}</b><em>${done.length ? fmt((100 * n) / done.length, 0) : 0}%</em></div>`).join("");
+  const stack = `<div class="fin__stack">${cat.map(([, n, c]) => (n ? `<span style="flex:${n};background:${c}"></span>` : "")).join("")}</div>`;
+  const finHtml = stack + fin;
+  if ($("fin").dataset.sig !== finHtml) { $("fin").innerHTML = finHtml; $("fin").dataset.sig = finHtml; }
+  $("fin-sub").textContent = done.length ? `${fmt(done.length)} requests kept in memory` : "no requests yet";
+
+  // context in use: the running request, else the last one
+  const ctx = eng.max_context || 0;
+  let used = 0;
+  if (live.state !== "idle" && live.state !== "unloaded") used = (live.prompt_tokens || 0) + (live.generated || 0);
+  else if (last) used = (last.prompt_tokens || 0) + (last.output_tokens || 0);
+  const frac = ctx ? Math.min(1, used / ctx) : 0;
+  $("ctx-bar").style.width = `${frac * 100}%`;
+  $("ctx-sub").textContent = ctx ? `${kfmt(used)} / ${ctxfmt(ctx)} · ${fmt(frac * 100, frac < 0.1 ? 1 : 0)}%` : "–";
+  $("ctx-note").textContent = live.state !== "idle" && live.state !== "unloaded" ? "the running request" : last ? "the last request" : "";
+
+  // model and engine
+  const loaded = live.state !== "unloaded";
+  const lb = $("loaded-badge");
+  lb.textContent = loaded ? "Loaded" : "Unloaded";
+  lb.className = `st-badge${loaded ? " st-badge--generating" : ""}`;
+  const kv = {int8: "8-bit", q4_0: "4-bit (Hadamard-rotated)", fp16: "16-bit"}[eng.kv] || eng.kv;
+  const t = m.totals || {};
+  facts($("facts-dash"), [
+    ["Model", eng.model],
+    ["Engine", eng.version ? `v${eng.version}` : (eng.model ? "built from source" : null)],
+    ["Context size", eng.max_context ? `${fmt(eng.max_context)} tokens` : null],
+    ["KV cache", kv ? `${kv}${eng.kv_resident ? `, ${fmt(eng.kv_resident)} positions per layer in VRAM` : ", all in VRAM"}` : null],
+    ["Experts in VRAM", eng.expert_slots ? `${fmt(eng.expert_slots)} (${gb((eng.expert_cache_mib || 0) * 1048576)} GB)` : null],
+    ["Speculation", eng.spec ? `MTP, up to ${Math.max(0, (eng.mtp_max || eng.spec) - 1)} drafts${t.drafts_offered ? ` · ${fmt((100 * t.drafts_accepted) / t.drafts_offered)}% accepted` : ""}` : null],
+    ["Parallel slots", live.parallel ? `${fmt(live.running || 0)} running of ${fmt(live.parallel)}` : null],
+    ["Images", eng.images ? "on" : "off"],
+    ["Since start", t.requests ? `${renderTotalsShort(t)}` : null],
+  ]);
+
+  // hardware
+  const gen = hw.gpu_pcie_gen_max || hw.gpu_pcie_gen;
   const per = (f) => (hw.gpus || []).map((g) => `GPU ${g.index} ${f(g)}`).join(" · ");
   const multi = (hw.gpus || []).length > 1;
   setMetric("gpu", hw.gpu_util == null ? null : fmt(hw.gpu_util), "%",
             multi ? per((g) => (g.util == null ? "–" : `${fmt(g.util)}%`)) : st.gpu_name || (st.gpu_note ? "not available" : ""));
   spark("sp-gpu", h.gpu_util, 100);
   setMetric("vram", hw.gpu_mem_used == null ? null : gb(hw.gpu_mem_used), hw.gpu_mem_total ? `/ ${gb(hw.gpu_mem_total, 0)} GB` : "GB",
-            multi ? per((g) => (g.mem_used == null ? "–" : `${gb(g.mem_used)} GB`))
-                  : eng.expert_slots ? `${fmt(eng.expert_slots)} experts cached` : (st.gpu_note ? "not available on Windows AMD yet" : ""));
+            multi ? per((g) => (g.mem_used == null ? "–" : `${gb(g.mem_used)} GB`)) : (st.gpu_note ? "not available on Windows AMD yet" : ""));
   spark("sp-vram", h.gpu_mem_used, hw.gpu_mem_total);
-  setMetric("temp", hw.gpu_temp == null ? null : fmt(hw.gpu_temp), "°C",
-            multi ? per((g) => (g.temp == null ? "–" : `${fmt(g.temp)}°`)) : "");
+  setMetric("temp", hw.gpu_temp == null ? null : fmt(hw.gpu_temp), "°C", multi ? per((g) => (g.temp == null ? "–" : `${fmt(g.temp)}°`)) : "");
   spark("sp-temp", h.gpu_temp, 90);
   setMetric("power", hw.gpu_power == null ? null : fmt(hw.gpu_power), "W", hw.gpu_power_limit ? `of ${fmt(hw.gpu_power_limit)} W limit` : "");
   spark("sp-power", h.gpu_power, hw.gpu_power_limit);
-  const gen = hw.gpu_pcie_gen_max || hw.gpu_pcie_gen;
   setMetric("pcie", gen ? `Gen${gen}` : null, hw.gpu_pcie_width ? `x${hw.gpu_pcie_width}` : "",
             hw.gpu_pcie_rx_mb == null ? "" : `to GPU ${fmt(hw.gpu_pcie_rx_mb, hw.gpu_pcie_rx_mb < 10 ? 1 : 0)} MB/s` +
             (hw.gpu_pcie_gen && gen && hw.gpu_pcie_gen < gen ? ` · idle Gen${hw.gpu_pcie_gen}` : ""));
@@ -312,23 +583,14 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
   if (hw.disk_read_mb == null) {
     setMetric("disk", null, "", st.psutil ? "" : "needs psutil (setup installs it)");
   } else {
-    const big = hw.disk_read_mb >= 1000;
-    setMetric("disk", big ? fmt(hw.disk_read_mb / 1024, 2) : fmt(hw.disk_read_mb, hw.disk_read_mb < 10 ? 1 : 0), big ? "GB/s" : "MB/s",
+    const bigr = hw.disk_read_mb >= 1000;
+    setMetric("disk", bigr ? fmt(hw.disk_read_mb / 1024, 2) : fmt(hw.disk_read_mb, hw.disk_read_mb < 10 ? 1 : 0), bigr ? "GB/s" : "MB/s",
               hw.disk_write_mb == null ? "" : `write ${fmt(hw.disk_write_mb, 1)} MB/s`);
   }
   spark("sp-disk", h.disk_read_mb);
-
-  // context fill: the running request, else the last one
-  const ctx = eng.max_context || 0;
-  let used = 0;
-  if (live.state !== "idle") used = (live.prompt_tokens || 0) + (live.generated || 0);
-  else if (last) used = (last.prompt_tokens || 0) + (last.output_tokens || 0);
-  const frac = ctx ? Math.min(1, used / ctx) : 0;
-  $("ctx-fill").setAttribute("stroke-dasharray", `${(235.6 * frac).toFixed(1)} 314.2`);
-  $("ctx-fill").style.opacity = 235.6 * frac >= 3 ? "1" : "0";         // a near-zero arc would draw just its round cap
-  $("ctx-pct").textContent = `${Math.round(frac * 100)}%`;
-  $("ctx-sub").textContent = ctx ? `${kfmt(used)} / ${ctxfmt(ctx)}` : "–";
   const cacheBytes = (eng.expert_cache_mib || 0) * 1048576;
+  $("slots-text").parentElement.parentElement.hidden = !eng.expert_slots;
+  $("temp-text").parentElement.parentElement.hidden = hw.gpu_temp == null;
   $("slots-text").textContent = eng.expert_slots ? `${fmt(eng.expert_slots)} · ${gb(cacheBytes)} GB` : "–";
   $("slots-bar").style.width = hw.gpu_mem_total ? `${Math.min(100, (100 * cacheBytes) / hw.gpu_mem_total)}%` : "0%";
   $("ram-text").textContent = hw.ram_total ? `${gb(hw.ram_used)} / ${gb(hw.ram_total, 0)} GB` : "–";
@@ -338,34 +600,71 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
   $("temp-text").textContent = hw.gpu_temp == null ? "–" : `${fmt(hw.gpu_temp)} °C`;
   $("temp-bar").style.width = hw.gpu_temp == null ? "0%" : `${Math.min(100, hw.gpu_temp)}%`;
 
-  // recent requests
-  const body = $("req-body");
-  if (!requests.length) {
-    body.innerHTML = `<tr><td colspan="9" class="muted">No requests yet</td></tr>`;
-  } else {
-    const badge = {stop: ["", "Done"], length: ["", "Max tokens"], cancel: ["st-badge--queued", "Stopped"],
-                   disconnect: ["st-badge--queued", "Closed"], error: ["st-badge--error", "Error"]};
-    body.innerHTML = requests.slice(0, reqShowAll ? requests.length : 12).map((r) => {
-      const [cls, text] = badge[r.finish] || ["", r.finish || "–"];
-      const t = new Date(r.time * 1000).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit", second: "2-digit"});
-      const proj = r.projection == null ? "" : ` <span class="st-badge${r.projection ? " st-badge--reading" : ""}" title="experimental speed projection ${r.projection ? "on" : "off"}">${r.projection ? "ESP" : "stock"}</span>`;
-      // #588: the VRAM share; the PCIe share (--pcie-frac) beside it when there is one
-      const hit = r.hit_rate == null ? "–" : `${(r.hit_rate * 100).toFixed(1)}%` +
-        (r.pcie_share ? ` <span class="muted" title="routed experts the GPU read over PCIe (--pcie-frac) or another GPU computed">+${(r.pcie_share * 100).toFixed(1)}% PCIe</span>` : "");
-      // Reused tokens are not prefetched again. Match the Monitor's existing Prefill metric.
-      const fresh = r.prompt_tokens == null ? null : Math.max(0, r.prompt_tokens - (r.reused || 0));
-      const prefillRate = fresh > 0 && r.prompt_ms > 0 ? fresh / (r.prompt_ms / 1000) : null;
-      return `<tr><td>${esc(t)}</td><td><span class="st-badge ${cls}">${esc(text)}</span>${proj}</td><td class="num">${fmt(r.prompt_tokens)}</td>
-        <td class="num">${fmt(r.reused)}</td><td class="num">${fmt(r.output_tokens)}</td><td class="num">${fmt(prefillRate)}</td><td class="num">${fmt(r.decode_tok_s, 1)}</td>
-        <td class="num">${hit}</td><td class="num">${fmt(r.duration_s, 1)} s</td></tr>`;
-    }).join("");
+  // the latest requests (compact)
+  const body = $("dash-req-body");
+  const html = reqs.length ? reqs.slice(0, 8).map((r) => reqCells(r, false)).join("") : `<tr><td colspan="9" class="muted">No requests yet</td></tr>`;
+  if (body.dataset.sig !== html) { body.innerHTML = html; body.dataset.sig = html; }
+}
+$("goto-requests").onclick = () => showTab("requests");
+
+function renderTotalsShort(t) {
+  const read = t.prompt_tokens - t.reused;
+  return `${fmt(t.requests)} requests · ${big(read)} read · ${big(t.output_tokens)} written`;
+}
+function statusBadge(r) {
+  const [cls, text] = FINISH[r.finish] || ["", r.finish || "–"];
+  const proj = r.projection == null ? "" : ` <span class="st-badge${r.projection ? " st-badge--reading" : ""}" title="experimental speed projection ${r.projection ? "on" : "off"}">${r.projection ? "ESP" : "stock"}</span>`;
+  return `<span class="st-badge ${cls}">${esc(text)}</span>${proj}`;
+}
+// one table row; the full table (the Requests page) adds the prompt bar, the expert hit rate and the drafts
+function reqCells(r, full) {
+  const fresh = freshOf(r), pf = prefillOf(r), tt = ttftOf(r);
+  const t = clock(r.time);
+  if (!full) {
+    return `<tr><td>${esc(t)}</td><td>${statusBadge(r)}</td><td class="num">${fmt(fresh)}</td><td class="num">${fmt(r.reused)}</td>` +
+      `<td class="num">${fmt(r.output_tokens)}</td><td class="num">${tt == null ? "–" : `${fmt(tt, 2)} s`}</td><td class="num">${fmt(pf)}</td>` +
+      `<td class="num">${fmt(r.decode_tok_s, 1)}</td><td class="num">${fmt(r.duration_s, 1)} s</td></tr>`;
   }
-  const all = $("req-all");
-  kept = kept == null ? requests.length : kept;
-  all.hidden = kept <= 12;
-  all.textContent = reqShowAll ? "Show fewer" : `Show all (${kept})`;
-  $("req-wrap").classList.toggle("all", reqShowAll);
-  $("req-totals").textContent = renderTotals(totals);
+  const total = r.prompt_tokens || 0, share = total ? (100 * (r.reused || 0)) / total : 0;
+  const hit = r.hit_rate == null ? "–" : `${(r.hit_rate * 100).toFixed(1)}%` +
+    (r.pcie_share ? ` <span class="muted" title="routed experts the GPU read over PCIe (--pcie-frac) or another GPU computed">+${(r.pcie_share * 100).toFixed(1)}%</span>` : "");
+  const drafts = r.drafts_offered ? `${fmt((100 * (r.drafts_accepted || 0)) / r.drafts_offered)}%` : "–";
+  return `<tr title="${esc(r.id || "")}"><td>${esc(t)}</td><td>${statusBadge(r)}</td>` +
+    `<td><div class="pcell"><span>${fmt(total)}</span><div class="pbar" title="${fmt(r.reused || 0)} reused of ${fmt(total)}"><i style="width:${share.toFixed(1)}%"></i></div>` +
+    `<em>${share >= 1 ? `${fmt(share)}% cached` : "fresh"}</em></div></td>` +
+    `<td class="num">${fmt(r.output_tokens)}</td><td class="num">${tt == null ? "–" : `${fmt(tt, 2)} s`}</td><td class="num">${fmt(pf)}</td>` +
+    `<td class="num">${fmt(r.decode_tok_s, 1)}</td><td class="num">${hit}</td><td class="num">${drafts}</td><td class="num">${fmt(r.duration_s, 1)} s</td></tr>`;
+}
+let reqFilter = "all";
+for (const b of $("req-filter").children) b.onclick = () => {
+  reqFilter = b.dataset.f;
+  for (const x of $("req-filter").children) x.setAttribute("aria-checked", String(x === b));
+  $("req-body").dataset.sig = "";
+  if (lastMetrics) render(lastMetrics);
+};
+function renderRequests(reqs, m) {
+  const keep = (r) => reqFilter === "all" || (reqFilter === "ok" ? r.finish === "stop" || r.finish === "length"
+    : reqFilter === "error" ? r.finish === "error" : r.finish === "cancel" || r.finish === "disconnect");
+  const shown = reqs.filter(keep);
+  const sig = `${reqFilter}|${reqs.length}|${reqs[0] ? reqs[0].id : ""}`;
+  const body = $("req-body");
+  if (body.dataset.sig !== sig) {
+    body.dataset.sig = sig;
+    body.innerHTML = shown.length ? shown.map((r) => reqCells(r, true)).join("")
+                                  : `<tr><td colspan="10" class="muted">${reqs.length ? "No request matches this filter" : "No requests yet"}</td></tr>`;
+  }
+  const kept = m.requests_kept == null ? reqs.length : m.requests_kept;
+  $("req-count").textContent = `${fmt(shown.length)}${reqFilter === "all" ? "" : ` of ${fmt(reqs.length)}`} requests · the server keeps the last ${fmt(Math.max(kept, 500))}`;
+  $("req-totals").textContent = renderTotals(m.totals);
+}
+function renderTotals(t) {
+  if (!t || !t.requests) return "";
+  const since = new Date(t.since * 1000).toLocaleString([], {weekday: "short", hour: "2-digit", minute: "2-digit"});
+  const read = t.prompt_tokens - t.reused;
+  const pSpeed = t.prompt_ms > 0 && read > 0 ? ` at ${fmt(read / (t.prompt_ms / 1000))} tok/s` : "";
+  const oSpeed = t.decode_ms > 0 && t.output_tokens > 0 ? ` at ${fmt(t.output_tokens / (t.decode_ms / 1000), 1)} tok/s` : "";
+  return `Since ${since}: ${fmt(t.requests)} requests · ${fmt(read)} prompt tokens read${pSpeed} (${fmt(t.reused)} reused) · ` +
+         `${fmt(t.output_tokens)} written${oSpeed}`;
 }
 
 function facts(el, rows) {
@@ -409,7 +708,6 @@ document.addEventListener("click", (e) => {
   const b = e.target.closest("[data-copy]");
   if (b) copyText(b.dataset.copy, b);
 });
-$("req-all").addEventListener("click", () => { reqShowAll = !reqShowAll; if (lastMetrics) render(lastMetrics); });
 
 // ------------------------------------------------------------------ MCP servers (GET /mcp)
 // Tools from the MCP servers in the run config: the chat offers them to the model (opt-in per request,
@@ -1065,8 +1363,9 @@ function outputs() {
   $("o-topp").textContent = (+$("s-topp").value).toFixed(2);
   $("o-topk").textContent = $("s-topk").value;
   const sel = [...$("s-thinking").children].find((b) => b.getAttribute("aria-checked") === "true");
-  $("o-thinking").textContent = sel ? {none: "answers right away", low: "short", medium: "medium", high: "thorough (default)"}[sel.dataset.v]
-                                    : effortShown() ? `effort ${$("s-effort").value}` : "";
+  const word = sel ? {none: "answers right away", low: "short", medium: "medium", high: "thorough (default)"}[sel.dataset.v] : "";
+  $("o-thinking").textContent = !effortShown() || (sel && sel.dataset.v === "none") ? word
+                                    : `${word ? word + " · " : ""}effort ${$("s-effort").value}`;
   for (const id of ["s-topp", "s-topk"]) $(id).disabled = t === 0;
 }
 for (const b of $("s-thinking").children) b.onclick = () => {

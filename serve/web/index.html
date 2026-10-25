@@ -8,6 +8,7 @@
 <link rel="stylesheet" href="web/tokens.css">
 <link rel="stylesheet" href="web/components.css">
 <link rel="stylesheet" href="web/app.css">
+<link rel="stylesheet" href="web/dashboard.css">
 <script>
   // the theme before the first paint: the saved choice, else the system's
   try {
@@ -18,23 +19,45 @@
 </script>
 </head>
 <body>
-<header class="st-header">
-  <span class="st-header__brand">Strata</span>
-  <nav class="st-tabs" role="tablist" aria-label="Views">
+<div class="shell">
+<!-- ============================ Left nav ============================ -->
+<aside class="side" aria-label="Navigation">
+  <div class="side__brand"><svg class="side__logo" viewBox="0 0 32 32" aria-hidden="true">
+    <path d="M16 2.38 28.42 9.08 16 15.78 3.58 9.08Z" fill="currentColor"/>
+    <path d="M3.58 14.8 16 21.5 28.42 14.8" fill="none" stroke="currentColor" stroke-width="3.67" stroke-linecap="round" stroke-linejoin="round" opacity=".7"/>
+    <path d="M3.58 21.28 16 27.98 28.42 21.28" fill="none" stroke="currentColor" stroke-width="3.67" stroke-linecap="round" stroke-linejoin="round" opacity=".45"/></svg>
+    <span>Strata</span></div>
+  <nav class="side__nav st-tabs" role="tablist" aria-label="Views" aria-orientation="vertical">
+    <span class="side__group">Workspace</span>
     <button class="st-tab" role="tab" id="tab-btn-chat" aria-controls="view-chat" aria-selected="true" data-tab="chat">
-      <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-chat"/></svg>Chat</button>
+      <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-chat"/></svg><span>Chat</span></button>
     <button class="st-tab" role="tab" id="tab-btn-images" aria-controls="view-images" aria-selected="false" data-tab="images" hidden>
-      <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-image"/></svg>Images</button>
+      <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-image"/></svg><span>Images</span></button>
+    <span class="side__group">Insights</span>
     <button class="st-tab" role="tab" id="tab-btn-monitor" aria-controls="view-monitor" aria-selected="false" data-tab="monitor">
-      <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-activity"/></svg>Monitor</button>
+      <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-activity"/></svg><span>Dashboard</span></button>
+    <button class="st-tab" role="tab" id="tab-btn-requests" aria-controls="view-requests" aria-selected="false" data-tab="requests">
+      <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-clock"/></svg><span>Requests</span></button>
+    <span class="side__group">System</span>
     <button class="st-tab" role="tab" id="tab-btn-about" aria-controls="view-about" aria-selected="false" data-tab="about">
-      <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-info"/></svg>About</button>
+      <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-info"/></svg><span>Model</span></button>
   </nav>
-  <span class="st-header__spacer"></span>
+  <div class="side__foot">
+    <div class="side__model" id="side-model" title="">
+      <span class="side__model-name" id="side-model-name">&ndash;</span>
+      <span class="side__model-sub muted small" id="side-model-sub"></span></div>
+    <button class="st-btn st-btn--icon" id="theme-btn" title="Light / dark" aria-label="Switch between light and dark">
+      <svg class="st-icon"><use id="theme-icon" href="web/sprite.svg#i-moon"/></svg></button>
+  </div>
+</aside>
+
+<div class="stage">
+<header class="topbar">
+  <h1 class="topbar__title" id="page-title">Chat</h1>
+  <span class="topbar__sub muted" id="page-sub"></span>
+  <span class="topbar__spacer"></span>
   <span class="st-pill" id="pill" data-state="idle" role="status" aria-live="polite">
     <span class="st-pill__dot"></span><span id="pill-text">Connecting&hellip;</span></span>
-  <button class="st-btn st-btn--icon" id="theme-btn" title="Light / dark" aria-label="Switch between light and dark">
-    <svg class="st-icon"><use id="theme-icon" href="web/sprite.svg#i-moon"/></svg></button>
 </header>
 
 <main>
@@ -94,78 +117,145 @@
     </div>
   </section>
 
-  <!-- ============================ Monitor ============================ -->
+  <!-- ============================ Dashboard ============================ -->
   <section class="view view--monitor" id="view-monitor" role="tabpanel" aria-labelledby="tab-btn-monitor" hidden>
-    <div class="monitor">
-      <div class="st-card state-card">
-        <div class="state-card__head">
-          <span class="card-title">Model state</span>
-          <span class="badges" id="state-badges">
-            <span class="st-badge" data-s="idle">Idle</span>
-            <span class="st-badge st-badge--reading" data-s="reading">Reading</span>
+    <div class="dash">
+      <!-- live strip: what the engine is doing right now -->
+      <div class="live card" id="live">
+        <div class="live__main">
+          <span class="live__state" id="live-state" data-s="idle"><i></i><b id="state-label">Waiting for a request</b></span>
+          <span class="muted" id="state-detail"></span>
+          <span class="badges" id="state-badges" hidden>
+            <span class="st-badge" data-s="idle">Idle</span><span class="st-badge st-badge--reading" data-s="reading">Reading</span>
             <span class="st-badge st-badge--generating" data-s="generating">Generating</span>
-            <span class="st-badge st-badge--queued" data-s="queued">Queued</span>
-            <span class="st-badge st-badge--error" data-s="error">Error</span>
+            <span class="st-badge st-badge--queued" data-s="queued">Queued</span><span class="st-badge st-badge--error" data-s="error">Error</span>
           </span>
         </div>
-        <div class="state-card__row"><span id="state-label">Waiting for a request</span><span class="muted" id="state-detail"></span></div>
-        <div class="st-progress" id="state-progress"><div class="st-progress__bar" id="state-bar" style="width:0%"></div></div>
+        <div class="st-progress live__bar" id="state-progress"><div class="st-progress__bar" id="state-bar" style="width:0%"></div></div>
       </div>
 
-      <div class="metrics" id="metrics">
-        <!-- filled by app.js: Speed, GPU load, VRAM, GPU temp, Power, PCIe, CPU, Disk read -->
-      </div>
+      <!-- lifetime + speed tiles, filled by app.js -->
+      <div class="tiles" id="tiles"></div>
 
-      <div class="monitor-row">
-        <div class="st-card ctx-card">
-          <span class="card-title">Context fill</span>
-          <div class="ctx-gauge">
-            <svg class="st-gauge" viewBox="0 0 120 120" aria-hidden="true">
-              <circle class="st-gauge__track" cx="60" cy="60" r="50" fill="none" stroke-width="10" stroke-linecap="round"
-                      stroke-dasharray="235.6 314.2" transform="rotate(135 60 60)"/>
-              <circle class="st-gauge__fill" id="ctx-fill" cx="60" cy="60" r="50" fill="none" stroke-width="10"
-                      stroke-linecap="round" stroke-dasharray="0 314.2" transform="rotate(135 60 60)"/>
-            </svg>
-            <div class="ctx-gauge__label"><span class="ctx-gauge__pct" id="ctx-pct">0%</span><span class="muted" id="ctx-sub">&ndash;</span></div>
-          </div>
-          <div class="bar-row"><span>Experts in VRAM</span><span class="muted" id="slots-text">&ndash;</span></div>
-          <div class="st-progress"><div class="st-progress__bar" id="slots-bar" style="width:0%"></div></div>
-          <div class="bar-row"><span>System RAM</span><span class="muted" id="ram-text">&ndash;</span></div>
-          <div class="st-progress" id="ram-progress"><div class="st-progress__bar" id="ram-bar" style="width:0%"></div></div>
-          <div class="bar-row"><span>GPU temperature</span><span class="muted" id="temp-text">&ndash;</span></div>
-          <div class="st-progress" data-tone="warn"><div class="st-progress__bar" id="temp-bar" style="width:0%"></div></div>
+      <div class="grid grid--charts">
+        <div class="card chart-card">
+          <div class="card__head"><div><span class="card__title">Throughput per request</span>
+            <span class="card__sub muted" id="tp-sub">tokens per second, one point per finished request</span></div>
+            <div class="legend" id="tp-legend"></div></div>
+          <div class="chart" id="chart-tp" role="img" aria-label="Decode and prefill speed per request"></div>
         </div>
-        <div class="st-card req-card">
-          <div class="req-head"><span class="card-title">Recent requests</span>
-            <button class="st-btn st-btn--secondary" id="req-all" hidden>Show all</button></div>
-          <div class="table-wrap" id="req-wrap">
-            <table class="st-table">
-              <thead><tr><th>Time</th><th>Status</th><th class="num">Prompt</th><th class="num">Reused</th><th class="num">Output</th>
-                <th class="num" title="New prompt tokens per second, excluding reused cache tokens (engine prompt time)">Prefill t/s</th><th class="num">Decode t/s</th><th class="num" title="While writing the answer: the share of the experts looked up that were already in VRAM. Experts the GPU read over PCIe (--pcie-frac) are not counted in it; their share of all routed experts is shown after it (+N% PCIe)">VRAM hit rate</th><th class="num">Duration</th></tr></thead>
-              <tbody id="req-body"><tr><td colspan="9" class="muted">No requests yet</td></tr></tbody>
-            </table>
-          </div>
-          <p class="muted req-totals" id="req-totals"></p>
+        <div class="card chart-card">
+          <div class="card__head"><div><span class="card__title">Tokens per day</span>
+            <span class="card__sub muted" id="day-sub">last 14 days, lifetime counters</span></div>
+            <div class="legend" id="day-legend"></div></div>
+          <div class="chart" id="chart-day" role="img" aria-label="Input, cached and output tokens per day"></div>
         </div>
       </div>
 
-      <div class="st-card cc-card" id="cc-card">
-        <div class="req-head"><span class="card-title">Conversation cache</span><span class="muted small" id="cc-sum"></span></div>
+      <div class="grid grid--three">
+        <div class="card chart-card">
+          <div class="card__head"><div><span class="card__title">Prompt tokens per request</span>
+            <span class="card__sub muted">read fresh vs. reused from cache</span></div>
+            <div class="legend" id="pr-legend"></div></div>
+          <div class="chart chart--short" id="chart-pr" role="img" aria-label="Fresh and cached prompt tokens per request"></div>
+        </div>
+        <div class="card chart-card">
+          <div class="card__head"><div><span class="card__title">Time to first token</span>
+            <span class="card__sub muted" id="ttft-sub">seconds from request to first output</span></div></div>
+          <div class="chart chart--short" id="chart-ttft" role="img" aria-label="Time to first token per request"></div>
+        </div>
+        <div class="card">
+          <div class="card__head"><div><span class="card__title">How requests ended</span>
+            <span class="card__sub muted" id="fin-sub"></span></div></div>
+          <div class="fin" id="fin"></div>
+          <div class="ctxbox">
+            <div class="bar-row"><span>Context in use</span><span class="muted" id="ctx-sub">&ndash;</span></div>
+            <div class="st-progress"><div class="st-progress__bar" id="ctx-bar" style="width:0%"></div></div>
+            <span class="muted small" id="ctx-note"></span>
+          </div>
+        </div>
+      </div>
+
+      <div class="grid grid--two">
+        <div class="card">
+          <div class="card__head"><span class="card__title">Model and engine</span>
+            <span class="st-badge" id="loaded-badge">&ndash;</span></div>
+          <dl class="facts facts--tight" id="facts-dash"></dl>
+        </div>
+        <div class="card">
+          <div class="card__head"><span class="card__title">Hardware</span><span class="card__sub muted" id="hw-sub">last minute</span></div>
+          <div class="hw" id="metrics"><!-- filled by app.js --></div>
+          <div class="hw-bars">
+            <div><div class="bar-row"><span>Experts in VRAM</span><span class="muted" id="slots-text">&ndash;</span></div>
+              <div class="st-progress"><div class="st-progress__bar" id="slots-bar" style="width:0%"></div></div></div>
+            <div><div class="bar-row"><span>System RAM</span><span class="muted" id="ram-text">&ndash;</span></div>
+              <div class="st-progress" id="ram-progress"><div class="st-progress__bar" id="ram-bar" style="width:0%"></div></div></div>
+            <div><div class="bar-row"><span>GPU temperature</span><span class="muted" id="temp-text">&ndash;</span></div>
+              <div class="st-progress" data-tone="warn"><div class="st-progress__bar" id="temp-bar" style="width:0%"></div></div></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card table-card">
+        <div class="card__head"><span class="card__title">Latest requests</span>
+          <button class="st-btn st-btn--secondary st-btn--sm" id="goto-requests">All requests</button></div>
+        <div class="table-wrap">
+          <table class="st-table dt" id="dash-req">
+            <thead><tr><th>Time</th><th>Status</th><th class="num">Input</th><th class="num">Cached</th><th class="num">Output</th>
+              <th class="num">TTFT</th><th class="num">Prefill t/s</th><th class="num">Decode t/s</th><th class="num">Duration</th></tr></thead>
+            <tbody id="dash-req-body"><tr><td colspan="9" class="muted">No requests yet</td></tr></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="card cc-card" id="cc-card">
+        <div class="card__head"><span class="card__title">Conversation cache</span><span class="muted small" id="cc-sum"></span></div>
         <div class="cc-bars" id="cc-bars" hidden>
           <div><div class="bar-row"><span>Parked conversations</span><span class="muted" id="cc-slots-text">&ndash;</span></div>
             <div class="st-progress"><div class="st-progress__bar" id="cc-slots-bar" style="width:0%"></div></div></div>
           <div><div class="bar-row"><span>Their memory (RAM)</span><span class="muted" id="cc-mem-text">&ndash;</span></div>
             <div class="st-progress"><div class="st-progress__bar" id="cc-mem-bar" style="width:0%"></div></div></div>
         </div>
-        <dl class="facts" id="cc-facts"></dl>
+        <dl class="facts facts--tight" id="cc-facts"></dl>
         <p class="muted small cc-note" id="cc-note"></p>
       </div>
 
-      <div class="st-card mcp-card" id="mcp-card" hidden>
-        <div class="req-head"><span class="card-title">MCP servers</span><span class="muted small" id="mcp-sum"></span></div>
+      <div class="card mcp-card" id="mcp-card" hidden>
+        <div class="card__head"><span class="card__title">MCP servers</span><span class="muted small" id="mcp-sum"></span></div>
         <div class="mcp-list" id="mcp-list"></div>
         <p class="muted small mcp-note">Their tools run on this PC with your rights, when the model decides to call them
           (in this page's chat only; switch it off in Sampling).</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================ Requests ============================ -->
+  <section class="view view--requests" id="view-requests" role="tabpanel" aria-labelledby="tab-btn-requests" hidden>
+    <div class="dash">
+      <div class="reqbar">
+        <div class="seg seg--filter" id="req-filter" role="radiogroup" aria-label="Filter by status">
+          <button type="button" role="radio" aria-checked="true" data-f="all">All</button>
+          <button type="button" role="radio" aria-checked="false" data-f="ok">Completed</button>
+          <button type="button" role="radio" aria-checked="false" data-f="cut">Cut short</button>
+          <button type="button" role="radio" aria-checked="false" data-f="error">Errors</button>
+        </div>
+        <span class="muted small" id="req-count"></span>
+        <span class="topbar__spacer"></span>
+        <span class="muted small" id="req-totals"></span>
+      </div>
+      <div class="card table-card table-card--full">
+        <div class="table-wrap table-wrap--tall" id="req-wrap">
+          <table class="st-table dt dt--full">
+            <thead><tr><th>Time</th><th>Status</th><th>Prompt</th><th class="num">Output</th>
+              <th class="num" title="Time from the request to the first output token">TTFT</th>
+              <th class="num" title="New prompt tokens per second, excluding reused cache tokens (engine prompt time)">Prefill t/s</th>
+              <th class="num">Decode t/s</th>
+              <th class="num" title="Share of the experts looked up that were already in VRAM; the share read over PCIe (--pcie-frac) follows it">VRAM hit</th>
+              <th class="num" title="Speculative drafts accepted">Drafts</th>
+              <th class="num">Duration</th></tr></thead>
+            <tbody id="req-body"><tr><td colspan="10" class="muted">No requests yet</td></tr></tbody>
+          </table>
+        </div>
       </div>
     </div>
   </section>
@@ -208,6 +298,8 @@
     </div>
   </section>
 </main>
+</div>
+</div>
 
 <!-- ============================ Sampling drawer ============================ -->
 <aside class="st-drawer" id="drawer" data-open="false" aria-label="Sampling and thinking" aria-hidden="true">

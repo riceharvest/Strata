@@ -3490,6 +3490,8 @@ class Service:
                        "prompt_ms": 0.0, "decode_ms": 0.0,
                        "drafts_offered": 0, "drafts_accepted": 0}   # #457: the MTP drafts, summed where reported
         self.last_timings = None                         # the last finished request's, llama.cpp's names (/v1/status)
+        from serve.lifetime import Lifetime
+        self.lifetime = Lifetime()                       # the dashboard's counters that survive a restart (serve/lifetime.py)
         # /metrics/prometheus' two throughput gauges need the totals as they stood at the last scrape, because
         # llama.cpp averages them over the window between two scrapes (#2341).
         self.scrape_bucket = (0, 0.0, 0, 0.0)
@@ -4248,7 +4250,8 @@ class Service:
         parked = self.conv_log.poll(getattr(self.engine, "log_path", None), getattr(self.engine, "log_start", None))
         return {"engine": engine, "live": live, "requests": hist[::-1][:None if all_requests else 12],
                 "conversation_cache": conversation_cache_view(engine, hist, totals, parked),
-                "requests_kept": len(hist), "totals": totals, "hardware": tel["now"],
+                "requests_kept": len(hist), "totals": totals, "lifetime": self.lifetime.view(),
+                "hardware": tel["now"],
                 "hardware_static":
                 tel["static"], "history": tel["history"], "time": now}
 
@@ -5110,6 +5113,7 @@ class Service:
                                 "projection": (sampling or {}).get("experimental_speed_projection") is not False
                                 if loaded else None,
                                 "time": started, "duration_s": round(time.time() - started, 1), "finish": finish,
+                                "first_token_s": round(st["first_token"] - started, 3) if st.get("first_token") else None,
                                 "prompt_tokens": seen, "reused": last.get("reused"), "output_tokens": n,
                                 "first_engine_token_s": first_engine_token_s,
                                 # the request's whole prompt, and the tokens read of it (None: an older engine)
@@ -5134,6 +5138,8 @@ class Service:
                             t["decode_ms"] += last.get("decode_ms") or 0.0
                             t["drafts_offered"] += last.get("drafts_offered") or 0
                             t["drafts_accepted"] += last.get("drafts_accepted") or 0
+                            self.lifetime.record(seen, last.get("reused") or 0, n, last.get("prompt_ms") or 0.0,
+                                                 last.get("decode_ms") or 0.0, started)
                             ft0 = st.get("first_token")             # this request's own (#465: one per request)
                             self.latencies.observe(ft0 - started if ft0 else None, n,
                                                    (last.get("decode_ms") or 0.0) / 1000, time.time() - started)
@@ -5282,6 +5288,44 @@ def request_timings(prompt_tokens: int, generated: int, last: dict) -> dict | No
             # the speculative drafts, as llama.cpp names them (from PR #83, @mikicvi): only when the engine reported them
             **({"draft_n": int(last["drafts_offered"]), "draft_n_accepted": int(last["drafts_accepted"])}
                if last.get("drafts_offered") is not None else {})}
+
+
+def seed_demo_history(svc, n: int) -> None:
+    """--demo-history (mock engine): made-up finished requests, so the dashboard has something to draw."""
+    import random
+    rnd = random.Random(7)
+    now = time.time()
+    t = svc.totals
+    for i in range(n):
+        started = now - (n - i) * 95 - rnd.random() * 40
+        reused = rnd.choice([0, 0, 1800, 4200, 9000, 15400])
+        fresh = rnd.choice([180, 420, 1100, 2600, 6200, 11800])
+        out = int(rnd.choice([60, 220, 480, 900, 1700, 3100]) * (0.7 + rnd.random() * 0.6))
+        pre_s = fresh / rnd.uniform(1500, 2300)
+        dec_tps = rnd.uniform(86, 118) - (out > 2000) * 9
+        finish = rnd.choice(["stop"] * 12 + ["length", "cancel", "disconnect", "error"][:1 + i % 3])
+        svc.history.append({
+            "id": uuid.uuid4().hex[:12], "projection": None, "time": started, "finish": finish,
+            "duration_s": round(pre_s + out / dec_tps + 0.2, 1), "first_token_s": round(pre_s + 0.18, 3),
+            "prompt_tokens": reused + fresh, "reused": reused, "output_tokens": out,
+            "prompt_ms": pre_s * 1000, "decode_ms": out / dec_tps * 1000, "decode_tok_s": round(dec_tps, 1),
+            "hit_rate": round(rnd.uniform(.84, .97), 3), "pcie_share": None,
+            "drafts_offered": out // 3, "drafts_accepted": int(out // 3 * rnd.uniform(.55, .8))})
+        t["requests"] += 1
+        t["prompt_tokens"] += reused + fresh
+        t["reused"] += reused
+        t["output_tokens"] += out
+        t["prompt_ms"] += pre_s * 1000
+        t["decode_ms"] += out / dec_tps * 1000
+        svc.lifetime.record(reused + fresh, reused, out, pre_s * 1000, out / dec_tps * 1000, started)
+    # earlier days, so the daily chart has a shape
+    rnd2 = random.Random(3)
+    for d in range(1, 15):
+        when = now - d * 86400
+        for _ in range(rnd2.randint(2, 9)):
+            reused, fresh = rnd2.choice([0, 3000, 12000]), rnd2.randint(300, 9000)
+            out = rnd2.randint(100, 2500)
+            svc.lifetime.record(reused + fresh, reused, out, fresh / 1900 * 1000, out / 100 * 1000, when)
 
 
 def request_stats(segments: list[dict]) -> dict:
@@ -7727,6 +7771,11 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
     ap.add_argument("--script-delay", type=float, default=0.0,
                     help="seconds to wait between the mock engine's tokens, so a turn stays live long enough for a "
                          "client to cancel it; the mock honours cancellation between tokens")
+    ap.add_argument("--lifetime-file", help="where the dashboard's lifetime token counters are kept between starts "
+                    "(default: next to --config as <config>.lifetime.json; none without a config)")
+    ap.add_argument("--demo-history", type=int, default=0, metavar="N",
+                    help="mock engine only: fill the request history and lifetime counters with N made-up requests "
+                         "(for looking at the dashboard without a GPU)")
     ap.add_argument("--script", action="append",
                     help="the mock engine's answer (default: a short greeting); given more than once, requests get "
                          "them in turn and the last one repeats")
@@ -8163,6 +8212,13 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
     svc.backend = cfg.get("backend")
     if a.config:
         svc.config_path = a.config                      # #564: the web page's Settings view
+    lifetime_path = a.lifetime_file or (str(Path(a.config).with_suffix("")) + ".lifetime.json" if a.config else None)
+    if lifetime_path:
+        from serve.lifetime import Lifetime
+        svc.lifetime = Lifetime(lifetime_path)
+        __import__("atexit").register(lambda: svc.lifetime.save(force=True))
+    if a.engine == "mock" and a.demo_history:
+        seed_demo_history(svc, a.demo_history)
     if a.config:                                        # the Chat settings shared with other apps, from last time
         svc.shared_path = str(Path(a.config).with_suffix("")) + ".shared-settings.json"
         try:
