@@ -249,6 +249,9 @@ void wait_seq(const unsigned* seq_ptr, unsigned seq, cudaStream_t s);
 void moe_sort(const int* idx, int T, int k, const int* vs, int n_vs, int* bounds, int* row_tok, int* pos,
               cudaStream_t s);
 /// acc[t] += w[t][i] * y[pos[t][i] - r0] for each pick of t (in pick order) whose sorted row is in [r0, r1).
+/// REAP scores: score[e] += gate weight x ||expert output row||, cnt[e] += 1, for the picks whose sorted rows are in [r0, r1)
+void reap_accum(const float* y, const int* pos, const int* idx, const float* w, int T, int k, int r0, int r1, int dim, float* score,
+                float* cnt, cudaStream_t s);
 void moe_combine(float* acc, const float* y, const int* pos, const float* w, int T, int k, int r0, int r1, int dim,
                  cudaStream_t s);
 /// rows[t][0] = 1, the rest 0 (the first layer's pre-mix: stream 0).

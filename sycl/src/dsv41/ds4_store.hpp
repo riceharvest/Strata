@@ -211,6 +211,48 @@ public:
                 if (s >= 0 && slots_[(size_t) s].pin > 0) slots_[(size_t) s].pin--;
             }
     }
+    /// Puts (layer, e) into a slot from somewhere other than the file: fill(dst) writes its blob (the expert cache's swaps copy
+    /// an expert leaving VRAM into the store from its VRAM slot, so it is not read off the disk later).  False: no slot, or the
+    /// fill failed (the slot is given back).  True when it is here already.
+    bool put(int layer, int e, const std::function<bool(uint8_t*)>& fill) {
+        if (layer < 0 || layer >= (int) geo_.size() || e < 0 || e >= geo_[(size_t) layer].n_exp) return false;
+        int s = -1;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            if (where_[(size_t) layer][(size_t) e] >= 0) return true;
+            s = take_slot(false);
+            if (s < 0) return false;
+            Slot& sp = slots_[(size_t) s];
+            if (sp.layer >= 0 && sp.expert >= 0) {
+                where_[(size_t) sp.layer][(size_t) sp.expert] = -1;
+                st_.evictions.fetch_add(1, std::memory_order_relaxed);
+            }
+            sp.layer = layer;
+            sp.expert = e;
+            sp.pin = 1;   // (not given up while it fills)
+            sp.prefetch = false;
+            sp.visible = false;
+            sp.tick = ++clock_;
+            sp.bad.store(false);
+            sp.cancel.store(false);
+            sp.left.store(0, std::memory_order_release);
+            sp.state.store(kLoading, std::memory_order_release);
+            where_[(size_t) layer][(size_t) e] = s;
+        }
+        Slot& sp = slots_[(size_t) s];
+        const bool ok = fill(sp.base);
+        std::lock_guard<std::mutex> lk(mu_);
+        sp.pin = 0;
+        if (ok) {
+            sp.state.store(kReady, std::memory_order_release);
+        } else {
+            where_[(size_t) layer][(size_t) e] = -1;
+            sp.layer = sp.expert = -1;
+            sp.state.store(kFree, std::memory_order_release);
+            free_hint_ = std::min(free_hint_, (size_t) s);
+        }
+        return ok;
+    }
     /// Starts reading (layer, e) if it is neither here nor on its way (a guess: unpinned, may be given up before it is used).
     void prefetch(int layer, int e) {
         if (layer < 0 || layer >= (int) geo_.size() || e < 0 || e >= geo_[(size_t) layer].n_exp) return;

@@ -1055,6 +1055,9 @@ struct Model::Impl {
     // the RAM store (--ssd-cache): the CPU lane's experts in slots a policy owns, read unbuffered (null: off)
     std::unique_ptr<ExpertStore> store;
     std::thread settle_th;   // (cache_settle: the RAM store's refill after a prompt, in the background)
+    // DS4_REAP_OUT=<file>: REAP scores of every routed expert over the prompts (gate weight x ||output||, and the picks), written
+    // after each prompt - for DS4_PRUNE_SCORES (one GPU)
+    float *reap_score = nullptr, *reap_cnt = nullptr;
     uint8_t* zc_stage_buf = nullptr;   // device: k staging slots for the store's experts of a decode token
     size_t zc_stride = 0;
     bool zc_copy = true;               // DS4_STORE_STAGE=0: the expert kernels read the arena over PCIe themselves
@@ -1108,6 +1111,7 @@ struct Model::Impl {
 #endif
     }
     bool copy_mode = false;
+    bool copy_dma = false;   // (copy_mode's RAM imported for device copies: the prompt's streams DMA from it)
     std::vector<std::array<uint8_t*, 2>> ram_part;   // slot -> its parts
     std::vector<std::array<size_t, 4>> cp_lay;       // layer -> part offsets of gate, up, down rows; a part's bytes
     std::vector<int> copy_spare;                      // layer -> its spare slot (-1: none)
@@ -3240,6 +3244,13 @@ struct Model::Impl {
             ++c.it_direct;
             return;
         }
+        if (in_ram && copy_mode && copy_dma && store_blob == nullptr && l.nm == 1) {   // (DMA'd from its imported RAM copy)
+            const uint8_t* p = ram_part[(size_t) l.ram[(size_t) e]][0];
+            for (int r = 0; r < 3; ++r) it.src[r] = p + cp_lay[(size_t) l.il][(size_t) r];
+            ++c.it_ram;
+            ++c.it_direct;
+            return;
+        }
         if (in_ram && ram_pinned && store_blob == nullptr) {   // (DMA'd from where it lies)
             const uint8_t* p = ram_slots[(size_t) l.ram[(size_t) e]];
             for (int r = 0; r < 3; ++r) it.src[r] = p + l.lay.trellis[r] + mx_read_off(l, mi, r);
@@ -3634,6 +3645,9 @@ struct Model::Impl {
                     std::fwrite(yv.data(), 4, yv.size(), dump_y);
                     std::fflush(dump_y);
                 }
+                if (reap_score != nullptr && !l.mtp)
+                    reap_accum(c.y, c.pos, c.ridx, c.rw, T, l.k_exp, a, a + nrows, D, reap_score + (size_t) l.il * g.n_exp,
+                               reap_cnt + (size_t) l.il * g.n_exp, d.st);
                 moe_combine(c.acc, c.y, c.pos, c.rw, T, l.k_exp, a, a + nrows, D, d.st);
             }
             i0 = j;
@@ -3972,6 +3986,52 @@ struct Model::Impl {
             // the hottest experts of the profile first, then by index
             const uint32_t* p = prof.data() + (size_t) l.il * g.n_exp;
             const std::vector<int> order = prune::hot_order(p, l.n_exp);
+            // DS4_PRUNE_SCORES=<file> (DS4_REAP_OUT's): which experts a layer keeps by their REAP mean (gate weight x ||output||
+            // over the picks: a rarely picked expert that matters when it is stays), the hottest by the profile on ties; how
+            // many a layer keeps stays the profile's water-filling
+            std::vector<int> keep_order = order;
+            if (static const std::vector<float> rs = [this] {
+                    std::vector<float> v;
+                    // (DS4_PRUNE_SCORES, else the pack's reap-scores.bin: REAP keeps far more of the model than the profile's
+                    //  frequency - held-out perplexity 2.58 at 120 a layer against 5.08, 3.16 at 96; unpruned 2.26)
+                    static const std::string pack_scores = o.pack + "/reap-scores.bin";
+                    const char* f = std::getenv("DS4_PRUNE_SCORES");
+                    if (f == nullptr) f = pack_scores.c_str();
+                    std::FILE* fp = std::fopen(f, "rb");
+                    if (fp == nullptr) return v;
+                    int32_t hd[2] = {0, 0};
+                    const size_t nn = (size_t) g.nl * g.n_exp;
+                    if (std::fread(hd, 4, 2, fp) == 2 && hd[0] == g.nl && hd[1] == g.n_exp) {
+                        std::vector<float> sc(nn), cn(nn);
+                        if (std::fread(sc.data(), 4, nn, fp) == nn && std::fread(cn.data(), 4, nn, fp) == nn) {
+                            v.resize(nn);
+                            for (size_t i = 0; i < nn; ++i) v[i] = cn[i] > 0 ? sc[i] / cn[i] : 0.0f;
+                        }
+                    }
+                    std::fclose(fp);
+                    std::fprintf(stderr, "ds4: --prune-experts keeps experts by the REAP scores in %s%s\n", f, v.empty() ? ": UNREADABLE, the profile's order instead" : "");
+                    return v;
+                }();
+                !rs.empty()) {
+                const float* r = rs.data() + (size_t) l.il * g.n_exp;
+                std::vector<int> rank((size_t) l.n_exp);
+                for (int i = 0; i < l.n_exp; ++i) rank[(size_t) order[(size_t) i]] = i;
+                std::stable_sort(keep_order.begin(), keep_order.end(), [&](int a, int b) {
+                    return r[a] != r[b] ? r[a] > r[b] : rank[(size_t) a] < rank[(size_t) b];
+                });
+            }
+            // the VRAM slots for the experts kept, hottest first by the profile (a masked one never takes a slot)
+            std::vector<int> vram_order;
+            {
+                const bool pr = prune::masks({l.il, l.n_exp, l.k_exp, prunable(l)}, prune_alloc[(size_t) l.il]);
+                std::vector<char> gone((size_t) l.n_exp, 0);
+                if (pr)
+                    for (int i = prune_alloc[(size_t) l.il]; i < l.n_exp; ++i) gone[(size_t) keep_order[(size_t) i]] = 1;
+                for (int e : order)
+                    if (!gone[(size_t) e]) vram_order.push_back(e);
+                for (int e : order)
+                    if (gone[(size_t) e]) vram_order.push_back(e);
+            }
             l.slot.assign((size_t) l.n_exp, -1);
             l.host.assign((size_t) l.n_exp, nullptr);
             // a layer with experts on both sides keeps one VRAM slot free for the cache's swaps
@@ -3983,7 +4043,7 @@ struct Model::Impl {
                 l.n_vram = l.n_slots;
                 l.spare_vram = -1;
             }
-            for (int i = 0; i < l.n_vram; ++i) l.slot[(size_t) order[(size_t) i]] = i;
+            for (int i = 0; i < l.n_vram; ++i) l.slot[(size_t) vram_order[(size_t) i]] = i;
             for (int m = 0; m < l.nm && l.n_slots > 0; ++m) {
                 Layer& x = member(l, m);
                 Dev& d = devs[(size_t) x.dev];
@@ -4071,6 +4131,7 @@ struct Model::Impl {
             }
             const int prune_n = prune_alloc[(size_t) l.il];
             if (prune::masks({l.il, l.n_exp, l.k_exp, prunable(l)}, prune_n)) {
+                const std::vector<int>& order = keep_order;   // (the experts kept: the REAP order where given)
                 prune::mask(l.heat.data(), order, prune_n, l.n_exp);
                 l.masked.assign((size_t) l.n_exp, 0);
                 for (int i = prune_n; i < l.n_exp; ++i) l.masked[(size_t) order[(size_t) i]] = 1;
@@ -4105,7 +4166,7 @@ struct Model::Impl {
                 double l_kept = 0.0, l_tot = 0.0;
                 for (int i = 0; i < l.n_exp; ++i) {
                     l_tot += p[i];
-                    if (i < pn) l_kept += p[order[(size_t) i]];
+                    if (l.masked.empty() ? i < pn : !l.masked[(size_t) i]) l_kept += l.masked.empty() ? p[order[(size_t) i]] : p[i];
                 }
                 total_hits += l_tot;
                 kept_hits += l_kept;
@@ -4199,7 +4260,7 @@ struct Model::Impl {
                 if (l.slot[(size_t) e] >= 0) {
                     for (int r = 0; r < 3; ++r)
                         os::advise(pk.fds[(size_t) l.mx_file[r]], (l.mx_off[r] + (uint64_t) e * l.mx_stride[r]), mx_part_bytes(l, r), false);
-                } else {
+                } else if (l.masked.empty() || !l.masked[(size_t) e]) {   // (--prune-experts: a masked one is never read)
                     warm.push_back({l.il, e, sum > 0 ? p[e] / sum : 0.0});
                 }
             }
@@ -4288,7 +4349,11 @@ struct Model::Impl {
     // order by a few threads, anonymous memory on huge pages (Windows: plain), not pinned (only the CPU reads it; what
     // goes to a GPU passes the pinned staging) - a layer that cannot get its memory keeps its experts in place
     bool copy_experts(const std::vector<std::pair<int, int>>& hot, std::string& err) {
-        if (o.mmap_experts > 0 || hot.empty()) return true;
+        // --prune-experts with --mmap-experts unset: resident - every kept CPU-lane expert (the drafter's too) copied into RAM, none
+        // read from the disk after the start (a pruned set fits VRAM + RAM by design; a miss off the disk costs a token more than
+        // all the rest); refused if they do not fit
+        const bool resident = o.prune_experts > 0 && o.mmap_experts < 0;
+        if ((o.mmap_experts > 0 && !resident) || hot.empty()) return true;
         const double t0 = now_ms();
         auto spare_of = [&](const Layer& l) { return o.expert_cache && l.spare_vram >= 0 ? 1 : 0; };
         double all = 0;
@@ -4306,8 +4371,14 @@ struct Model::Impl {
         // (auto: none - copies that all fit were measured no faster than the page cache: the CPU lane's rows are
         // compute-bound, ~46 GB/s from either on 2 Xeon sockets, NUMA parts included; a part copied cost decode speed
         // on 64 GB and on 32 GB of RAM)
-        double budget = o.mmap_experts == 0 ? std::min(all, can) : 0.0;
+        double budget = o.mmap_experts == 0 || resident ? std::min(all, can) : 0.0;
         if (const char* v = std::getenv("DS4_COPY_GB")) budget = std::atof(v) * 1e9;
+        if (resident && all > can) {
+            err = "--prune-experts " + std::to_string(o.prune_experts) + ": the kept experts VRAM does not hold need " +
+                  std::to_string((int) (all / 1e9 + 0.5)) + " GB of RAM, this process can get " + std::to_string((int) (can / 1e9)) +
+                  " GB beside the rest - a lower --prune-experts fits (or --mmap-experts on reads the rest from the disk, slowly)";
+            return false;
+        }
         if (o.mmap_experts == 0 && all > can)
             std::fprintf(stderr, "ds4: --mmap-experts off: the CPU lane's experts (%.1f GB) do not all fit the RAM this "
                                  "process can get (%.1f GB beside %.0f GB for the rest) - the most-routed copied, the "
@@ -4420,6 +4491,14 @@ struct Model::Impl {
         }
         for (const Job& j : jobs) L[(size_t) j.layer].ram[(size_t) j.e] = j.slot;
         copy_mode = true;
+        // the copies imported for the copy engines (one NUMA part): the prompt's streams DMA them from where they lie
+        // (opt-in, DS4_COPY_DMA=1: on the B70 the prompt's first layer never finished with it - the copies from these pages never
+        //  ran - while the RAM store's imported arena works; the staged copies read the prompt as fast at 16K)
+        if (NH == 1 && chunk > 0 && std::getenv("DS4_COPY_DMA") != nullptr && std::atoi(std::getenv("DS4_COPY_DMA")) != 0) {
+            bool all_in = true;
+            for (size_t i = 0; i < ram_chunks.size(); ++i) all_in = ds4_host_import(ram_chunks[i], ram_chunk_bytes[i]) && all_in;
+            copy_dma = all_in;
+        }
         ram_held = (int) jobs.size();
         double cb = 0;
         for (const Job& j : jobs) cb += (double) L[(size_t) j.layer].blob;
@@ -4608,6 +4687,7 @@ struct Model::Impl {
     void init_store() {
         const double gb = store_gb();
         if (gb <= 0.0 || L.empty() || L[0].lay.fmt != gg::kFmtMXFP4 || !file_experts) return;
+        if (copy_mode && o.prune_experts > 0) return;   // (resident: every kept expert is in VRAM or copied into RAM already)
         std::vector<ExpertStore::LayerGeo> geo((size_t) g.nl);   // (the trunk's layers: the drafter's bigger experts stay in place)
         for (const Layer& l : L) {
             if (l.il >= g.nl) continue;
@@ -5997,6 +6077,43 @@ struct Model::Impl {
     void swap_in_mx(Layer& l, Swap& sw, SwapBufs& B) {
         uint8_t *sw_a = B.a, *sw_b = B.b, *sw_h = B.h;   // (this thread's)
         const std::vector<cudaStream_t>& copy_st = B.st;
+        // `out` (leaving VRAM at this swap's switch) into the RAM store from its VRAM slot, so the CPU lane finds it in RAM, not
+        // on the disk (a prompt's settle moved ~340 experts out, each one a disk read in the decode after)
+        if (store && l.nm == 1 && !copy_mode && sw.ram < 0 && sw.out >= 0 && l.slot[(size_t) sw.out] >= 0) {
+            const uint8_t* vsrc = l.vram_base + (size_t) l.slot[(size_t) sw.out] * unit(l);
+            cudaStream_t cs = copy_st[(size_t) l.dev];
+            store->put(l.il, sw.out, [&](uint8_t* dst) {
+                cudaSetDevice(devs[(size_t) l.dev].id);
+                return cudaMemcpyAsync(dst, vsrc, unit(l), cudaMemcpyDeviceToHost, cs) == cudaSuccess &&
+                       cudaStreamSynchronize(cs) == cudaSuccess;
+            });
+        }
+        // in from the RAM store when it holds the expert in its imported arena: pinned, DMA'd straight into the spare slot,
+        // released - ~0.3 ms where the file read below took ~18 ms a swap off the SATA SSD (a prompt's settle: 343 swaps, 6 s)
+        if (store && l.nm == 1 && !copy_mode) {
+            const int ss = store->find(l.il, sw.in);
+            if (ss >= 0 && store->dma_ok(ss)) {
+                std::vector<char> pok;
+                const int one = sw.in;
+                if (store->ensure(l.il, &one, 1, pok) && pok[0]) {
+                    const int s2 = store->find(l.il, sw.in);
+                    const uint8_t* src = s2 >= 0 ? store->blob(s2) : nullptr;
+                    bool okd = src != nullptr;
+                    if (okd) {
+                        cudaSetDevice(devs[(size_t) l.dev].id);
+                        cudaStream_t cs = copy_st[(size_t) l.dev];
+                        uint8_t* dst = l.vram_base + (size_t) l.spare_vram * unit(l);
+                        for (int r = 0; r < 3 && okd; ++r)
+                            okd = cudaMemcpyAsync(dst + l.lay.trellis[r], src + l.lay.trellis[r] + mx_read_off(l, 0, r),
+                                                  r < 2 ? mx_read_len(l, r) : mx_part_bytes(l, 2), cudaMemcpyHostToDevice,
+                                                  cs) == cudaSuccess;
+                        okd = okd && cudaStreamSynchronize(cs) == cudaSuccess;
+                    }
+                    store->release(l.il, &one, 1, pok);
+                    if (okd && sw.ram < 0 && !check_swaps) return;   // (the plain case; RAM tier and checks below as before)
+                }
+            }
+        }
         bool ok = copy_mode ? read_mx(l, sw.in, sw_a) : read_mx_file(l, sw.in, sw_a);   // (a copy holds its slot till
                                                                                           // this swap's switch)
         for (int m = 0; m < l.nm && ok; ++m) {
@@ -6054,9 +6171,9 @@ struct Model::Impl {
     // in, its coldest VRAM expert out) until nothing is worth moving or DS4_SETTLE_MS (6000) is spent
     void cache_settle() {
         if (!o.expert_cache || cache_ths.empty()) return;
-        // (1.5 s by default, was 6: the swaps are for the decode after the prompt, and the decode's own ticks go on swapping;
-        //  every second here is a second before the first token)
-        static const double budget = env_f("DS4_SETTLE_MS", 1500.0f);
+        // (6 s: at 1.5 the decode after a 120K-token prompt ran 8.6 tok/s against 11.2 - 76 swaps against 343, more of each
+        //  token's experts on the CPU lane - so the swaps keep their time; the RAM store's refill below no longer blocks)
+        static const double budget = env_f("DS4_SETTLE_MS", 6000.0f);
         if (settle_th.joinable()) settle_th.join();   // (the refill the prompt before started)
         if (budget <= 0.0) return;
         const double t0 = now_ms();
@@ -8127,6 +8244,16 @@ struct Model::Impl {
             ctoks.push_back(ctok(pos + t, tk[t]));
         }
         plan_streams();
+        static const char* reap_out = std::getenv("DS4_REAP_OUT");
+        if (reap_out != nullptr && reap_score == nullptr && devs.size() == 1) {
+            const size_t nn = (size_t) g.nl * g.n_exp;
+            cudaSetDevice(devs[0].id);
+            if (cudaMalloc(&reap_score, nn * 4) == cudaSuccess && cudaMalloc(&reap_cnt, nn * 4) == cudaSuccess) {
+                cudaMemset(reap_score, 0, nn * 4);
+                cudaMemset(reap_cnt, 0, nn * 4);
+                std::fprintf(stderr, "ds4: REAP scores of the prompts' experts -> %s\n", reap_out);
+            }
+        }
         if (snap_slot >= 0) {   // feed_mark: the state before the run's last row, kept by its layers on the way
             run.snap_pos = pos + n - 1;
             for (int il = 0; il < g.nl; ++il) {
@@ -8343,6 +8470,21 @@ struct Model::Impl {
             for (Dev& dv : devs) {
                 cudaSetDevice(dv.id);
                 CK(cudaStreamSynchronize(dv.st));
+            }
+        }
+        if (reap_score != nullptr) {   // DS4_REAP_OUT: the totals so far - int32 layers, int32 experts, then F32 score sums, F32 picks
+            const size_t nn = (size_t) g.nl * g.n_exp;
+            std::vector<float> sc(nn), cn(nn);
+            cudaSetDevice(devs[0].id);
+            CK(cudaStreamSynchronize(devs[0].st));
+            CK(cudaMemcpy(sc.data(), reap_score, nn * 4, cudaMemcpyDeviceToHost));
+            CK(cudaMemcpy(cn.data(), reap_cnt, nn * 4, cudaMemcpyDeviceToHost));
+            if (std::FILE* f = std::fopen(std::getenv("DS4_REAP_OUT"), "wb")) {
+                const int32_t hd[2] = {g.nl, g.n_exp};
+                std::fwrite(hd, 4, 2, f);
+                std::fwrite(sc.data(), 4, nn, f);
+                std::fwrite(cn.data(), 4, nn, f);
+                std::fclose(f);
             }
         }
         return true;
