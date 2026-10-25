@@ -234,7 +234,14 @@ private:
         }
         auto fd = [&](int file) {
             if (file < 0 || file >= (int) fds.size()) return os::kBadFd;
-            if (fds[(size_t) file] == os::kBadFd) fds[(size_t) file] = os::open_ro(paths_[(size_t) file]);
+            if (fds[(size_t) file] == os::kBadFd) {
+                fds[(size_t) file] = os::open_ro(paths_[(size_t) file]);
+#if !defined(_WIN32)
+                // (rows of 144 bytes at random offsets: without this each page-cache miss pulled the kernel's read-ahead window,
+                //  ~16 KB+ for a 4 KB page holding one row - a 120K-token prompt's ~3M misses read tens of GB off the disk)
+                if (fds[(size_t) file] != os::kBadFd) posix_fadvise((int) fds[(size_t) file], 0, 0, POSIX_FADV_RANDOM);
+#endif
+            }
             return fds[(size_t) file];
         };
         const os::fd_t f = fd(r.file);

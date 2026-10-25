@@ -997,8 +997,248 @@ void set_xmx_kernel(const SetArgs a) {
         else a.y[lr * a.ldo + c0 + c] = O.g[r][c];
     }
 }
+// v2: 128 rows a block (each weight tile decoded once for twice the rows: the decode, not the matrix engines, bounds v1) - sub-group
+// g rows 8 g .. + 8 and all 64 outputs (4 tiles of gate and of up), swiglu from the accumulators through a 2 KB scratch of its own.
+// DS4_XMX_BM=128 takes it (sets whose experts reach 128 rows); the same arithmetic as v1, so the same bits.
+constexpr int BM2 = 128;
+template <int T, bool GATE_UP>
+void set_xmx2_kernel(const SetArgs a) {
+    struct Tiles {
+        sycl::half x[BM2][kXLd], wg[BN][kXLd], wu[GATE_UP ? BN : 1][kXLd];
+    };
+    constexpr size_t kScr = 16 * 8 * BN * sizeof(float);   // 16 sub-groups' 8 x 64 sums
+    constexpr size_t kSmem = sizeof(Tiles) > kScr ? sizeof(Tiles) : kScr;
+    SYCL_SHARED(uint8_t[kSmem], smem);
+    SYCL_SHARED(uint32_t[Ty<T>::TAB > 0 ? Ty<T>::TAB : 1], tab);
+    SYCL_SHARED(int[BM2], src);
+    Tiles& Tl = *reinterpret_cast<Tiles*>(&smem[0]);
+    const sycl::sub_group sg = sycl::ext::oneapi::this_work_item::get_nd_item<3>().get_sub_group();
+    const int e = blockIdx.z;
+    const int lo = a.bounds[e] - a.row0, hi = a.bounds[e + 1] - a.row0;
+    const int r0 = lo + blockIdx.x * BM2;
+    if (r0 >= hi || hi - lo <= a.skip_le) return;   // (uniform)
+    load_tab<T>(tab);
+    const int nr = min(BM2, hi - r0);
+    const int c0 = blockIdx.y * BN;
+    const uint8_t* blob = a.wbase + (size_t) e * a.stride;
+    const int K = GATE_UP ? a.n_embd : a.n_ff;
+    const size_t rb = row_bytes_t<T>(K);
+    const int tid = (int) threadIdx.x, sgi = tid >> 4, lane = tid & 15;
+    if (tid < BM2) src[tid] = tid < nr ? (GATE_UP ? a.idx[r0 + tid] : r0 + tid) : -1;
+    __syncthreads();
+    const int mr = sgi * 8;
+    const bool live = mr < nr;   // (uniform in the sub-group)
+    xjm::joint_matrix<sycl::sub_group, float, xjm::use::accumulator, 8, 16> fg[4], fu[4];
+    for (int j = 0; j < 4; ++j) {
+        xjm::joint_matrix_fill(sg, fg[j], 0.0f);
+        xjm::joint_matrix_fill(sg, fu[j], 0.0f);
+    }
+    const int tr = tid >> 2, tq = tid & 3;
+    auto lp = [](const sycl::half* p) {
+        return sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(const_cast<sycl::half*>(p));
+    };
+    for (int kb = 0; kb < K / 32; ++kb) {
+        for (int m = 0; m < (GATE_UP ? 2 : 1); ++m) {
+            float w8[8];
+            deq8<T>(blob + a.tr[GATE_UP ? m : 2] + (size_t) (c0 + tr) * rb, kb, tq, tab, w8);
+            sycl::half* dst = m == 0 ? &Tl.wg[tr][tq * 8] : &Tl.wu[tr][tq * 8];
+#pragma unroll
+            for (int j = 0; j < 8; ++j) dst[j] = sycl::half(w8[j]);
+        }
+#pragma unroll
+        for (int hr = 0; hr < 2; ++hr) {   // (rows tr and tr + 64)
+            const int r = tr + 64 * hr, sr = src[r];
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                sycl::half v = sycl::half(0.0f);
+                if (sr >= 0) {
+                    const size_t at = (size_t) sr * a.ldx + (size_t) kb * 32 + tq * 8 + j;
+                    v = GATE_UP ? sycl::half(a.xf[at]) : sycl::bit_cast<sycl::half>(a.xh[at]);
+                }
+                Tl.x[r][tq * 8 + j] = v;
+            }
+        }
+        __syncthreads();
+        if (live) {
+#pragma unroll
+            for (int kk = 0; kk < 32; kk += 16) {
+                xjm::joint_matrix<sycl::sub_group, sycl::half, xjm::use::a, 8, 16, xjm::layout::row_major> fa;
+                xjm::joint_matrix_load(sg, fa, lp(&Tl.x[mr][kk]), kXLd);
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    xjm::joint_matrix<sycl::sub_group, sycl::half, xjm::use::b, 16, 16, xjm::layout::col_major> fb;
+                    xjm::joint_matrix_load(sg, fb, lp(&Tl.wg[16 * j][kk]), kXLd);
+                    xjm::joint_matrix_mad(sg, fg[j], fa, fb, fg[j]);
+                    if (GATE_UP) {
+                        xjm::joint_matrix_load(sg, fb, lp(&Tl.wu[16 * j][kk]), kXLd);
+                        xjm::joint_matrix_mad(sg, fu[j], fa, fb, fu[j]);
+                    }
+                }
+            }
+        }
+        __syncthreads();
+    }
+    if (!live) return;   // (no barrier of the group's after this: the sub-group's own scratch only)
+    float* cs = reinterpret_cast<float*>(&smem[0]) + (size_t) sgi * 8 * BN;
+    auto lps = [](float* p) {
+        return sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(p);
+    };
+    float gv[32];
+    for (int j = 0; j < 4; ++j) xjm::joint_matrix_store(sg, fg[j], lps(cs + 16 * j), BN, xjm::layout::row_major);
+    sycl::group_barrier(sg);
+#pragma unroll
+    for (int m = 0; m < 32; ++m) gv[m] = cs[lane + 16 * m];
+    if (GATE_UP) {
+        sycl::group_barrier(sg);
+        for (int j = 0; j < 4; ++j) xjm::joint_matrix_store(sg, fu[j], lps(cs + 16 * j), BN, xjm::layout::row_major);
+        sycl::group_barrier(sg);
+    }
+#pragma unroll
+    for (int m = 0; m < 32; ++m) {
+        const int i = lane + 16 * m, r = mr + i / BN, c = i % BN;
+        if (r >= nr) continue;
+        const size_t lr = (size_t) (r0 + r);
+        if (GATE_UP) a.h[lr * a.ldo + c0 + c] = __half_as_ushort(__float2half_rn(swiglu(gv[m], cs[i], a.limit)));
+        else a.y[lr * a.ldo + c0 + c] = gv[m];
+    }
+}
+// v3: a 128 x 128 tile a block of 512 work items (the B70 gives a work-group 128 KB of SLM), K in steps of 64: each decoded weight
+// serves 128 rows and each activation 128 outputs, and sub-group g (32 of them) takes rows 32 (g / 8) .. + 32 and outputs
+// 16 (g % 8) .. + 16 of gate and of up - 6 fragment loads from SLM per 8 DPAS (v2: 9).  swiglu pairs the accumulators
+// (joint_matrix_apply of two), the results go out through SLM (rows past the expert's masked).  DS4_XMX_BM=3.
+constexpr int BM3 = 128, BN3 = 128, KS3 = 64, kXLd3 = KS3 + 8;
+template <int T, bool GATE_UP>
+void set_xmx3_kernel(const SetArgs a, sycl::nd_item<3> it, uint8_t* smem, uint32_t* tab, int* src) {
+    struct Tiles {
+        sycl::half x[BM3][kXLd3], wg[BN3][kXLd3], wu[GATE_UP ? BN3 : 1][kXLd3];
+    };
+    Tiles& Tl = *reinterpret_cast<Tiles*>(smem);
+    const sycl::sub_group sg = it.get_sub_group();
+    const int e = (int) it.get_group(0);
+    const int lo = a.bounds[e] - a.row0, hi = a.bounds[e + 1] - a.row0;
+    const int r0 = lo + (int) it.get_group(2) * BM3;
+    if (r0 >= hi || hi - lo <= a.skip_le) return;   // (uniform)
+    const int tid = (int) it.get_local_id(2), sgi = tid >> 4, lane = tid & 15;
+    load_tab<T>(tab);
+    const int nr = sycl::min(BM3, hi - r0);
+    const int c0 = (int) it.get_group(1) * BN3;
+    const uint8_t* blob = a.wbase + (size_t) e * a.stride;
+    const int K = GATE_UP ? a.n_embd : a.n_ff;
+    const size_t rb = row_bytes_t<T>(K);
+    if (tid < BM3) src[tid] = tid < nr ? (GATE_UP ? a.idx[r0 + tid] : r0 + tid) : -1;
+    it.barrier(sycl::access::fence_space::local_space);
+    const int mr = (sgi >> 3) * 32, nc = (sgi & 7) * 16;
+    const bool live = mr < nr;
+    xjm::joint_matrix<sycl::sub_group, float, xjm::use::accumulator, 8, 16> fg[4], fu[4];
+    for (int m = 0; m < 4; ++m) {
+        xjm::joint_matrix_fill(sg, fg[m], 0.0f);
+        xjm::joint_matrix_fill(sg, fu[m], 0.0f);
+    }
+    auto lp = [](const sycl::half* p) {
+        return sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(const_cast<sycl::half*>(p));
+    };
+    // the decode: work item tid weight row tid / 4 (0 .. 127), 8 values tid % 4 of each 32; the activations: rows tid / 4, the same
+    const int tr = tid >> 2, tq = tid & 3;
+    for (int k0 = 0; k0 < K; k0 += KS3) {
+#pragma unroll
+        for (int kb2 = 0; kb2 < KS3 / 32; ++kb2) {
+            const int kb = k0 / 32 + kb2;
+            for (int m = 0; m < (GATE_UP ? 2 : 1); ++m) {
+                float w8[8];
+                deq8<T>(blob + a.tr[GATE_UP ? m : 2] + (size_t) (c0 + tr) * rb, kb, tq, tab, w8);
+                sycl::half* dst = m == 0 ? &Tl.wg[tr][kb2 * 32 + tq * 8] : &Tl.wu[tr][kb2 * 32 + tq * 8];
+#pragma unroll
+                for (int j = 0; j < 8; ++j) dst[j] = sycl::half(w8[j]);
+            }
+            const int sr = src[tr];
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                sycl::half v = sycl::half(0.0f);
+                if (sr >= 0) {
+                    const size_t at = (size_t) sr * a.ldx + (size_t) kb * 32 + tq * 8 + j;
+                    v = GATE_UP ? sycl::half(a.xf[at]) : sycl::bit_cast<sycl::half>(a.xh[at]);
+                }
+                Tl.x[tr][kb2 * 32 + tq * 8 + j] = v;
+            }
+        }
+        it.barrier(sycl::access::fence_space::local_space);
+        if (live) {
+#pragma unroll
+            for (int kk = 0; kk < KS3; kk += 16) {
+                xjm::joint_matrix<sycl::sub_group, sycl::half, xjm::use::b, 16, 16, xjm::layout::col_major> bg, bu;
+                xjm::joint_matrix_load(sg, bg, lp(&Tl.wg[nc][kk]), kXLd3);
+                if (GATE_UP) xjm::joint_matrix_load(sg, bu, lp(&Tl.wu[nc][kk]), kXLd3);
+#pragma unroll
+                for (int m = 0; m < 4; ++m) {
+                    xjm::joint_matrix<sycl::sub_group, sycl::half, xjm::use::a, 8, 16, xjm::layout::row_major> fa;
+                    xjm::joint_matrix_load(sg, fa, lp(&Tl.x[mr + 8 * m][kk]), kXLd3);
+                    xjm::joint_matrix_mad(sg, fg[m], fa, bg, fg[m]);
+                    if (GATE_UP) xjm::joint_matrix_mad(sg, fu[m], fa, bu, fu[m]);
+                }
+            }
+        }
+        it.barrier(sycl::access::fence_space::local_space);
+    }
+    if (!live) return;   // (the sub-group's own scratch from here: no group barrier after this)
+    if (GATE_UP)
+        for (int m = 0; m < 4; ++m) {
+            const float lim = a.limit;
+            xjm::joint_matrix_apply(sg, fg[m], fu[m], [=](float& g, float& u) { g = swiglu(g, u, lim); });
+        }
+    float* cs = reinterpret_cast<float*>(smem) + (size_t) sgi * 32 * 16;   // this sub-group's 32 x 16 (2 KB)
+    for (int m = 0; m < 4; ++m)
+        xjm::joint_matrix_store(sg, fg[m], sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(cs + m * 8 * 16),
+                                16, xjm::layout::row_major);
+    sycl::group_barrier(sg);
+    for (int i = lane; i < 32 * 16; i += 16) {
+        const int r = mr + i / 16, c = nc + i % 16;
+        if (r >= nr) continue;
+        const size_t lr = (size_t) (r0 + r);
+        if (GATE_UP) a.h[lr * a.ldo + c0 + c] = __half_as_ushort(__float2half_rn(cs[i]));
+        else a.y[lr * a.ldo + c0 + c] = cs[i];
+    }
+}
+template <int T, bool GU>
+void launch_set_xmx3(const SetArgs& a, cudaStream_t s) {
+    const int nc = GU ? a.n_ff : a.n_embd;
+    const sycl::range<3> local(1, 1, 512),
+        global((size_t) a.n_exp, (size_t) (nc / BN3), (size_t) ((a.max_rows + BM3 - 1) / BM3) * 512);
+    strata::q_of(s)->submit([&](sycl::handler& cgh) {
+        struct Tiles {
+            sycl::half x[BM3][kXLd3], wg[BN3][kXLd3], wu[GU ? BN3 : 1][kXLd3];
+        };
+        constexpr size_t kScr = 32 * 32 * 16 * sizeof(float);
+        constexpr size_t kSmem = sizeof(Tiles) > kScr ? sizeof(Tiles) : kScr;
+        sycl::local_accessor<uint8_t, 1> sm(sycl::range<1>(kSmem), cgh);
+        sycl::local_accessor<uint32_t, 1> tb(sycl::range<1>(Ty<T>::TAB > 0 ? Ty<T>::TAB : 1), cgh);
+        sycl::local_accessor<int, 1> sr(sycl::range<1>(BM3), cgh);
+        cgh.parallel_for(sycl::nd_range<3>(global, local), [=](sycl::nd_item<3> it) [[sycl::reqd_sub_group_size(16)]] {
+            set_xmx3_kernel<T, GU>(a, it, sm.get_multi_ptr<sycl::access::decorated::no>().get(),
+                                   tb.get_multi_ptr<sycl::access::decorated::no>().get(),
+                                   sr.get_multi_ptr<sycl::access::decorated::no>().get());
+        });
+    });
+}
+static int xmx_bm() {
+    // (3: v3, the default - 15.6-18.3 TFLOP/s at a prompt chunk's shape (40 experts x 390 rows) against v1's 10.6-11.5 and v2's
+    //  11.2-12.8, ds4_xmx_test --bench on the B70; 128: v2; 64: v1)
+    static const int bm = std::getenv("DS4_XMX_BM") != nullptr ? std::atoi(std::getenv("DS4_XMX_BM")) : 3;
+    return bm;
+}
 template <int T, bool GU>
 void launch_set_xmx(const SetArgs& a, dim3 grid, cudaStream_t s) {
+    if (xmx_bm() == 3 && a.max_rows >= 64 && (GU ? a.n_ff : a.n_embd) % BN3 == 0 && a.n_embd % KS3 == 0 && a.n_ff % KS3 == 0) {
+        launch_set_xmx3<T, GU>(a, s);   // (v3: 128 x 128 tiles, 512 work items)
+        return;
+    }
+    if (xmx_bm() == BM2 && a.max_rows >= BM2) {   // (v2: 128-row blocks)
+        const sycl::range<3> local(1, 1, kThreads),
+            global(grid.z, grid.y, (size_t) ((a.max_rows + BM2 - 1) / BM2) * kThreads);
+        strata::q_of(s)->parallel_for(sycl::nd_range<3>(global, local), [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(16)]] {
+            set_xmx2_kernel<T, GU>(a);
+        });
+        return;
+    }
     const sycl::range<3> local(1, 1, kThreads), global(grid.z, grid.y, (size_t) grid.x * kThreads);
     strata::q_of(s)->parallel_for(sycl::nd_range<3>(global, local), [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(16)]] {
         set_xmx_kernel<T, GU>(a);

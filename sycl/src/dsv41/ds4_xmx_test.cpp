@@ -3,9 +3,12 @@
 // shape (n_embd 5120, n_ff 2304) in the official sets' types (IQ2_XXS, IQ2_XS, IQ1_M) and IQ3_XXS.
 //   ds4_xmx_test                       the check (ctest): rows per expert 1 .. 130 (partial tiles), the light kernels off
 //   ds4_xmx_test --bench TYPE E R [N]  us per set_gate_up / set_down call, F32 kernel vs XMX, E experts of R rows each
+//   ds4_xmx_test --ixbench T N         ms per index_score (every key, 32 heads x 128, fp4p keys) of T queries over N keys
+// The check also runs index_score's XMX kernel against its FMA kernel (bf16 and fp4p keys, causal limits).
 // About 0.2 GB of device memory for the check; the bench E x 9 MB (IQ2_XXS).
 #include "ds4_sycl.hpp"
 #include "ds4_iq.cuh"
+#include "ds4_kernels.cuh"
 
 #include <chrono>
 #include <cmath>
@@ -27,6 +30,8 @@ struct Normal {
     }
 };
 
+static void check_index(cudaStream_t s);   // (below: index_score's XMX kernel against its FMA kernel)
+static void check_attn(cudaStream_t s);    // (below: a chunk's sparse attention, XMX against FMA)
 static int fails = 0;
 #define CHECK(c, ...)                                         \
     do {                                                      \
@@ -290,9 +295,244 @@ static int check_main() {
         free_set(S);
     }
     iq::force_tiles(-1);
+    check_index(s);
+    check_attn(s);
     cudaStreamDestroy(s);
     std::printf(fails == 0 ? "ALL OK\n" : "%d FAILED\n", fails);
     return fails == 0 ? 0 : 1;
+}
+
+
+namespace ds4k = strata::ds4;
+// index_score's inputs: T queries (32 heads x 128, F32), their head weights (64 a row), n keys in format kf
+struct IxSet {
+    float *q = nullptr, *w = nullptr, *out = nullptr;
+    uint8_t* k = nullptr;
+};
+static IxSet make_ix(int T, int n, int kf, std::mt19937& rng) {
+    IxSet x;
+    Normal nd;
+    std::vector<float> hq((size_t) T * 32 * 128), hw((size_t) T * 64);
+    for (float& v : hq) v = nd(rng);
+    for (float& v : hw) v = std::fabs(nd(rng)) * 0.1f;
+    const size_t rb = ds4k::kv_row_bytes(kf, 128);
+    std::vector<uint8_t> hk((size_t) n * rb, 0);
+    for (int p = 0; p < n; ++p) {
+        uint8_t* r = hk.data() + (size_t) p * rb;
+        if (kf == ds4k::kKvFp4p) {
+            for (int i = 0; i < 64; ++i) r[i] = (uint8_t) rng();
+            for (int i = 0; i < 4; ++i) r[64 + i] = (uint8_t) (120 + rng() % 8);   // (UE8M0: 2^-7 .. 2^0)
+        } else
+            for (int i = 0; i < 128; ++i) {
+                const float v = nd(rng);
+                uint32_t b;
+                std::memcpy(&b, &v, 4);
+                const uint16_t h = (uint16_t) (b >> 16);
+                std::memcpy(r + 2 * i, &h, 2);
+            }
+    }
+    cudaMalloc(&x.q, hq.size() * 4);
+    cudaMalloc(&x.w, hw.size() * 4);
+    cudaMalloc(&x.k, hk.size());
+    cudaMalloc(&x.out, (size_t) T * n * 4);
+    cudaMemcpy(x.q, hq.data(), hq.size() * 4, cudaMemcpyHostToDevice);
+    cudaMemcpy(x.w, hw.data(), hw.size() * 4, cudaMemcpyHostToDevice);
+    cudaMemcpy(x.k, hk.data(), hk.size(), cudaMemcpyHostToDevice);
+    return x;
+}
+static void free_ix(IxSet& x) {
+    cudaFree(x.q);
+    cudaFree(x.w);
+    cudaFree(x.k);
+    cudaFree(x.out);
+}
+static ds4k::Rows ix_rows(int p0) {   // gen 1: query t sees (p0 + t + 1) / 2 keys
+    ds4k::Rows r;
+    r.gen = 1;
+    r.p0 = p0;
+    r.R = 2;
+    r.kcap = 512;
+    return r;
+}
+// XMX vs FMA: the same -inf positions, every finite score within 2% of its row's largest magnitude (BF16 operands)
+static void check_index(cudaStream_t s) {
+    std::mt19937 rng(5);
+    const int T = 37, p0 = 3001, n = (p0 + T) / 2;
+    for (int kf : {ds4k::kKvBf16, ds4k::kKvFp4p}) {
+        IxSet x = make_ix(T, n, kf, rng);
+        const ds4k::Rows lim = ix_rows(p0);
+        std::vector<float> a((size_t) T * n), b((size_t) T * n);
+        for (int mode : {0, 1}) {
+            ds4k::index_force_xmx(mode);
+            cudaMemsetAsync(x.out, 0, (size_t) T * n * 4, s);
+            ds4k::index_score(x.q, x.w, x.k, 32, 128, T, n, nullptr, 0, 1, lim, x.out, n, s, kf);
+            cudaMemcpyAsync(mode ? b.data() : a.data(), x.out, (size_t) T * n * 4, cudaMemcpyDeviceToHost, s);
+            cudaStreamSynchronize(s);
+        }
+        ds4k::index_force_xmx(-1);
+        int inf_bad = 0;
+        double worst = 0;
+        for (int t = 0; t < T; ++t) {
+            double mx = 1e-30;
+            for (int p = 0; p < n; ++p)
+                if (std::isfinite(a[(size_t) t * n + p])) mx = std::max(mx, (double) std::fabs(a[(size_t) t * n + p]));
+            for (int p = 0; p < n; ++p) {
+                const float u = a[(size_t) t * n + p], v = b[(size_t) t * n + p];
+                if (std::isfinite(u) != std::isfinite(v)) ++inf_bad;
+                else if (std::isfinite(u)) worst = std::max(worst, std::fabs((double) u - v) / mx);
+            }
+        }
+        std::printf("index_score %s keys, %d queries x %d keys: XMX vs FMA worst %.2e of the row's largest, %d -inf mismatches\n",
+                    kf == ds4k::kKvFp4p ? "fp4p" : "bf16", T, n, worst, inf_bad);
+        CHECK(inf_bad == 0 && worst < 2e-2, "index_score XMX (%s keys): worst %.2e, %d -inf mismatches",
+              kf == ds4k::kKvFp4p ? "fp4p" : "bf16", worst, inf_bad);
+        free_ix(x);
+    }
+}
+
+// a prompt chunk's sparse attention over packed rows: XMX vs FMA on T queries of 64 heads, the window's BF16 rows and n_sel
+// selected compressed rows each (random codes, E4M3 scales near 1), sinks; every output within 2% of its head's largest
+static void check_attn(cudaStream_t s) {
+    std::mt19937 rng(17);
+    Normal nd;
+    const int T = 9, H = 64, D = 512, WIN = 128, NC = 700, KC = 512, R = 4;
+    const long long p0 = 2600;   // (query t sees min(512, (p0 + t + 1) / 4) selected rows and the window)
+    std::vector<float> hq((size_t) T * H * D), hs(H);
+    for (float& v : hq) v = nd(rng) * 0.05f;
+    for (float& v : hs) v = nd(rng);
+    std::vector<uint16_t> hw((size_t) (WIN + T) * D);
+    for (uint16_t& v : hw) {
+        const float f = nd(rng);
+        uint32_t b;
+        std::memcpy(&b, &f, 4);
+        v = (uint16_t) (b >> 16);
+    }
+    const size_t crow = ds4k::kv_row_bytes(ds4k::kKvFp4, D);
+    std::vector<uint8_t> hc((size_t) NC * crow, 0);
+    for (int r = 0; r < NC; ++r) {
+        uint8_t* row = hc.data() + (size_t) r * crow;
+        for (int i = 0; i < 256; ++i) row[i] = (uint8_t) rng();
+        for (int i = 0; i < 32; ++i) row[256 + i] = (uint8_t) (0x30 + rng() % 16);   // (E4M3 0.5 .. ~2)
+    }
+    std::vector<int> hsel((size_t) T * KC);
+    for (int& v : hsel) v = (int) (rng() % NC);
+    float *q, *sk, *o;
+    uint16_t* w;
+    uint8_t* c;
+    int* sel;
+    cudaMalloc(&q, hq.size() * 4);
+    cudaMalloc(&sk, hs.size() * 4);
+    cudaMalloc(&o, hq.size() * 4);
+    cudaMalloc(&w, hw.size() * 2);
+    cudaMalloc(&c, hc.size());
+    cudaMalloc(&sel, hsel.size() * 4);
+    cudaMemcpy(q, hq.data(), hq.size() * 4, cudaMemcpyHostToDevice);
+    cudaMemcpy(sk, hs.data(), hs.size() * 4, cudaMemcpyHostToDevice);
+    cudaMemcpy(w, hw.data(), hw.size() * 2, cudaMemcpyHostToDevice);
+    cudaMemcpy(c, hc.data(), hc.size(), cudaMemcpyHostToDevice);
+    cudaMemcpy(sel, hsel.data(), hsel.size() * 4, cudaMemcpyHostToDevice);
+    ds4k::AttnRows ar;
+    ar.gen = 1;
+    ar.p0 = p0;
+    ar.t0 = 0;
+    ar.win = WIN;
+    ar.R = R;
+    ar.kcap = KC;
+    std::vector<float> a(hq.size()), b(hq.size());
+    for (int mode : {0, 1}) {
+        ds4k::attn_force_xmx(mode);
+        cudaMemsetAsync(o, 0, hq.size() * 4, s);
+        // (the window buffer: the ring's 128 rows before p0, then the chunk's rows - here random rows all of them)
+        ds4k::sparse_attn(q, w, c, sel, KC, ar, sk, H, D, T, 1.0f / std::sqrt((float) D), o, s, ds4k::kKvFp4, 0, nullptr);
+        cudaMemcpyAsync(mode ? b.data() : a.data(), o, hq.size() * 4, cudaMemcpyDeviceToHost, s);
+        cudaStreamSynchronize(s);
+    }
+    ds4k::attn_force_xmx(-1);
+    double worst = 0;
+    int bad = 0;
+    for (int t = 0; t < T; ++t)
+        for (int h = 0; h < H; ++h) {
+            const float* u = a.data() + ((size_t) t * H + h) * D;
+            const float* v = b.data() + ((size_t) t * H + h) * D;
+            double mx = 1e-30;
+            for (int i = 0; i < D; ++i) mx = std::max(mx, (double) std::fabs(u[i]));
+            for (int i = 0; i < D; ++i) {
+                if (!std::isfinite(v[i])) ++bad;
+                else worst = std::max(worst, std::fabs((double) u[i] - v[i]) / mx);
+            }
+        }
+    std::printf("sparse_attn (chunk rows, packed): XMX vs FMA worst %.2e of the head's largest, %d non-finite\n", worst, bad);
+    CHECK(bad == 0 && worst < 2e-2, "sparse_attn XMX: worst %.2e, %d non-finite", worst, bad);
+    cudaFree(q), cudaFree(sk), cudaFree(o), cudaFree(w), cudaFree(c), cudaFree(sel);
+}
+
+// ms per sparse_attn call of T chunk queries (64 heads, the window + 512 selected rows each): FMA, XMX 16 heads a block, XMX 64
+static int attn_bench(int T) {
+    std::mt19937 rng(3);
+    Normal nd;
+    const int H = 64, D = 512, WIN = 128, NC = 4096, KC = 512, R = 4;
+    std::vector<float> hq((size_t) T * H * D), hs(H, 0.0f);
+    for (float& v : hq) v = nd(rng) * 0.05f;
+    std::vector<uint16_t> hw((size_t) (WIN + T) * D, 0x3f80);
+    const size_t crow = ds4k::kv_row_bytes(ds4k::kKvFp4, D);
+    std::vector<uint8_t> hc((size_t) NC * crow);
+    for (size_t i = 0; i < hc.size(); ++i) hc[i] = (uint8_t) ((i % crow) >= 256 ? 0x38 : rng());
+    std::vector<int> hsel((size_t) T * KC);
+    for (int& v : hsel) v = (int) (rng() % NC);
+    float *q, *sk, *o;
+    uint16_t* w;
+    uint8_t* c;
+    int* sel;
+    cudaStream_t s = nullptr;
+    cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking);
+    cudaMalloc(&q, hq.size() * 4), cudaMalloc(&sk, hs.size() * 4), cudaMalloc(&o, hq.size() * 4);
+    cudaMalloc(&w, hw.size() * 2), cudaMalloc(&c, hc.size()), cudaMalloc(&sel, hsel.size() * 4);
+    cudaMemcpy(q, hq.data(), hq.size() * 4, cudaMemcpyHostToDevice);
+    cudaMemcpy(sk, hs.data(), hs.size() * 4, cudaMemcpyHostToDevice);
+    cudaMemcpy(w, hw.data(), hw.size() * 2, cudaMemcpyHostToDevice);
+    cudaMemcpy(c, hc.data(), hc.size(), cudaMemcpyHostToDevice);
+    cudaMemcpy(sel, hsel.data(), hsel.size() * 4, cudaMemcpyHostToDevice);
+    ds4k::AttnRows ar;
+    ar.gen = 1, ar.p0 = 100000, ar.t0 = 0, ar.win = WIN, ar.R = R, ar.kcap = KC;
+    const bool x16 = !(std::getenv("DS4_ATTN_XMX64") != nullptr && std::atoi(std::getenv("DS4_ATTN_XMX64")) != 0);
+    for (int m = 0; m < 2; ++m) {
+        ds4k::attn_force_xmx(m);
+        auto call = [&] { ds4k::sparse_attn(q, w, c, sel, KC, ar, sk, H, D, T, 0.0442f, o, s, ds4k::kKvFp4, 0, nullptr); };
+        call();
+        cudaStreamSynchronize(s);
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < 5; ++i) call();
+        cudaStreamSynchronize(s);
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() / 5;
+        std::printf("sparse_attn %-13s %d queries x 640 rows: %.2f ms (%.1f TFLOP/s)\n", m == 0 ? "FMA" : x16 ? "XMX 16 heads" : "XMX 64 heads",
+                    T, ms, 4.0 * T * 640.0 * H * D / (ms * 1e-3) / 1e12);
+    }
+    ds4k::attn_force_xmx(-1);
+    cudaFree(q), cudaFree(sk), cudaFree(o), cudaFree(w), cudaFree(c), cudaFree(sel);
+    cudaStreamDestroy(s);
+    return 0;
+}
+static int ix_bench(int T, int n) {
+    cudaStream_t s = nullptr;
+    cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking);
+    std::mt19937 rng(9);
+    IxSet x = make_ix(T, n, ds4k::kKvFp4p, rng);
+    const ds4k::Rows lim = ix_rows(2 * n - T);   // (the slab's last query sees every key)
+    for (int mode : {0, 1}) {
+        ds4k::index_force_xmx(mode);
+        ds4k::index_score(x.q, x.w, x.k, 32, 128, T, n, nullptr, 0, 1, lim, x.out, n, s, ds4k::kKvFp4p);
+        cudaStreamSynchronize(s);
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < 3; ++i) ds4k::index_score(x.q, x.w, x.k, 32, 128, T, n, nullptr, 0, 1, lim, x.out, n, s, ds4k::kKvFp4p);
+        cudaStreamSynchronize(s);
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() / 3;
+        std::printf("index_score %-4s %d queries x %d keys: %.1f ms (%.1f TFLOP/s)\n", mode ? "XMX" : "FMA", T, n, ms,
+                    2.0 * T * (double) n * 32 * 128 / (ms * 1e-3) / 1e12);
+    }
+    ds4k::index_force_xmx(-1);
+    free_ix(x);
+    cudaStreamDestroy(s);
+    return 0;
 }
 
 static int bench_main(int type, int E, int R, int N) {
@@ -338,5 +578,7 @@ int main(int argc, char** argv) {
         const int type = t == "IQ2_XS" ? iq::kIQ2_XS : t == "IQ1_M" ? iq::kIQ1_M : t == "IQ3_XXS" ? iq::kIQ3_XXS : iq::kIQ2_XXS;
         return bench_main(type, std::atoi(argv[3]), std::atoi(argv[4]), argc > 5 ? std::atoi(argv[5]) : 20);
     }
+    if (argc >= 3 && std::strcmp(argv[1], "--attnbench") == 0) return attn_bench(std::atoi(argv[2]));
+    if (argc >= 4 && std::strcmp(argv[1], "--ixbench") == 0) return ix_bench(std::atoi(argv[2]), std::atoi(argv[3]));
     return check_main();
 }

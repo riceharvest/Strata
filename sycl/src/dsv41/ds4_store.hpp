@@ -66,6 +66,10 @@ public:
         // a new chunk of the arena for the GPU to read in place: returns the device address of `host` (null: not visible)
         std::function<void*(void* host, size_t bytes)> map_chunk;
         std::function<void(void* host)> unmap_chunk;
+        // a new chunk of the arena registered for the GPU's copy engines (cudaHostRegister without mapping: the chunked prompt
+        // DMAs a slot's expert straight out of it instead of a reader copying it into staging first); true: registered
+        std::function<bool(void* host, size_t bytes)> dma_chunk;
+        std::function<void(void* host)> undma_chunk;
         size_t reserve = 192;              // slots kept evictable (not visible) for the window's demand and guesses
         int vis_percent = 100;             // the share of experts the GPU may take (by a fixed hash): the rest stay the CPU lane's, so both lanes work
     };
@@ -111,6 +115,8 @@ public:
         io_.reset();
         for (size_t i = 0; i < chunks_.size(); ++i)
             if (cfg_.unmap_chunk && chunk_dev_[i] != nullptr) cfg_.unmap_chunk(chunks_[i].first);
+        for (size_t i = 0; i < chunks_.size(); ++i)
+            if (cfg_.undma_chunk && i < chunk_dma_.size() && chunk_dma_[i]) cfg_.undma_chunk(chunks_[i].first);
         os::range_release(arena_, arena_bytes_);
     }
 
@@ -132,6 +138,11 @@ public:
     }
     const uint8_t* mat(int slot, int r) const { return slots_[(size_t) slot].base + geo_[(size_t) slots_[(size_t) slot].layer].tr[r]; }
     const uint8_t* blob(int slot) const { return slots_[(size_t) slot].base; }
+    /// The slot's chunk is registered for the copy engines (Cfg::dma_chunk): a device copy may read its blob directly
+    bool dma_ok(int slot) const {
+        const size_t c = (size_t) slot / kChunk;
+        return c < chunk_dma_.size() && chunk_dma_[c] != 0;
+    }
     /// The device address of the slot's blob (0: the arena is not mapped for the GPU)
     unsigned long long dev_blob(int slot) const {
         const size_t c = (size_t) slot / kChunk;
@@ -349,9 +360,11 @@ public:
                 sp.base = nullptr;
             }
             if (cfg_.unmap_chunk && chunk_dev_[c] != nullptr) cfg_.unmap_chunk(chunks_[c].first);
+            if (cfg_.undma_chunk && c < chunk_dma_.size() && chunk_dma_[c]) cfg_.undma_chunk(chunks_[c].first);
             os::range_decommit(chunks_[c].first, chunks_[c].second);
             chunks_.pop_back();
             chunk_dev_.pop_back();
+            if (!chunk_dma_.empty()) chunk_dma_.pop_back();
             nalloc_ = first;
             free_hint_ = std::min(free_hint_, first);
             ++done;
@@ -473,6 +486,7 @@ private:
         chunks_.push_back({p, bytes});
         void* dev = cfg_.map_chunk ? cfg_.map_chunk(p, bytes) : nullptr;
         chunk_dev_.push_back(dev);
+        chunk_dma_.push_back(cfg_.dma_chunk && dev == nullptr && cfg_.dma_chunk(p, bytes) ? 1 : 0);
         for (size_t i = 0; i < n; ++i) slots_[nalloc_ + i].base = (uint8_t*) p + i * slot_bytes_ + kSlack;
         nalloc_ += n;
         return true;
@@ -518,6 +532,7 @@ private:
     std::unique_ptr<Slot[]> slots_;
     std::vector<std::pair<void*, size_t>> chunks_;
     std::vector<void*> chunk_dev_;
+    std::vector<char> chunk_dma_;
     std::vector<std::vector<int>> where_;
     std::vector<std::vector<float>> heat_;
     std::vector<uint64_t> hits_in_layer_;

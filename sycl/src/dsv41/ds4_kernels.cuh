@@ -123,6 +123,8 @@ struct Rows {
 /// with candidates p = cand[t][i / blk] * blk + i % blk for i < lim.k[t] * blk; positions >= lim.n[t] (or past the
 /// query's candidates) -> -inf.  q rows heads * hd apart, w rows 64, cand rows cand_stride, out rows out_stride; the keys
 /// k rows of format kfmt (the cache's kKvFp4p, or kKvBf16).
+/// (tests) index_score's kernel for the scores of every key: 1 XMX (an AOT bmg build), 0 the FMA one, -1 the default
+void index_force_xmx(int mode);
 void index_score(const float* q, const float* w, const void* k, int heads, int hd, int T, int n, const int* cand,
                  int cand_stride, int blk, const Rows& lim, float* out, long long out_stride, cudaStream_t s,
                  int kfmt = kKvFp4p);
@@ -153,6 +155,8 @@ struct AttnRows {
     int gen = 0, t0 = 0, win = 0, R = 0, kcap = 0;
     long long p0 = 0;
 };
+/// (tests) a prompt chunk's sparse attention over packed rows: 1 XMX (an AOT bmg build), 0 the FMA kernel, -1 the default
+void attn_force_xmx(int mode);
 void sparse_attn(const float* q, const uint16_t* win, const void* ckv, const int* sel, int sel_stride,
                  const AttnRows& a, const float* sink, int heads, int d, int T, float scale, float* out, cudaStream_t s,
                  int ckv_fmt = kKvFp4, int heads_per_block = 0, const AttnScratch* scr = nullptr);

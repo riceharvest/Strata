@@ -442,13 +442,26 @@ inline cudaError_t cudaEventQuery(cudaEvent_t e) {
     auto st = e->ev.get_info<sycl::info::event::command_execution_status>();
     return st == sycl::info::event_command_status::complete ? cudaSuccess : cudaErrorNotReady;
 }
+// DS4_PROF: the streams cudaStreamCreate* makes are created with profiling, so an event's barrier carries the GPU's timestamp
+inline bool ds4_prof_queues() {
+    static const bool on = std::getenv("DS4_PROF") != nullptr;
+    return on;
+}
+// The GPU's time between the two barriers where their queues profile (DS4_PROF), else the host's between the records: the
+// host's is when the work was queued, not when it ran - every DS4_PROF stage and kernel time read so before 2026-10-25
 inline cudaError_t cudaEventElapsedTime(float* ms, cudaEvent_t start, cudaEvent_t end) {
-    if (start && end) {
-        double d = std::chrono::duration<double, std::milli>(end->tp - start->tp).count();
-        *ms = (float) d;
-    } else {
-        *ms = 0.0f;
+    *ms = 0.0f;
+    if (!start || !end) return cudaSuccess;
+    if (ds4_prof_queues() && start->recorded && end->recorded) {
+        try {
+            const uint64_t a = start->ev.get_profiling_info<sycl::info::event_profiling::command_end>();
+            const uint64_t b = end->ev.get_profiling_info<sycl::info::event_profiling::command_end>();
+            *ms = (float) ((double) ((int64_t) (b - a)) / 1e6);
+            return cudaSuccess;
+        } catch (const sycl::exception&) {   // (a queue without profiling: the host's times below)
+        }
     }
+    *ms = (float) std::chrono::duration<double, std::milli>(end->tp - start->tp).count();
     return cudaSuccess;
 }
 inline cudaError_t cudaStreamWaitEvent(cudaStream_t s, cudaEvent_t e, unsigned int = 0) {
@@ -581,6 +594,30 @@ inline cudaError_t cudaHostUnregister(void* p) {
     ds4_shim::st().registered.erase((const char*) p);
     return cudaSuccess;
 }
+// (no CUDA name) A host range imported into the driver for device copies - sycl_ext_oneapi_copy_optimize, Level Zero's external
+// pointer import: a copy from it is a DMA as from USM host memory, where cudaHostRegister above is bookkeeping only (it is what
+// the model files' mappings get - 100+ GB the import would pin).  For the RAM store's arena chunks (2 GB each).
+inline bool ds4_host_import(void* p, size_t n) {
+    try {
+        sycl::ext::oneapi::experimental::prepare_for_device_copy(p, n, dpct::get_in_order_queue().get_context());
+    } catch (const sycl::exception&) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lk(ds4_shim::st().mu);
+    ds4_shim::st().registered[(const char*) p] = n;
+    return true;
+}
+inline void ds4_host_unimport(void* p) {
+    {
+        std::lock_guard<std::mutex> lk(ds4_shim::st().mu);
+        if (ds4_shim::st().registered.erase((const char*) p) == 0) return;
+    }
+    ds4_shim::wait_queues(true);   // (no copy still reads it)
+    try {
+        sycl::ext::oneapi::experimental::release_from_device_copy(p, dpct::get_in_order_queue().get_context());
+    } catch (const sycl::exception&) {
+    }
+}
 
 enum cudaMemcpyKind {
     cudaMemcpyHostToHost = 0,
@@ -639,7 +676,9 @@ inline cudaError_t cudaMemcpy2DAsync(void* dst, size_t dpitch, const void* src, 
 inline cudaError_t cudaStreamCreateWithFlags(cudaStream_t* s, unsigned int) {
     auto ctx = dpct::get_current_device().get_context();
     sycl::device dev = dpct::get_current_device();
-    *s = new sycl::queue(ctx, dev, sycl::property::queue::in_order());
+    *s = ds4_prof_queues() ? new sycl::queue(ctx, dev, sycl::property_list{sycl::property::queue::in_order(),
+                                                                          sycl::property::queue::enable_profiling()})
+                           : new sycl::queue(ctx, dev, sycl::property::queue::in_order());
     std::lock_guard<std::mutex> lk(ds4_shim::st().mu);
     ds4_shim::st().queues.push_back(*s);
     return cudaSuccess;

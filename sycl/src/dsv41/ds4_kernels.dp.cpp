@@ -8,6 +8,9 @@
 #include "ds4_attn_split.cuh"
 
 #include "ds4_sycl.hpp"
+#if defined(STRATA_XMX_SG16)
+#include <sycl/ext/oneapi/matrix/matrix.hpp>
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -1956,6 +1959,119 @@ void compress_win(const float* kv, const float* score, float* kv_state, float* s
     STRATA_LAUNCH(s, 1, 512, 0, compress_kernel, kv, score, kv_state, score_state, ratio, p0, T, d, w, eps, latent);
 }
 
+#if defined(STRATA_XMX_SG16)
+// index_score on Xe2's matrix engines (an AOT bmg build; the scores of every key, no candidates): score[t][p] =
+// sum_h w[t][h] relu(q[t][h] . k[p]) is a GEMM of the queries' heads (M = T x 32) by the keys (N), K = 128, then the
+// weighted relu over each query's 32 rows.  A block of 256 work items (16 sub-groups of 16) takes 4 queries x 64 keys: sub-group
+// g query g / 4, keys 16 (g % 4) .. + 16, its 32 heads as four 8 x 16 accumulators.  BF16 operands (the fp4 keys times their
+// power-of-two scales keep F32's range; F16's would not), F32 sums: not the FMA kernel's bits - the scores only pick the
+// top-k, and DeepSeek's own indexer runs in FP8.  DS4_IX_XMX=0 keeps the FMA kernel.
+namespace ixm = sycl::ext::oneapi::experimental::matrix;
+constexpr int kIxQ = 4, kIxN = 64, kIxLd = 128 + 8;   // queries, keys a block; a row's pitch in BF16
+constexpr int kIxKT = 8;   // key tiles a block (512 keys): the queries' rows loaded once for them all
+template <int KF>
+void index_score_xmx_kernel(sycl::nd_item<2> it, const float* __restrict__ q, const float* __restrict__ w,
+                            const uint8_t* __restrict__ kc, int T, int n, Rows lim, float* __restrict__ out,
+                            long long out_stride, sycl::ext::oneapi::bfloat16* sa, sycl::ext::oneapi::bfloat16* sb) {
+    using bf16 = sycl::ext::oneapi::bfloat16;
+    constexpr int HD = 128, H = 32;
+    const sycl::sub_group sg = it.get_sub_group();
+    const int tid = (int) it.get_local_id(1), sgi = tid >> 4, lane = tid & 15;
+    const int t0 = (int) it.get_group(0) * kIxQ, pb = (int) it.get_group(1) * kIxN * kIxKT;
+    // the 4 queries' 128 head rows, BF16 (rows past T zero) - once for the block's 512 keys
+    for (int i = tid; i < kIxQ * H * HD; i += 256) {
+        const int r = i / HD, c = i % HD, t = t0 + r / H;
+        sa[r * kIxLd + c] = bf16(t < T ? q[(size_t) t * H * HD + (size_t) (r % H) * HD + c] : 0.0f);
+    }
+    const int qi = sgi >> 2, nb = (sgi & 3) * 16, t = t0 + qi;
+    int ln = 0, lk = 0;
+    if (t < T) rows_at(lim, t, ln, lk);
+    float wt[H];   // this sub-group's query's head weights
+    for (int h = 0; h < H; ++h) wt[h] = t < T ? w[(size_t) t * 64 + h] : 0.0f;
+    auto lp = [](bf16* p) {
+        return sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(p);
+    };
+    for (int kt = 0; kt < kIxKT; ++kt) {
+        const int p0 = pb + kt * kIxN;
+        if (p0 >= n) break;   // (uniform)
+        it.barrier(sycl::access::fence_space::local_space);   // (the tile before is done with sb; sa written, the first time)
+        {   // the 64 keys' rows, decoded (keys past n zero): thread tid key tid / 4, dims 32 (tid % 4) .. + 32
+            const int kr = tid >> 2, c0 = (tid & 3) * 32, p = p0 + kr;
+            bf16* dst = sb + kr * kIxLd + c0;
+            if (p < n) {
+                const uint8_t* row = kc + (size_t) p * kv_row_bytes(KF, HD);
+                if (KF == kKvFp4p) {
+                    const float ks = ue8m0_val(row[HD / 2 + c0 / 32]);
+                    for (int c = 0; c < 32; c += 8) {
+                        const uint32_t cw = *(const uint32_t*) (row + (c0 + c) / 2);
+                        for (int x = 0; x < 8; ++x) dst[c + x] = bf16(e2m1_val14(cw >> (4 * x)) * 16384.0f * ks);
+                    }
+                } else {
+                    const uint16_t* b = (const uint16_t*) (row + c0 * 2);
+                    for (int c = 0; c < 32; ++c) dst[c] = sycl::bit_cast<bf16>(b[c]);
+                }
+            } else
+                for (int c = 0; c < 32; ++c) dst[c] = bf16(0.0f);
+        }
+        it.barrier(sycl::access::fence_space::local_space);
+        ixm::joint_matrix<sycl::sub_group, float, ixm::use::accumulator, 8, 16> acc[4];
+        for (int m = 0; m < 4; ++m) ixm::joint_matrix_fill(sg, acc[m], 0.0f);
+        for (int kk = 0; kk < HD; kk += 16) {
+            ixm::joint_matrix<sycl::sub_group, bf16, ixm::use::b, 16, 16, ixm::layout::col_major> fb;
+            ixm::joint_matrix_load(sg, fb, lp(sb + nb * kIxLd + kk), kIxLd);
+            for (int m = 0; m < 4; ++m) {
+                ixm::joint_matrix<sycl::sub_group, bf16, ixm::use::a, 8, 16, ixm::layout::row_major> fa;
+                ixm::joint_matrix_load(sg, fa, lp(sa + (qi * H + m * 8) * kIxLd + kk), kIxLd);
+                ixm::joint_matrix_mad(sg, acc[m], fa, fb, acc[m]);
+            }
+        }
+        // the weighted relu over the 32 heads straight from the accumulators: an 8 x 16 F32 accumulator on sub-groups of 16
+        // holds column `lane` in each work item, its element i row i (joint_matrix_apply visits them in order) - the key
+        // p0 + nb + lane's 8 heads m 8 .. + 8 (ds4_xmx_test's index check against the FMA kernel holds this layout to account)
+        float sum = 0.0f;
+        for (int m = 0; m < 4; ++m) {
+            int i = 0;
+            ixm::joint_matrix_apply(sg, acc[m], [&](float& x) {
+                sum += fmaxf(x, 0.0f) * wt[m * 8 + i];
+                ++i;
+            });
+        }
+        const int p = p0 + nb + lane;
+        if (t < T && p < n) out[(long long) t * out_stride + p] = p < ln ? sum : -INFINITY;
+    }
+}
+static std::atomic<int> g_ix_force{-1};   // (index_force_xmx: tests)
+static bool index_xmx_on() {
+    const int f = g_ix_force.load(std::memory_order_relaxed);
+    if (f >= 0) return f == 1;
+    static const bool on = !(std::getenv("DS4_IX_XMX") != nullptr && std::atoi(std::getenv("DS4_IX_XMX")) == 0);
+    return on;
+}
+template <int KF>
+static void launch_index_xmx(const float* q, const float* w, const uint8_t* k, int T, int n, const Rows& lim, float* out,
+                             long long out_stride, cudaStream_t s) {
+    using bf16 = sycl::ext::oneapi::bfloat16;
+    const sycl::range<2> local(1, 256), global((size_t) cdiv(T, kIxQ), (size_t) cdiv(n, kIxN * kIxKT) * 256);
+    strata::q_of(s)->submit([&](sycl::handler& cgh) {
+        // (sa: the queries' rows, 34.8 KB; sb: a key tile's, 17.4 KB)
+        sycl::local_accessor<bf16, 1> sa(sycl::range<1>((size_t) kIxQ * 32 * kIxLd), cgh);
+        sycl::local_accessor<bf16, 1> sb(sycl::range<1>((size_t) kIxN * kIxLd), cgh);
+        cgh.parallel_for(sycl::nd_range<2>(global, local), [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(16)]] {
+            index_score_xmx_kernel<KF>(it, q, w, k, T, n, lim, out, out_stride,
+                                       sa.get_multi_ptr<sycl::access::decorated::no>().get(),
+                                       sb.get_multi_ptr<sycl::access::decorated::no>().get());
+        });
+    });
+}
+#endif
+
+void index_force_xmx(int mode) {   // 1 the XMX kernel, 0 the FMA one, -1 back to the default
+#if defined(STRATA_XMX_SG16)
+    g_ix_force.store(mode);
+#else
+    (void) mode;
+#endif
+}
 void index_score(const float* q, const float* w, const void* k, int heads, int hd, int T, int n, const int* cand,
                  int cand_stride, int blk, const Rows& lim, float* out, long long out_stride, cudaStream_t s,
                  int kfmt) {
@@ -1964,6 +2080,13 @@ void index_score(const float* q, const float* w, const void* k, int heads, int h
         return;
     }
     if (n <= 0) return;
+#if defined(STRATA_XMX_SG16)
+    if (cand == nullptr && heads == 32 && index_xmx_on()) {   // (the scores of every key: the long prompt's quadratic part)
+        if (kfmt == kKvFp4p) launch_index_xmx<kKvFp4p>(q, w, (const uint8_t*) k, T, n, lim, out, out_stride, s);
+        else launch_index_xmx<kKvBf16>(q, w, (const uint8_t*) k, T, n, lim, out, out_stride, s);
+        return;
+    }
+#endif
     const size_t smem = (size_t) (heads * hd + heads) * sizeof(float);
     const dim3 grid(cdiv(n, kThreads), T);
     if (kfmt == kKvFp4p)
@@ -2010,6 +2133,324 @@ static int sm_count() {
     return v;
 }
 
+#if defined(STRATA_XMX_SG16)
+// A prompt chunk's sparse attention on Xe2's matrix engines (gen rows, packed compressed rows): a block a query and 16 of its
+// heads (16 sub-groups of 16), flash style over tiles of 32 rows - S = Q K^T (4 output tiles x 4 quarters of the 512 dims,
+// the quarters summed in SLM), the online softmax by head (the learned sink at the end, as the FMA kernel), O += P V with O's
+// 16 x 512 in the sub-groups' accumulators (sub-group g: heads 8 (g / 8) .. + 8, dims 64 (g % 8) .. + 64).  BF16 operands - the
+// window's and the compressed rows' values are exact in BF16; Q and P are rounded to it - F32 sums: not the FMA kernel's bits.
+// An 8 x 16 F32 accumulator on sub-groups of 16: work item `lane` holds column lane, its element i row i (joint_matrix_apply
+// visits them in order; ds4_xmx_test checks this kernel against the FMA one).  DS4_ATTN_XMX=0 keeps the FMA kernel.
+namespace axm = sycl::ext::oneapi::experimental::matrix;
+constexpr int kAxH = 16, kAxN = 32, kAxLd = 512 + 8;   // heads, rows a tile, a row's pitch in BF16
+void sparse_attn_xmx_kernel(sycl::nd_item<2> it, const float* __restrict__ q, const uint16_t* __restrict__ win,
+                            const uint8_t* __restrict__ ckv, const int* __restrict__ sel, int sel_stride, AttnRows ar,
+                            const float* __restrict__ sink, int heads, float scale, float* __restrict__ out,
+                            sycl::ext::oneapi::bfloat16* sq, sycl::ext::oneapi::bfloat16* sk, sycl::ext::oneapi::bfloat16* sp,
+                            float* ss, float* st) {
+    using bf16 = sycl::ext::oneapi::bfloat16;
+    constexpr int d = 512;
+    const sycl::sub_group sg = it.get_sub_group();
+    const int tid = (int) it.get_local_id(1), sgi = tid >> 4;
+    const int t = (int) it.get_group(0), hb = (int) it.get_group(1) * kAxH;
+    // the query's rows (as sparse_attn_packed_kernel's gen path)
+    const long long ta = ar.t0 + t, pa = ar.p0 + ta;
+    const long long first = sycl::max((long long) ar.win - ar.p0, ta + 1);
+    const int w0 = (int) first, n_win = (int) (ar.win + ta - first + 1);
+    const int n_sel = ar.R > 0 ? (int) sycl::min((long long) ar.kcap, (pa + 1) / ar.R) : 0;
+    const uint16_t* wbase = win + (size_t) w0 * d;
+    const int* sl = sel + (size_t) t * sel_stride;
+    const size_t crow = kv_row_bytes(kKvFp4, d);
+    const int total = n_win + n_sel;
+    for (int i = tid; i < kAxH * d; i += 256) {
+        const int h = i / d, c = i % d;
+        sq[h * kAxLd + c] = bf16(q[((size_t) t * heads + hb + h) * d + c]);
+    }
+    float* m_run = st;            // [16] the running max a head
+    float* den = st + kAxH;       // [16] the running sum
+    float* alpha = st + 2 * kAxH; // [16] this tile's rescale
+    if (tid < kAxH) {
+        m_run[tid] = -1e30f;
+        den[tid] = 0.0f;
+    }
+    const int mb = sgi >> 3, n0 = (sgi & 7) * 64;   // this sub-group's O: heads 8 mb .. + 8, dims n0 .. + 64
+    axm::joint_matrix<sycl::sub_group, float, axm::use::accumulator, 8, 16> acc[4];
+    for (int j = 0; j < 4; ++j) axm::joint_matrix_fill(sg, acc[j], 0.0f);
+    auto lp = [](bf16* p) {
+        return sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(p);
+    };
+    auto lpf = [](float* p) {
+        return sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(p);
+    };
+    for (int t0 = 0; t0 < total; t0 += kAxN) {
+        const int nt = sycl::min(kAxN, total - t0);
+        it.barrier(sycl::access::fence_space::local_space);   // (the tile before is done with sk / sp; sq written, the first time)
+        for (int task = tid; task < kAxN * 16; task += 256) {   // 32 rows x 16 parts of 32 values
+            const int r = task >> 4, part = task & 15, j = t0 + r;
+            uint4* dst = (uint4*) (sk + r * kAxLd + part * 32);
+            if (r >= nt) {
+                dst[0] = dst[1] = dst[2] = dst[3] = make_uint4(0, 0, 0, 0);
+            } else if (j < n_win) {   // a window row: BF16 already
+                const uint4* src = (const uint4*) (wbase + (size_t) j * d + part * 32);
+                dst[0] = src[0], dst[1] = src[1], dst[2] = src[2], dst[3] = src[3];
+            } else
+                unpack32(ckv + (size_t) sl[j - n_win] * crow, part, dst);
+        }
+        it.barrier(sycl::access::fence_space::local_space);
+        {   // S: sub-group g the output tile g % 4 (heads 8 (g % 4 / 2), rows 16 (g % 2)) over the dims' quarter g / 4
+            const int tq = sgi & 3, kq = sgi >> 2, sm = (tq >> 1) * 8, sn = (tq & 1) * 16;
+            axm::joint_matrix<sycl::sub_group, float, axm::use::accumulator, 8, 16> s_acc;
+            axm::joint_matrix_fill(sg, s_acc, 0.0f);
+            for (int kk = kq * 128; kk < kq * 128 + 128; kk += 16) {
+                axm::joint_matrix<sycl::sub_group, bf16, axm::use::a, 8, 16, axm::layout::row_major> fa;
+                axm::joint_matrix<sycl::sub_group, bf16, axm::use::b, 16, 16, axm::layout::col_major> fb;
+                axm::joint_matrix_load(sg, fa, lp(sq + sm * kAxLd + kk), kAxLd);
+                axm::joint_matrix_load(sg, fb, lp(sk + sn * kAxLd + kk), kAxLd);
+                axm::joint_matrix_mad(sg, s_acc, fa, fb, s_acc);
+            }
+            axm::joint_matrix_store(sg, s_acc, lpf(ss + (size_t) kq * kAxH * kAxN + sm * kAxN + sn), kAxN, axm::layout::row_major);
+        }
+        it.barrier(sycl::access::fence_space::local_space);
+        {   // head sgi's online softmax over the tile (the quarters summed): its sub-group, lane j the rows j and j + 16
+            const int h = sgi, lane = tid & 15;
+            const float* row = ss + h * kAxN;
+            float v[2], mx = -INFINITY;
+            for (int u = 0; u < 2; ++u) {
+                const int j = lane + 16 * u;
+                v[u] = j < nt ? (row[j] + row[kAxH * kAxN + j] + row[2 * kAxH * kAxN + j] + row[3 * kAxH * kAxN + j]) * scale
+                              : -INFINITY;
+                mx = sycl::fmax(mx, v[u]);
+            }
+            mx = sycl::reduce_over_group(sg, mx, sycl::maximum<float>());
+            const float m_old = m_run[h], m_new = sycl::fmax(m_old, mx), a = sycl::exp(m_old - m_new);
+            float sum = 0.0f;
+            for (int u = 0; u < 2; ++u) {
+                const int j = lane + 16 * u;
+                const float pj = j < nt ? sycl::exp(v[u] - m_new) : 0.0f;
+                sum += pj;
+                sp[h * (kAxN + 8) + j] = bf16(pj);
+            }
+            sum = sycl::reduce_over_group(sg, sum, sycl::plus<float>());
+            if (lane == 0) {
+                den[h] = den[h] * a + sum;
+                m_run[h] = m_new;
+                alpha[h] = a;
+            }
+        }
+        it.barrier(sycl::access::fence_space::local_space);
+        for (int j = 0; j < 4; ++j) {   // O's rows rescaled by their head's alpha, then O += P V
+            int i = 0;
+            axm::joint_matrix_apply(sg, acc[j], [&](float& x) {
+                x *= alpha[mb * 8 + i];
+                ++i;
+            });
+        }
+        for (int kk = 0; kk < kAxN; kk += 16) {
+            axm::joint_matrix<sycl::sub_group, bf16, axm::use::a, 8, 16, axm::layout::row_major> fa;
+            axm::joint_matrix_load(sg, fa, lp(sp + mb * 8 * (kAxN + 8) + kk), kAxN + 8);
+            for (int j = 0; j < 4; ++j) {
+                axm::joint_matrix<sycl::sub_group, bf16, axm::use::b, 16, 16, axm::layout::row_major> fb;
+                axm::joint_matrix_load(sg, fb, lp(sk + kk * kAxLd + n0 + 16 * j), kAxLd);
+                axm::joint_matrix_mad(sg, acc[j], fa, fb, acc[j]);
+            }
+        }
+    }
+    it.barrier(sycl::access::fence_space::local_space);
+    if (tid < kAxH) alpha[tid] = 1.0f / (den[tid] + sycl::exp(sink[hb + tid] - m_run[tid]));
+    it.barrier(sycl::access::fence_space::local_space);
+    for (int j = 0; j < 4; ++j) {
+        int i = 0;
+        axm::joint_matrix_apply(sg, acc[j], [&](float& x) {
+            x *= alpha[mb * 8 + i];
+            ++i;
+        });
+        float* o = out + ((size_t) t * heads + hb + mb * 8) * d + n0 + 16 * j;
+        axm::joint_matrix_store(sg, acc[j], sycl::address_space_cast<sycl::access::address_space::global_space,
+                                                                     sycl::access::decorated::no>(o),
+                                d, axm::layout::row_major);
+    }
+}
+// The same for all 64 heads of a query in one block of 512 work items (32 sub-groups; the B70 gives a work-group 128 KB of SLM):
+// each row is unpacked once a query, not once a 16 heads.  S: 16 output tiles (heads 8 (g % 16 / 2), rows 16 (g % 2)) over the
+// dims' halves g / 16, summed in SLM; O: sub-group g heads 8 (g / 4) .. + 8, dims 128 (g % 4) .. + 128 (8 accumulators).
+constexpr int kAx64H = 64;
+void sparse_attn_xmx64_kernel(sycl::nd_item<2> it, const float* __restrict__ q, const uint16_t* __restrict__ win,
+                              const uint8_t* __restrict__ ckv, const int* __restrict__ sel, int sel_stride, AttnRows ar,
+                              const float* __restrict__ sink, float scale, float* __restrict__ out,
+                              sycl::ext::oneapi::bfloat16* sq, sycl::ext::oneapi::bfloat16* sk, sycl::ext::oneapi::bfloat16* sp,
+                              float* ss, float* st) {
+    using bf16 = sycl::ext::oneapi::bfloat16;
+    constexpr int d = 512, H = kAx64H, NT = 512;
+    const sycl::sub_group sg = it.get_sub_group();
+    const int tid = (int) it.get_local_id(1), sgi = tid >> 4;
+    const int t = (int) it.get_group(0);
+    const long long ta = ar.t0 + t, pa = ar.p0 + ta;
+    const long long first = sycl::max((long long) ar.win - ar.p0, ta + 1);
+    const int w0 = (int) first, n_win = (int) (ar.win + ta - first + 1);
+    const int n_sel = ar.R > 0 ? (int) sycl::min((long long) ar.kcap, (pa + 1) / ar.R) : 0;
+    const uint16_t* wbase = win + (size_t) w0 * d;
+    const int* sl = sel + (size_t) t * sel_stride;
+    const size_t crow = kv_row_bytes(kKvFp4, d);
+    const int total = n_win + n_sel;
+    for (int i = tid; i < H * d; i += NT) sq[(i / d) * kAxLd + i % d] = bf16(q[(size_t) t * H * d + i]);
+    float* m_run = st;
+    float* den = st + H;
+    float* alpha = st + 2 * H;
+    if (tid < H) {
+        m_run[tid] = -1e30f;
+        den[tid] = 0.0f;
+    }
+    const int mb = sgi >> 2, n0 = (sgi & 3) * 128;
+    axm::joint_matrix<sycl::sub_group, float, axm::use::accumulator, 8, 16> acc[8];
+    for (int j = 0; j < 8; ++j) axm::joint_matrix_fill(sg, acc[j], 0.0f);
+    auto lp = [](bf16* p) {
+        return sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(p);
+    };
+    auto lpf = [](float* p) {
+        return sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(p);
+    };
+    for (int t0 = 0; t0 < total; t0 += kAxN) {
+        const int nt = sycl::min(kAxN, total - t0);
+        it.barrier(sycl::access::fence_space::local_space);
+        {   // 32 rows x 16 parts of 32 values: one task a work item
+            const int r = tid >> 4, part = tid & 15, j = t0 + r;
+            uint4* dst = (uint4*) (sk + r * kAxLd + part * 32);
+            if (r >= nt) dst[0] = dst[1] = dst[2] = dst[3] = make_uint4(0, 0, 0, 0);
+            else if (j < n_win) {
+                const uint4* src = (const uint4*) (wbase + (size_t) j * d + part * 32);
+                dst[0] = src[0], dst[1] = src[1], dst[2] = src[2], dst[3] = src[3];
+            } else
+                unpack32(ckv + (size_t) sl[j - n_win] * crow, part, dst);
+        }
+        it.barrier(sycl::access::fence_space::local_space);
+        {
+            const int tq = sgi & 15, kh = sgi >> 4, sm = (tq >> 1) * 8, sn = (tq & 1) * 16;
+            axm::joint_matrix<sycl::sub_group, float, axm::use::accumulator, 8, 16> s_acc;
+            axm::joint_matrix_fill(sg, s_acc, 0.0f);
+            for (int kk = kh * 256; kk < kh * 256 + 256; kk += 16) {
+                axm::joint_matrix<sycl::sub_group, bf16, axm::use::a, 8, 16, axm::layout::row_major> fa;
+                axm::joint_matrix<sycl::sub_group, bf16, axm::use::b, 16, 16, axm::layout::col_major> fb;
+                axm::joint_matrix_load(sg, fa, lp(sq + sm * kAxLd + kk), kAxLd);
+                axm::joint_matrix_load(sg, fb, lp(sk + sn * kAxLd + kk), kAxLd);
+                axm::joint_matrix_mad(sg, s_acc, fa, fb, s_acc);
+            }
+            axm::joint_matrix_store(sg, s_acc, lpf(ss + (size_t) kh * H * kAxN + sm * kAxN + sn), kAxN, axm::layout::row_major);
+        }
+        it.barrier(sycl::access::fence_space::local_space);
+        for (int hh = 0; hh < 2; ++hh) {   // heads sgi and sgi + 32: a sub-group each in turn, lane j the rows j and j + 16
+            const int h = sgi + 32 * hh, lane = tid & 15;
+            const float* row = ss + h * kAxN;
+            float v[2], mx = -INFINITY;
+            for (int u = 0; u < 2; ++u) {
+                const int j = lane + 16 * u;
+                v[u] = j < nt ? (row[j] + row[H * kAxN + j]) * scale : -INFINITY;
+                mx = sycl::fmax(mx, v[u]);
+            }
+            mx = sycl::reduce_over_group(sg, mx, sycl::maximum<float>());
+            const float m_old = m_run[h], m_new = sycl::fmax(m_old, mx), a = sycl::exp(m_old - m_new);
+            float sum = 0.0f;
+            for (int u = 0; u < 2; ++u) {
+                const int j = lane + 16 * u;
+                const float pj = j < nt ? sycl::exp(v[u] - m_new) : 0.0f;
+                sum += pj;
+                sp[h * (kAxN + 8) + j] = bf16(pj);
+            }
+            sum = sycl::reduce_over_group(sg, sum, sycl::plus<float>());
+            if (lane == 0) {
+                den[h] = den[h] * a + sum;
+                m_run[h] = m_new;
+                alpha[h] = a;
+            }
+        }
+        it.barrier(sycl::access::fence_space::local_space);
+        for (int j = 0; j < 8; ++j) {
+            int i = 0;
+            axm::joint_matrix_apply(sg, acc[j], [&](float& x) {
+                x *= alpha[mb * 8 + i];
+                ++i;
+            });
+        }
+        for (int kk = 0; kk < kAxN; kk += 16) {
+            axm::joint_matrix<sycl::sub_group, bf16, axm::use::a, 8, 16, axm::layout::row_major> fa;
+            axm::joint_matrix_load(sg, fa, lp(sp + mb * 8 * (kAxN + 8) + kk), kAxN + 8);
+            for (int j = 0; j < 8; ++j) {
+                axm::joint_matrix<sycl::sub_group, bf16, axm::use::b, 16, 16, axm::layout::row_major> fb;
+                axm::joint_matrix_load(sg, fb, lp(sk + kk * kAxLd + n0 + 16 * j), kAxLd);
+                axm::joint_matrix_mad(sg, acc[j], fa, fb, acc[j]);
+            }
+        }
+    }
+    it.barrier(sycl::access::fence_space::local_space);
+    if (tid < H) alpha[tid] = 1.0f / (den[tid] + sycl::exp(sink[tid] - m_run[tid]));
+    it.barrier(sycl::access::fence_space::local_space);
+    for (int j = 0; j < 8; ++j) {
+        int i = 0;
+        axm::joint_matrix_apply(sg, acc[j], [&](float& x) {
+            x *= alpha[mb * 8 + i];
+            ++i;
+        });
+        float* o = out + ((size_t) t * H + mb * 8) * d + n0 + 16 * j;
+        axm::joint_matrix_store(sg, acc[j], sycl::address_space_cast<sycl::access::address_space::global_space,
+                                                                     sycl::access::decorated::no>(o),
+                                d, axm::layout::row_major);
+    }
+}
+static std::atomic<int> g_attn_force{-1};   // (attn_force_xmx: tests)
+static bool attn_xmx_on() {
+    const int f = g_attn_force.load(std::memory_order_relaxed);
+    if (f >= 0) return f == 1;
+    static const bool on = !(std::getenv("DS4_ATTN_XMX") != nullptr && std::atoi(std::getenv("DS4_ATTN_XMX")) == 0);
+    return on;
+}
+static void launch_attn_xmx(const float* q, const uint16_t* win, const uint8_t* ckv, const int* sel, int sel_stride,
+                            const AttnRows& a, const float* sink, int heads, int T, float scale, float* out, cudaStream_t s) {
+    using bf16 = sycl::ext::oneapi::bfloat16;
+    static const bool h64 = std::getenv("DS4_ATTN_XMX64") != nullptr && std::atoi(std::getenv("DS4_ATTN_XMX64")) != 0;   // (opt-in: 16 heads a block measured faster)
+    if (heads == kAx64H && h64) {   // (every head of a query in one block: its rows unpacked once)
+        strata::q_of(s)->submit([&](sycl::handler& cgh) {
+            sycl::local_accessor<bf16, 1> sq(sycl::range<1>((size_t) kAx64H * kAxLd), cgh);   // 66.6 KB
+            sycl::local_accessor<bf16, 1> sk(sycl::range<1>((size_t) kAxN * kAxLd), cgh);     // 33.3 KB
+            sycl::local_accessor<bf16, 1> sp(sycl::range<1>((size_t) kAx64H * (kAxN + 8)), cgh);
+            sycl::local_accessor<float, 1> ss(sycl::range<1>((size_t) 2 * kAx64H * kAxN), cgh);   // 16 KB
+            sycl::local_accessor<float, 1> st(sycl::range<1>((size_t) 3 * kAx64H), cgh);
+            cgh.parallel_for(sycl::nd_range<2>(sycl::range<2>((size_t) T, 512), sycl::range<2>(1, 512)),
+                             [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(16)]] {
+                sparse_attn_xmx64_kernel(it, q, win, ckv, sel, sel_stride, a, sink, scale, out,
+                                         sq.get_multi_ptr<sycl::access::decorated::no>().get(),
+                                         sk.get_multi_ptr<sycl::access::decorated::no>().get(),
+                                         sp.get_multi_ptr<sycl::access::decorated::no>().get(),
+                                         ss.get_multi_ptr<sycl::access::decorated::no>().get(),
+                                         st.get_multi_ptr<sycl::access::decorated::no>().get());
+            });
+        });
+        return;
+    }
+    const sycl::range<2> local(1, 256), global((size_t) T, (size_t) (heads / kAxH) * 256);
+    strata::q_of(s)->submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<bf16, 1> sq(sycl::range<1>((size_t) kAxH * kAxLd), cgh);    // 16.6 KB
+        sycl::local_accessor<bf16, 1> sk(sycl::range<1>((size_t) kAxN * kAxLd), cgh);    // 33.3 KB
+        sycl::local_accessor<bf16, 1> sp(sycl::range<1>((size_t) kAxH * (kAxN + 8)), cgh);
+        sycl::local_accessor<float, 1> ss(sycl::range<1>((size_t) 4 * kAxH * kAxN), cgh);  // 8 KB
+        sycl::local_accessor<float, 1> st(sycl::range<1>((size_t) 3 * kAxH), cgh);
+        cgh.parallel_for(sycl::nd_range<2>(global, local), [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(16)]] {
+            sparse_attn_xmx_kernel(it, q, win, ckv, sel, sel_stride, a, sink, heads, scale, out,
+                                   sq.get_multi_ptr<sycl::access::decorated::no>().get(),
+                                   sk.get_multi_ptr<sycl::access::decorated::no>().get(),
+                                   sp.get_multi_ptr<sycl::access::decorated::no>().get(),
+                                   ss.get_multi_ptr<sycl::access::decorated::no>().get(),
+                                   st.get_multi_ptr<sycl::access::decorated::no>().get());
+        });
+    });
+}
+#endif
+void attn_force_xmx(int mode) {   // 1 the XMX kernel for a chunk's packed rows, 0 the FMA one, -1 back to the default
+#if defined(STRATA_XMX_SG16)
+    g_attn_force.store(mode);
+#else
+    (void) mode;
+#endif
+}
+
 void sparse_attn(const float* q, const uint16_t* win, const void* ckv, const int* sel, int sel_stride,
                  const AttnRows& a, const float* sink, int heads, int d, int T, float scale, float* out, cudaStream_t s,
                  int ckv_fmt, int heads_per_block, const AttnScratch* scr) {
@@ -2022,6 +2463,12 @@ void sparse_attn(const float* q, const uint16_t* win, const void* ckv, const int
                       sink, heads, d, scale, out);
         return;
     }
+#if defined(STRATA_XMX_SG16)
+    if (ckv_fmt == kKvFp4 && a.gen && heads % kAxH == 0 && attn_xmx_on()) {   // (a prompt chunk's rows)
+        launch_attn_xmx(q, win, (const uint8_t*) ckv, sel, sel_stride, a, sink, heads, T, scale, out, s);
+        return;
+    }
+#endif
     // a decode step / short verify window of packed rows: the split-KV kernel (Strata's CUDA lab, ds4_attn_split.cuh; 2.9x at
     // one query on an A4000).  The same inputs; the merge sums the chunks in another order, so the bits differ in the last
     // place (4e-7 against a double reference).  DS4_ATTN_SPLIT=1 turns it on (off by default: no measurable decode gain on the R9700 box, the decode is bound elsewhere).
