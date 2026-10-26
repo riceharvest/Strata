@@ -62,6 +62,11 @@ docker) ctr=(docker); extra=() ;;
 podman) ctr=(podman); extra=(--security-opt label=disable) ;;
 *) echo "strata-sycl.sh: STRATA_SYCL_RUNNER is docker, podman, native or distrobox:<name>" >&2; exit 2 ;;
 esac
+# the engine pins the RAM the GPU copies from through io_uring (ds4_sycl.hpp ds4_host_pin), which the runtimes' default
+# seccomp profiles refuse: their default profile (moby's) plus io_uring_setup / _enter / _register.  STRATA_SYCL_SECCOMP= (empty):
+# the runtime's own profile (the engine warns, and runs unpinned)
+seccomp=${STRATA_SYCL_SECCOMP-"$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/seccomp-io_uring.json"}
+[ -n "$seccomp" ] && [ -f "$seccomp" ] && extra+=(--security-opt "seccomp=$seccomp")
 "${ctr[@]}" rm -f "$name" >/dev/null 2>&1 || true        # a container left behind by a killed server
 exec "${ctr[@]}" run --rm -i --name "$name" --device /dev/dri --oom-score-adj 1000 --stop-timeout 30 --no-healthcheck \
     --ulimit memlock=-1 "${extra[@]}" \

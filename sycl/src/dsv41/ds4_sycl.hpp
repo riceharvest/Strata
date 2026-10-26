@@ -20,7 +20,12 @@
 #include <exception>
 #include <execinfo.h>
 #if defined(__linux__)
+#include <linux/io_uring.h>
 #include <sys/mman.h>
+#include <sys/syscall.h>
+#include <sys/uio.h>
+#include <unistd.h>
+#include <cerrno>
 #endif
 #include <chrono>
 #include <cmath>
@@ -715,29 +720,71 @@ inline cudaError_t cudaHostUnregister(void* p) {
 // (no CUDA name) A host range imported into the driver for device copies - sycl_ext_oneapi_copy_optimize, Level Zero's external
 // pointer import: a copy from it is a DMA as from USM host memory, where cudaHostRegister above is bookkeeping only (it is what
 // the model files' mappings get - 100+ GB the import would pin).  For the RAM store's arena chunks (2 GB each).
+// The import does not pin: xe maps the range as a userptr that follows the CPU's page tables, and when the kernel migrates a
+// page under a running copy (compaction, khugepaged) the copy engine faults (CAT error, -EBUSY / -ENOENT: DEVICE_LOST).  So the
+// range is pinned long-term first, as cudaHostRegister pins on CUDA: registered as io_uring fixed buffers (FOLL_LONGTERM), its
+// pages cannot move while the ring's file is open.  A stress test (copies from an imported 8 GB range while another process
+// made the kernel compact, 1-2 M pages migrated): import alone DEVICE_LOST, pinned none.  Needs RLIMIT_MEMLOCK for the range
+// (docker --ulimit memlock=-1) and io_uring allowed (seccomp); else a warning and the range unpinned, as before.  DS4_PIN=0: off
+inline int ds4_host_pin(void* p, size_t n) {
+#if defined(__linux__)
+    if (std::getenv("DS4_PIN") != nullptr && std::atoi(std::getenv("DS4_PIN")) == 0) return -1;
+    io_uring_params prm{};
+    const int fd = (int) syscall(__NR_io_uring_setup, 1, &prm);
+    int err = fd < 0 ? errno : 0;
+    if (fd >= 0) {
+        std::vector<iovec> iov;
+        const size_t piece = (size_t) 1 << 30;   // (a fixed buffer is at most 1 GB)
+        for (size_t o = 0; o < n; o += piece) iov.push_back({(char*) p + o, std::min(piece, n - o)});
+        if (syscall(__NR_io_uring_register, fd, IORING_REGISTER_BUFFERS, iov.data(), (unsigned) iov.size()) == 0) return fd;
+        err = errno;
+        ::close(fd);
+    }
+    static std::atomic<bool> told{false};
+    if (!told.exchange(true))
+        std::fprintf(stderr, "ds4: WARNING: the device-copied RAM could not be pinned (io_uring: %s) - a page the kernel moves under a "
+                             "copy can stop the GPU (DEVICE_LOST); give the container --ulimit memlock=-1 and io_uring\n",
+                     std::strerror(err));
+    return -1;
+#else
+    (void) p, (void) n;
+    return -1;
+#endif
+}
+inline std::map<const char*, int>& ds4_host_pins() {
+    static std::map<const char*, int> m;
+    return m;
+}
 inline bool ds4_host_import(void* p, size_t n) {
 #if defined(__linux__)
     if (!(std::getenv("DS4_THP") != nullptr && std::atoi(std::getenv("DS4_THP")) != 0)) madvise(p, n, MADV_NOHUGEPAGE);   // (ds4_os.hpp thp_on)
 #endif
+    const int pin = ds4_host_pin(p, n);
     try {
         sycl::ext::oneapi::experimental::prepare_for_device_copy(p, n, dpct::get_in_order_queue().get_context());
     } catch (const sycl::exception&) {
+        if (pin >= 0) ::close(pin);
         return false;
     }
     std::lock_guard<std::mutex> lk(ds4_shim::st().mu);
     ds4_shim::st().registered[(const char*) p] = n;
+    if (pin >= 0) ds4_host_pins()[(const char*) p] = pin;
     return true;
 }
 inline void ds4_host_unimport(void* p) {
+    int pin = -1;
     {
         std::lock_guard<std::mutex> lk(ds4_shim::st().mu);
         if (ds4_shim::st().registered.erase((const char*) p) == 0) return;
+        auto it = ds4_host_pins().find((const char*) p);
+        if (it != ds4_host_pins().end()) pin = it->second, ds4_host_pins().erase(it);
     }
     ds4_shim::wait_queues(true);   // (no copy still reads it)
     try {
         sycl::ext::oneapi::experimental::release_from_device_copy(p, dpct::get_in_order_queue().get_context());
     } catch (const sycl::exception&) {
     }
+    if (pin >= 0) ::close(pin);   // (the pages movable again: after the release)
 }
 
 enum cudaMemcpyKind {
