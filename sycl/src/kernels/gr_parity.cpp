@@ -686,7 +686,9 @@ int fused_multi_lds_parity(const float* d_norm, const uint16_t* d_down, const ui
     // Fresh random inputs every repetition, 200 repetitions for each T = 2..8 (a race that fires one launch in a hundred
     // shows), direct and as a graph replay. After every repetition: both groups' q8_1 bytes equal what
     // native_quantize_q8_1 makes of `mixed`, nothing outside the written ranges changed, and the counters are back at zero.
-    if (!v3) {
+    // SYCL port: STRATA_QFUSE is not built (the caller quantizes, see the single-group check above): nothing to test
+    std::printf("  fused GR read + q8_1 (STRATA_QFUSE), a window of two groups: skipped (not built in the SYCL port)\n");
+    if (false && !v3) {
         // (STRATA_GRP_REPS=N more repetitions, STRATA_GRP_KEEP_GOING=1 counts every failure instead of stopping at the first: to measure a rare one)
         const int REPS = std::getenv("STRATA_GRP_REPS") ? std::max(1, std::atoi(std::getenv("STRATA_GRP_REPS"))) : 200;
         const bool keep_going = std::getenv("STRATA_GRP_KEEP_GOING") != nullptr;

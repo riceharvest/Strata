@@ -1551,7 +1551,11 @@ __dpct_inline__ void gdn_chunk_prep_kernel(const float *__restrict__ h,
 DPCT1053: Migration of device assembly code is not supported.
 */
 __dpct_inline__ void gdn_pf_l2(const float *p) {
+#if defined(__SYCL_DEVICE_ONLY__) && defined(__NVPTX__)
     asm volatile("prefetch.global.L2 [%0];" ::"l"(p));
+#else
+    (void) p;   // SYCL port: no L2 prefetch instruction on Xe (the AOT backend rejects the PTX)
+#endif
 }
 __dpct_inline__ void gdn_cp_wait_all() {
 #if STRATA_GDN_CP_ASYNC
@@ -3853,9 +3857,10 @@ static void gdn_recurrence_impl(int variant, float* state, const float* h, const
     } else {
         static const bool pipe = [] { const char* v = std::getenv("STRATA_GDN_PIPELINE"); return v == nullptr || std::atoi(v) != 0; }();
 #if !defined(__HIPCC__)
-        // STRATA_GDN_CHUNKED=1 (opt-in): the recurrence in chunks for prompt chunks of kGdnChunkedMin+ tokens (other
-        // bits; a shorter chunk, a card it does not fit or a failed scratch allocation takes the kernels below)
-        static const bool chunked = [] { const char* v = std::getenv("STRATA_GDN_CHUNKED"); return v != nullptr && std::atoi(v) != 0; }();
+        // STRATA_GDN_CHUNKED=1 (opt-in upstream): the recurrence in chunks for prompt chunks of kGdnChunkedMin+ tokens.
+        // SYCL port: off - the migrated scan assumes 32-lane warps per token and was never checked on Xe (the default
+        // here is the sub-group recurrence above, gdn_xe_launch).
+        static const bool chunked = false;
 #endif
         if (xe) {
             detail::gdn_xe_launch(*strata::q_of(stream), state, h, gate, beta, y, T);

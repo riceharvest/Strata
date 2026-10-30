@@ -202,7 +202,9 @@ inline int64_t select_long_at() {
 }
 // 143-amdk: STRATA_QFUSE_HC - only the hyper-connection read writes its consumer's q8_1 image (not the GDN recurrence): gfx12 default (=0 / 1 forces off / on)
 inline bool g_qfuse_hc() {
-#if defined(STRATA_USE_HIP)
+#if defined(SYCL_LANGUAGE_VERSION)
+    return false;   // SYCL port: STRATA_QFUSE_HC is not built either
+#elif defined(STRATA_USE_HIP)
     static const bool on = [] {
         const char* v = std::getenv("STRATA_QFUSE_HC");
         if (v != nullptr) return std::atoi(v) != 0;
@@ -282,7 +284,9 @@ inline float g_route_prior() {
     static const float lambda = strata::route_prior_resolve(env_s, false, false, 0.0);
     return lambda;
 }
-inline bool g_qfuse() { static const bool on = [] { const char* v = std::getenv("STRATA_QFUSE"); return v != nullptr && std::atoi(v) != 0; }(); return on; }
+// SYCL port: STRATA_QFUSE is not built (fused_gr / gdn_step_norm_multi write no q8_1 image here): always off, the
+// consumers quantize their own inputs.
+inline bool g_qfuse() { return false; }
 #define VDBG(...) do { if (g_dbg) { std::fprintf(stderr, "verify dbg: " __VA_ARGS__); std::fflush(stderr); } } while (0)
 
 struct Bump {

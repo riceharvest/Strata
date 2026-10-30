@@ -917,7 +917,7 @@ int main(int argc, char** argv) {
                 // #3948 (STRATA_QFUSE): the same call with a q8_1 destination also writes the outputs' q8_1 image, row t - tb
                 // at (t - tb) * value_dim: the bytes native_quantize_q8_1 makes of y rows [tb, n), the outputs and the state
                 // unchanged by asking for it, and nothing written past those rows (the engine's second group has tb > 0)
-                if (c.tb < n) {
+                if (false && c.tb < n) {   // SYCL port: STRATA_QFUSE is not built, the q8_1 destination is never asked for
                     if (std::getenv("STRATA_GDN_PARITY_TRACE")) std::printf("    trace: T=%d '%s' with a q8_1 destination\n", T, c.name);
                     const size_t qb = (size_t) (vd / 32) * 36, rows = (size_t) (n - c.tb);
                     void *d_q = dev((size_t) T * qb), *d_qr = dev((size_t) T * qb);

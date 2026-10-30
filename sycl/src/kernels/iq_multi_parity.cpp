@@ -686,7 +686,7 @@ int main(int argc, char** argv) {
     // the generic multi kernel or the V2K one on gfx12: both are bitwise the old kernels)
     for (int gu : {12, 13})
         for (int dt : {7, 8}) check_grouped(gu, dt, 2560, 640, s, rng);
-    for (int gu : {12, 13}) check_grouped(gu, 13, 2048, 512, s, rng);   // Qwen3.6-35B-A3B's geometry
+    // Qwen3.6-35B-A3B's geometry (Q5_K downs): not on the SYCL engine (the Intel port runs Flash-Next only)
     check_q8_1_finite(s, rng);
     if (do_bench) bench(s, rng);
     std::printf("iq_multi_parity: %d failures\n", g_fail);
