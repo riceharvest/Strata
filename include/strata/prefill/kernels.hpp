@@ -25,8 +25,9 @@ void gr_mix_r(const float* R, const float* rs, const float* w_norm, const float*
               int64_t T, void* stream, uint16_t* mixed_h = nullptr, uint16_t* mixed16_lo = nullptr);
 /// F-2: gr_write, then gr_norm_rs of the next half (its norm weights) over the rows just written - the same bits as
 /// the two calls, without reading R back.
-/// S23 (opt-in STRATA_HC_UPMIX=1): the up projection (lo16 x w_up^T, BF16, FP32 accumulate) with gr_mix_r as its
-/// epilogue - `gated` is never written.  gfx11 and CUDA sm_80+; false (nothing launched) elsewhere.
+/// S23 (opt-in STRATA_HC_UPMIX=1; on by default on Battlemage): the up projection (lo16 x w_up^T, BF16, FP32
+/// accumulate) with gr_mix_r as its epilogue - `gated` is never written.  gfx11, CUDA sm_80+ and Battlemage (XMX);
+/// false (nothing launched) elsewhere.
 bool gr_upmix(const uint16_t* lo16, const uint16_t* w_up, const float* R, const float* rs, const float* w_norm,
               float* mixed, uint16_t* mixed16, uint16_t* mixed_h, int64_t T, void* stream);
 void gr_write_norm_rs(float* R, const float* bo, const float* inj, int64_t inj_ld, const float* w_norm_next, float eps,
@@ -38,8 +39,8 @@ void gr_write_norm_rs(float* R, const float* bo, const float* inj, int64_t inj_l
 void gr_write_cvec_norm_rs(float* R, const float* bo, const float* inj, int64_t inj_ld, const float* v_l,
                            const float* s_l, const int* on, int mode, const float* w_norm_next, float eps, float* rs,
                            uint16_t* xn16, int64_t T, void* stream, uint16_t* xn16_lo = nullptr, int64_t ldx = 0, bool f16img = false);
-/// lo16[t, k] = bf16(silu(lo[t, k] / hc))
-void gr_silu(const float* lo, uint16_t* lo16, int64_t T, void* stream, uint16_t* lo16_lo = nullptr);
+/// lo16[t, k] = bf16(silu(lo[t, k] / hc))   (lo's row stride ld: 0 = 320)
+void gr_silu(const float* lo, uint16_t* lo16, int64_t T, void* stream, uint16_t* lo16_lo = nullptr, int64_t ld = 0);
 /// The BF16-weight GEMMs' activation image (gr_* kernels, to_bf16) in FP16 instead of BF16, on the current device.
 void set_act_f16(bool on);
 /// STRATA_F16_RANGE: count what the activation images convert to FP16 on this device (hf_sat): the largest |value| and
@@ -72,6 +73,9 @@ void gdn_recurrence(float* state, const float* h, const float* gate, const float
 /// chunked WMMA recurrence instead (gfx11, STRATA_GDN_CHUNKED=1, 64 tokens and more: other bits, see docs/AMD_HIP.md).
 /// SYCL only: 6 = the Xe sub-group recurrence (16-lane sub-groups, one barrier per token) + the norm kernel, the same
 /// bits as 0 on an Arc A770; gdn_recurrence takes it by default on Alchemist (STRATA_GDN_XE=0 off, =1 any Intel GPU).
+/// SYCL only: 7 = the register-resident Xe recurrence (a sub-group per 16 columns x one row group, one barrier per
+/// token) + a grid-stride norm, the same bits as 0 on the B70; gdn_recurrence takes it by default on Battlemage
+/// (STRATA_GDN_REG=0 off, =1 any Intel GPU).
 void gdn_recurrence_variant(int variant, float* state, const float* h, const float* gate, const float* beta,
                             const float* z, const float* gamma, float eps, float* y, uint16_t* y16, int64_t T,
                             void* stream, int64_t ld16 = 0);

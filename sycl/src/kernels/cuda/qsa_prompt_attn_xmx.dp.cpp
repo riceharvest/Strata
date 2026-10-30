@@ -366,9 +366,11 @@ bool dispatch(const float* q, const QsaAttnPools& pools, const int32_t* ids, con
 
 bool qsa_prompt_attn_xmx(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps, int64_t cap,
                          const QsaShapes& s, float* attn, int64_t n_q, void* stream) {
-    // STRATA_PROMPT_ATTN_XMX=1 (64-cell chunks) or =32 (32-cell chunks); unset or 0: the caller's fallback
-    static const int mode = [] { const char* v = std::getenv("STRATA_PROMPT_ATTN_XMX"); return v ? std::atoi(v) : 0; }();
+    // STRATA_PROMPT_ATTN_XMX unset or =3: v3 (qsa_prompt_attn_esimd.dp.cpp; INT8 KV, other pools take the caller's fallback);
+    // =1 (64-cell chunks) or =32 (32-cell chunks): v2 below; =0: the caller's fallback
+    static const int mode = [] { const char* v = std::getenv("STRATA_PROMPT_ATTN_XMX"); return v ? std::atoi(v) : 3; }();
     if (mode == 0 || n_q <= 0) return false;
+    if (mode == 3) return qsa_prompt_attn_esimd(q, pools, ids, steps, cap, s, attn, n_q, stream);
     if (pools.k_q4 != nullptr || s.head_dim != HD || s.n_head != (int64_t) G * s.n_head_kv || cap <= 0 || !ids || !steps ||
         !pools.page_table)
         return false;

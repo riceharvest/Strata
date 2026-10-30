@@ -121,6 +121,10 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16, 2
     std::vector<int32_t> table(pages);
     for (int64_t i = 0; i < pages; ++i) table[i] = (int32_t) i;
     std::shuffle(table.begin(), table.end(), rng);
+    // QA_HOLES=n: every n-th page is not resident (-1, as KV streaming leaves a block it could not load): its cells are
+    // masked (weight 0) in every kernel and in the FP64 reference
+    if (const char* ho = std::getenv("QA_HOLES"))
+        for (int64_t i = std::atoi(ho) / 2; std::atoi(ho) > 0 && i < pages; i += std::atoi(ho)) table[i] = -1;
     // queries at positions ctx - nq .. ctx - 1
     const int64_t cap = k::qsa_selection_width(ctx, s);
     std::vector<int32_t> ids((size_t) (nq * cap), 0), steps((size_t) (nq * k::kStepCount), 0);
@@ -253,7 +257,7 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16, 2
             k::qsa_prompt_attn_percell(d_q + t0 * NH * HD, pl, d_ids + t0 * cap, d_steps + t0 * k::kStepCount, cap, s,
                                        scratch, d_pc + t0 * NH * HD, std::min(batch, nq - t0), nullptr);
     };
-    bool refused = false;   // SYCL port: the XMX kernel takes int8 and FP16 pools; the per-cell check runs anyway
+    bool refused = false;   // SYCL port: the XMX kernel v3 takes int8 pools (v2: int8 and FP16); the per-cell check runs anyway
     auto new_run = [&]() {
         if (!k::qsa_prompt_attn_batch(d_q, pl, d_ids, d_steps, cap, s, d_new, nq, nullptr)) {
             if (!refused) std::fprintf(stderr, "qsa_prompt_attn_batch refused the pools: per-cell check only\n");
@@ -292,6 +296,7 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16, 2
             double mx = -1e300;
             for (int64_t c = 0; c < w; ++c) {
                 const int64_t cell = sel[c], row = ((int64_t) table[cell / PS] * NKV + kvh) * PS + cell % PS;
+                if (table[cell / PS] < 0) { sco[c] = -1e300; continue; }   // QA_HOLES: masked
                 double a = 0;
                 for (int64_t d = 0; d < HD; ++d) {
                     const double kv = fmt == 2 ? q4v(k4, row, d)
@@ -307,6 +312,7 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16, 2
                 double a = 0;
                 for (int64_t c = 0; c < w; ++c) {
                     const int64_t cell = sel[c], row = ((int64_t) table[cell / PS] * NKV + kvh) * PS + cell % PS;
+                    if (table[cell / PS] < 0) continue;
                     const double vv = fmt == 2 ? q4v(v4, row, d)
                                       : fmt == 1 ? (double) vq[row * HD + d] * h2f(vs[row * 4 + d / 64]) : h2f(vh[row * HD + d]);
                     a += sco[c] * vv;
@@ -393,7 +399,7 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16, 2
 }  // namespace
 
 int main(int argc, char** argv) {
-    setenv("STRATA_PROMPT_ATTN_XMX", "1", 0);   // SYCL port: the batched kernel under test is the XMX one (opt-in in the engine)
+    setenv("STRATA_PROMPT_ATTN_XMX", "3", 0);   // SYCL port: the batched kernel under test is the XMX one (v3; =1: v2)
 #if defined(__HIP_PLATFORM_AMD__)
     // S6: on AMD the kernel under test is the RDNA4 matrix-core one (opt-in in the engine); other cards skip
     {

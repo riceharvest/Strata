@@ -727,7 +727,7 @@ All are environment variables for the engine. Put them in the config's `"env"` b
 | `STRATA_ATTN_RS` | 2 | QSA prompt attention probability layout (bit-exact variants) |
 | `STRATA_IQ3S_WIDE=1` | Off | Wide kernel for dense IQ3_S matrices: neutral on one B70 (decode -0.3%), the author reports gains on two cards |
 | `STRATA_EXPERT_SPLIT=1` | Off | Upstream's i-quant multi kernels (-11 to -16% decode here) |
-| `STRATA_PROMPT_ATTN_XMX=1` | Off | joint_matrix prompt attention (-24% to -27% prompt on the B70) |
+| `STRATA_PROMPT_ATTN_XMX` | 3 (int8 KV, Battlemage) | 3: ESIMD prompt attention, the kernel alone 4.4x (118K context, 2048 queries) to 4.8x (the engine's own selections, 16,384 queries) the per-cell kernel in `qsa_prompt_attn_parity`; `=1` the joint_matrix one (-24% to -27% prompt); `=0` the per-cell kernel |
 | `STRATA_SYCL_GEMM_STAGE=1` | Off on Battlemage | Stage GEMM operands past 4 GiB |
 | `STRATA_I8_NO_ESIMD` | n/a | Compile-time: stubs for the int8 ESIMD kernels (set for a device without them) |
 | `STRATA_DBG_NAN=1` | Off | Report non-finite values, including the experts' FP16 inputs |

@@ -572,8 +572,15 @@ static int64_t pf_switch_min_t() {   // S23: STRATA_PF_SWITCH_MIN_T=N - the roun
     static const int64_t v = [] { const char* e = std::getenv("STRATA_PF_SWITCH_MIN_T"); return e ? (int64_t) std::atoll(e) : (int64_t) 0; }();
     return v;
 }
+// B70: on by default on Battlemage (gr_upmix's XMX kernel: oneMKL's up GEMM sums K = 320 in its order there, so the
+// read is the default pair's bits - gr_prompt_bench; up GEMM + gr_mix_r 5.2 -> 2.8-3.1 ms per half at 16K tokens);
+// STRATA_HC_UPMIX=0 turns it off
 inline bool hc_upmix() {
-    static const bool v = [] { const char* e = std::getenv("STRATA_HC_UPMIX"); return e != nullptr && e[0] == '1'; }();
+    static const bool v = [] {
+        const char* e = std::getenv("STRATA_HC_UPMIX");
+        if (e != nullptr) return e[0] == '1';
+        return strata::intel_gpu_gen(strata::q_of(nullptr)->get_device()) == strata::IntelGpuGen::Battlemage;
+    }();
     return v;
 }
 // CUDA: the fused read only on chunks of 33+ tokens - below that cuBLAS's up GEMM takes another kernel, rounding-level
@@ -604,6 +611,21 @@ inline bool hcd_exact() {
     return v;
 }
 inline bool hc_pad() { return pf_hcdown() || hcd_exact(); }
+// B70 (default on Battlemage; STRATA_HC_DOWNINJ=0 turns it off): the hyper-connection read's down and inject
+// projections as ONE oneMKL GEMM over xn16 - [w_down; w_inject] (324 x 10240 BF16, copied into a scratch: 7 us) into
+// lo with row stride 324, inj its last 4 columns.  The inject product alone re-read all of xn16 (335 MB at 16K tokens)
+// for 4 columns: 0.72 ms per half.  oneMKL gives lo the two calls' bits; inj the same bits at T 16384 and another K
+// order of the last 4 columns at 3508 / 40 (rounding-level: the same error against FP64; gr_prompt_bench).  Chunks of
+// 512+ tokens only: below that the 6.6 MB weight copy costs about what the second pass did.  (The copy is ~12 us per
+// half, ~9 ms per 118K prompt; a packed [w_down; w_inject] kept per half-layer would cost 96 x 6.6 MB = 634 MB of VRAM.)
+inline bool hc_downinj() {
+    static const bool v = [] {
+        const char* e = std::getenv("STRATA_HC_DOWNINJ");
+        if (e != nullptr) return e[0] == '1';
+        return strata::intel_gpu_gen(strata::q_of(nullptr)->get_device()) == strata::IntelGpuGen::Battlemage;
+    }();
+    return v;
+}
 inline bool cvec_fuse() {
     static const bool v = [] { const char* e = std::getenv("STRATA_CVEC_FUSE"); return e && e[0] == '1'; }();
     return v;
@@ -2411,7 +2433,7 @@ bool Prefill::carve(size_t T, void* alloc) {
     m.emb = o.take<float>(T * N, ok); m.R = o.take<float>(T * D, ok);
     m.xn = gr_unfused() ? o.take<float>(T * D, ok) : nullptr;   // F-1: not needed (gr_mix_r reads R)
     m.grs = o.take<float>(T * HC, ok);
-    m.xn16 = o.take<uint16_t>(T * (D + (hc_pad() ? XN_PAD : 0)), ok); m.lo = o.take<float>(T * LR, ok); m.lo16 = o.take<uint16_t>(T * LR, ok);
+    m.xn16 = o.take<uint16_t>(T * (D + (hc_pad() ? XN_PAD : 0)), ok); m.lo = o.take<float>(T * (LR + HC), ok); m.lo16 = o.take<uint16_t>(T * LR, ok);   // lo: + inj (hc_downinj)
     m.gated = o.take<float>(T * D, ok); m.inj = o.take<float>(T * HC, ok);
     m.mixed = o.take<float>(T * N, ok); m.mixed_bf = o.take<uint16_t>(T * N, ok);
     m.mixed_h = o.take<uint16_t>(T * N, ok);
@@ -3373,7 +3395,7 @@ uint64_t Prefill::bytes_needed_impl(const core::ModelGeometry& g, const core::Se
     } else {   // STRATA_RING_BYTES=0: 0.1.39's count
         f(T * N); f(T * D); f(T * D);
     }
-    o.take<uint16_t>(T * (D + (hc_pad() ? XN_PAD : 0)), ok); f(T * LR); o.take<uint16_t>(T * LR, ok);
+    o.take<uint16_t>(T * (D + (hc_pad() ? XN_PAD : 0)), ok); f(T * (LR + HC)); o.take<uint16_t>(T * LR, ok);
     f(T * D); f(T * HC); f(T * N); o.take<uint16_t>(T * N, ok); o.take<uint16_t>(T * N, ok);
     if (!emb_reuse_account()) f(T * N);   // bo: aliases emb in carve; still counted unless STRATA_EMB_REUSE_ACCOUNT=1
     const bool f16_io = prompt_f16();   // the current device's mode (the stage's), as Prefill::init will decide it
@@ -3545,6 +3567,24 @@ catch (sycl::exception const &exc) {
   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
             << ", line:" << __LINE__ << std::endl;
   std::exit(1);
+}
+// hc_downinj: Y[T, 324] = xn16 . [w_down; w_inject]^T (lo in columns 0..319, inj in 320..323) - the two resident
+// BF16 matrices copied into one scratch on the stream (the in-order queue keeps the copy ahead of the GEMM and behind
+// the previous half's)
+bool hc_downinj_proj(Gemm& gm, const core::WeightRef* wd, const core::WeightRef* wi, const uint16_t* X, float* Y,
+                     int64_t T, void* stream, std::string& err) {
+    static uint16_t* w = nullptr;
+    if (w == nullptr) {
+        w = (uint16_t*) sycl::malloc_device((size_t) (LR + HC) * D * 2, dpct::get_in_order_queue());
+        if (w == nullptr) { err = "prefill: the STRATA_HC_DOWNINJ weight scratch (6.6 MB)"; return false; }
+    }
+    sycl::queue& q = *strata::q_of(stream);
+    q.memcpy(w, wd->data, (size_t) LR * D * 2);
+    q.memcpy(w + (size_t) LR * D, wi->data, (size_t) HC * D * 2);
+    const bool ct = g_cold.begin();
+    gm.bf16(X, w, Y, T, LR + HC, D, LR + HC);
+    if (ct) g_cold.end("bf16", "hc down+inject", T, LR + HC, D);
+    return true;
 }
 
 }  // namespace
@@ -4925,8 +4965,21 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                     }
                     hcd = true;
                 }
-                if (!hcd && !hdown && !bf16_proj(m.gemm, wd, m.xn16, m.lo, T, sd, err, 0, m.xn16_lo, ldx != D ? ldx : 0, m.cs, xf16)) return false;
-                gr_silu(m.lo, m.lo16, T, m.cs, m.lo16_lo);
+                // B70 (hc_downinj): the down and inject projections as one GEMM into lo (stride 324); the write at the
+                // end of this half reads inj from lo's last 4 columns
+                const float* inj_rd = m.inj;
+                int64_t inj_ld = HC;
+                if (!hcd && !hdown && hc_downinj() && T >= std::max<int64_t>(pf_switch_min_t(), 512) && ldx == D && !m.xn16_lo && !xf16 &&
+                    !wd_q8.data && wd->q8_scale == nullptr && wi->q8_scale == nullptr &&
+                    wd->kind == core::WeightKind::Bf16InF32 && wd->data && wd->ne0 == D && wd->ne1 == LR &&
+                    wi->kind == core::WeightKind::Bf16InF32 && wi->data && wi->ne0 == D && wi->ne1 == HC) {
+                    if (!hc_downinj_proj(m.gemm, wd, wi, m.xn16, m.lo, T, m.cs, err)) return false;
+                    inj_rd = m.lo + LR;
+                    inj_ld = LR + HC;
+                }
+                const bool downinj = inj_rd != m.inj;
+                if (!hcd && !hdown && !downinj && !bf16_proj(m.gemm, wd, m.xn16, m.lo, T, sd, err, 0, m.xn16_lo, ldx != D ? ldx : 0, m.cs, xf16)) return false;
+                gr_silu(m.lo, m.lo16, T, m.cs, m.lo16_lo, downinj ? LR + HC : 0);
                 bool upmixed = false;
                 if (wu->q8_scale == nullptr && hc_upmix() && T >= std::max(pf_switch_min_t(), hc_upmix_min_t()) && !gr_unfused() && !m.lo16_lo && !m.mixed_bf_lo &&
                     wu->kind == core::WeightKind::Bf16InF32 && wu->data && wu->ne0 == LR && wu->ne1 == D) {
@@ -4969,7 +5022,7 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                     }
                 }
                 if (!upmixed && !bf16_proj(m.gemm, wu, m.lo16, m.gated, T, su, err, 0, m.lo16_lo, 0, m.cs)) return false;
-                if (!hcd && !bf16_proj(m.gemm, wi, m.xn16, m.inj, T, si, err, 0, m.xn16_lo, ldx != D ? ldx : 0, m.cs, xf16)) return false;
+                if (!hcd && !downinj && !bf16_proj(m.gemm, wi, m.xn16, m.inj, T, si, err, 0, m.xn16_lo, ldx != D ? ldx : 0, m.cs, xf16)) return false;
                 if (upmixed) {
                 } else if (gr_unfused()) {
                     gr_mix(m.xn, m.gated, m.mixed, m.mixed_bf, T, m.cs, m.mixed_h, m.mixed_bf_lo);
@@ -7560,10 +7613,10 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                         API to ensure synchronization behavior.
                         */
                         m.cs->memcpy(Rc, m.R, (size_t)T * D * 4);
-                        gr_write(Rc, m.bo, m.inj, HC, T, m.cs);
+                        gr_write(Rc, m.bo, inj_rd, inj_ld, T, m.cs);
                         strata::kernels::cvec_apply(Rc, l, T, D, nullptr, 0, nullptr, 0, false, m.cs);
                         gr_norm_rs(Rc, (const float*) wnn->data, EPS, rc, xc, T, m.cs, nullptr, D, xf16);
-                        gr_write_cvec_norm_rs(m.R, m.bo, m.inj, HC, cv_dir + l * N, cv_s + l, cv_on,
+                        gr_write_cvec_norm_rs(m.R, m.bo, inj_rd, inj_ld, cv_dir + l * N, cv_s + l, cv_on,
                                               strata::kernels::cvec().mode, (const float*) wnn->data, EPS, m.grs,
                                               m.xn16, T, m.cs, m.xn16_lo, ldx, xf16);
                         std::vector<float> a((size_t) T * D), b((size_t) T * D), ra((size_t) T * HC), rb((size_t) T * HC);
@@ -7626,16 +7679,16 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                                      std::memcmp(ra.data(), rb.data(), ra.size() * 4) ? "DIFFERS" : "identical",
                                      std::memcmp(xa.data(), xb.data(), xa.size() * 2) ? "DIFFERS" : "identical");
                     } else
-                    gr_write_cvec_norm_rs(m.R, m.bo, m.inj, HC, cv_dir + l * N, cv_s + l, cv_on,
+                    gr_write_cvec_norm_rs(m.R, m.bo, inj_rd, inj_ld, cv_dir + l * N, cv_s + l, cv_on,
                                           strata::kernels::cvec().mode, (const float*) wnn->data, EPS, m.grs, m.xn16,
                                           T, m.cs, m.xn16_lo, ldx, xf16);
                     normed = true;
                 } else if (wnn) {
-                    gr_write_norm_rs(m.R, m.bo, m.inj, HC, (const float*) wnn->data, EPS, m.grs, m.xn16, T, m.cs,
+                    gr_write_norm_rs(m.R, m.bo, inj_rd, inj_ld, (const float*) wnn->data, EPS, m.grs, m.xn16, T, m.cs,
                                      m.xn16_lo, ldx, xf16);
                     normed = true;
                 } else {
-                    gr_write(m.R, m.bo, m.inj, HC, T, m.cs);
+                    gr_write(m.R, m.bo, inj_rd, inj_ld, T, m.cs);
                 }
                 if (steered && !cv_fused)   // --control-vector-scaled
                     strata::kernels::cvec_apply(m.R, l, T, D, nullptr, 0, nullptr, 0, false, m.cs);

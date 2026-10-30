@@ -36,6 +36,7 @@
 #include <cstring>
 #include <random>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -96,14 +97,50 @@ double rel_l1(const std::vector<float>& a, const std::vector<float>& b) {
     return d / (m > 1e-30 ? m : 1e-30);
 }
 
+// --prefill-variants A,B: the two gdn_recurrence_variant kernels compared (A is the baseline, B must give its bits).
+// --prefill-fp64 N: also run the recurrence in FP64 on the host for value heads 0..N-1 (the kernels' state layout) and
+// print both variants' error against it, the state and the raw outputs (o / sqrt(S), what y holds before the norm).
+int g_variant_a = 0, g_variant_b = 6, g_fp64_heads = 0;
+
+// The FP64 recurrence of value head hv over T tokens: st (S, HV, S) in, updated; oc[t * HV * S + hv * S + j].
+void fp64_head(int hv, int T, const std::vector<float>& st0, const std::vector<float>& h,
+               const std::vector<float>& gate, const std::vector<float>& beta, std::vector<double>& st,
+               std::vector<double>& oc) {
+    constexpr int S = 128, HK = 16, HV = 48, C = 10240;
+    const int qh = hv % HK;
+    std::vector<double> s((size_t) S * S);   // s[i * S + j]: row i, column j of this head
+    for (int i = 0; i < S; ++i)
+        for (int j = 0; j < S; ++j) s[(size_t) i * S + j] = st0[((size_t) i * HV + hv) * S + j];
+    std::vector<double> kv(S), o(S);
+    for (int t = 0; t < T; ++t) {
+        const float* ht = h.data() + (size_t) t * C;
+        const float *q = ht + qh * S, *k = ht + HK * S + qh * S, *v = ht + 2 * HK * S + hv * S;
+        const double g = std::exp((double) gate[(size_t) t * HV + hv]), b = beta[(size_t) t * HV + hv];
+        std::fill(kv.begin(), kv.end(), 0.0);
+        for (int i = 0; i < S; ++i)
+            for (int j = 0; j < S; ++j) kv[j] += s[(size_t) i * S + j] * (double) k[i];
+        for (int j = 0; j < S; ++j) kv[j] = ((double) v[j] - g * kv[j]) * b;   // delta
+        std::fill(o.begin(), o.end(), 0.0);
+        for (int i = 0; i < S; ++i)
+            for (int j = 0; j < S; ++j) {
+                double& x = s[(size_t) i * S + j];
+                x = g * x + (double) k[i] * kv[j];
+                o[j] += x * (double) q[i];
+            }
+        for (int j = 0; j < S; ++j) oc[(size_t) t * HV * S + (size_t) hv * S + j] = o[j] / std::sqrt((double) S);
+    }
+    for (int i = 0; i < S; ++i)
+        for (int j = 0; j < S; ++j) st[((size_t) i * HV + hv) * S + j] = s[(size_t) i * S + j];
+}
+
 // Compare every state element and every token/head output, including FP16 bits.
 // Fixtures have nonzero initial state, modulo-paired heads, signed q/k/v, and
 // both shallow and deep decay. A tolerance is diagnostic only, never a pass.
 int prefill_case(int T, int seed, int repeats) {
     constexpr int S = 128, HK = 16, HV = 48, C = 10240;
     sycl::queue q(dpct::get_in_order_queue().get_device(),
-                  sycl::property_list{sycl::property::queue::in_order{}});
-    // Variant 6 runs on Intel GPUs only (the engine throws elsewhere): skip, not fail, on any other device.
+                  sycl::property_list{sycl::property::queue::in_order{}, sycl::property::queue::enable_profiling{}});
+    // Variants 6 and 7 run on Intel GPUs only (the engine throws elsewhere): skip, not fail, on any other device.
     const auto dev = q.get_device();
     const auto sizes = dev.get_info<sycl::info::device::sub_group_sizes>();
     if (!dev.is_gpu() || dev.get_info<sycl::info::device::vendor_id>() != 0x8086 ||
@@ -138,34 +175,71 @@ int prefill_case(int T, int seed, int repeats) {
     if (!dy || !dy16) throw std::bad_alloc();
     std::vector<float> refst(st.size()), refy(z.size()), gotst(st.size()), goty(z.size());
     std::vector<uint16_t> ref16(z.size()), got16(z.size());
-    auto run = [&](int variant, std::vector<float>& ost, std::vector<float>& oy, std::vector<uint16_t>& o16) {
-        // Warm up the compiled kernel before measuring; every run resets state.
-        q.memcpy(dst, st.data(), st.size() * sizeof(float)).wait_and_throw();
+    auto call = [&](int variant) {
         if (variant == -1)
             strata::prefill::gdn_recurrence(dst, dh, dg, db, dz, dgm, 1e-6f, dy, dy16, T, &q);
+        else if (variant == -2)   // the production recurrence without the output norm
+            strata::prefill::gdn_recurrence_state_only(dst, dh, dg, db, dy, T, &q);
         else
-            strata::prefill::gdn_recurrence_variant(variant, dst, dh, dg, db, dz, dgm,
-                                                   1e-6f, dy, dy16, T, &q);
+            strata::prefill::gdn_recurrence_variant(variant, dst, dh, dg, db, dz, dgm, 1e-6f, dy, dy16, T, &q);
+    };
+    // Device time of one call (every call starts from the same state): the span between two barriers' completions.
+    auto device_ms = [&](int variant) {
+        q.memcpy(dst, st.data(), st.size() * sizeof(float)).wait_and_throw();
+        auto e0 = q.ext_oneapi_submit_barrier();
+        call(variant);
+        auto e1 = q.ext_oneapi_submit_barrier();
+        e1.wait_and_throw();
+        return 1e-6 * double(e1.get_profiling_info<sycl::info::event_profiling::command_end>() -
+                             e0.get_profiling_info<sycl::info::event_profiling::command_end>());
+    };
+    auto run = [&](int variant, std::vector<float>& ost, std::vector<float>& oy, std::vector<uint16_t>& o16) {
+        q.memcpy(dst, st.data(), st.size() * sizeof(float)).wait_and_throw();
+        call(variant);
         q.wait_and_throw();
-        double elapsed = 0;
-        for (int i = 0; i < repeats; ++i) {
-            q.memcpy(dst, st.data(), st.size() * sizeof(float)).wait_and_throw();
-            const auto start = std::chrono::steady_clock::now();
-            if (variant == -1)
-                strata::prefill::gdn_recurrence(dst, dh, dg, db, dz, dgm, 1e-6f, dy, dy16, T, &q);
-            else
-                strata::prefill::gdn_recurrence_variant(variant, dst, dh, dg, db, dz, dgm,
-                                                       1e-6f, dy, dy16, T, &q);
-            q.wait_and_throw();
-            elapsed += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
-        }
         q.memcpy(ost.data(), dst, ost.size() * sizeof(float)).wait_and_throw();
         q.memcpy(oy.data(), dy, oy.size() * sizeof(float)).wait_and_throw();
         q.memcpy(o16.data(), dy16, o16.size() * sizeof(uint16_t)).wait_and_throw();
-        return elapsed / repeats;
     };
-    const double base_ms = run(0, refst, refy, ref16);
-    const double xe_ms = run(6, gotst, goty, got16);
+    run(g_variant_a, refst, refy, ref16);
+    run(g_variant_b, gotst, goty, got16);
+    // the fastest of `repeats` device times, A and B (and the production recurrence without the norm) alternating
+    double base_ms = 1e30, xe_ms = 1e30, rec_ms = 1e30;
+    for (int i = 0; i < repeats; ++i) {
+        base_ms = std::min(base_ms, device_ms(g_variant_a));
+        xe_ms = std::min(xe_ms, device_ms(g_variant_b));
+        if (repeats > 1) rec_ms = std::min(rec_ms, device_ms(-2));
+    }
+    if (repeats > 1) std::printf("  production recurrence without the norm: %.3f ms\n", rec_ms);
+    if (g_fp64_heads > 0) {
+        const int nh = std::min(g_fp64_heads, HV);
+        std::vector<double> st64(st.size()), oc64(z.size());
+        std::vector<std::thread> pool;
+        for (int hv = 0; hv < nh; ++hv)
+            pool.emplace_back([&, hv] { fp64_head(hv, T, st, h, gate, beta, st64, oc64); });
+        for (auto& th : pool) th.join();
+        // max |err| over the heads checked, and that over max |value| (a relative error that ignores values near 0)
+        auto err = [&](const std::vector<float>& got, const std::vector<double>& want, bool state, double& emax,
+                       double& vmax) {
+            emax = 0, vmax = 0;
+            for (int hv = 0; hv < nh; ++hv)
+                for (int64_t r = 0; r < (state ? S : T); ++r)
+                    for (int j = 0; j < S; ++j) {
+                        const size_t at = ((size_t) r * HV + hv) * S + j;
+                        emax = std::max(emax, std::fabs((double) got[at] - want[at]));
+                        vmax = std::max(vmax, std::fabs(want[at]));
+                    }
+        };
+        double se, sv, ye, yv;
+        err(refst, st64, true, se, sv);
+        err(refy, oc64, false, ye, yv);
+        std::printf("  fp64 (%d heads) variant %d: state max_abs=%.3g (max|s|=%.3g, rel %.3g)  o max_abs=%.3g (max|o|=%.3g, rel %.3g)\n",
+                    nh, g_variant_a, se, sv, se / sv, ye, yv, ye / yv);
+        err(gotst, st64, true, se, sv);
+        err(goty, oc64, false, ye, yv);
+        std::printf("  fp64 (%d heads) variant %d: state max_abs=%.3g (max|s|=%.3g, rel %.3g)  o max_abs=%.3g (max|o|=%.3g, rel %.3g)\n",
+                    nh, g_variant_b, se, sv, se / sv, ye, yv, ye / yv);
+    }
     size_t state_bad = 0, y_bad = 0, half_bad = 0;
     double max_abs = 0, max_rel = 0;
     auto compare = [&](const std::vector<float>& a, const std::vector<float>& b, size_t& mismatches) {
@@ -180,10 +254,10 @@ int prefill_case(int T, int seed, int repeats) {
     compare(refst, gotst, state_bad);
     compare(refy, goty, y_bad);
     for (size_t i = 0; i < ref16.size(); ++i) half_bad += ref16[i] != got16[i];
-    std::printf("prefill T=%d seed=%d heads=%d: state=%zu y=%zu fp16=%zu mismatches; max_abs=%.9g max_rel=%.9g; baseline=%.3f ms xe=%.3f ms\n",
-                T, seed, HV, state_bad, y_bad, half_bad, max_abs, max_rel, base_ms, xe_ms);
-    // T=7 additionally checks the production entry point (variant 6 on Alchemist or under STRATA_GDN_XE=1,
-    // else variant 0) and T=0's no-op contract.
+    std::printf("prefill T=%d seed=%d heads=%d: state=%zu y=%zu fp16=%zu mismatches; max_abs=%.9g max_rel=%.9g; variant %d=%.3f ms variant %d=%.3f ms\n",
+                T, seed, HV, state_bad, y_bad, half_bad, max_abs, max_rel, g_variant_a, base_ms, g_variant_b, xe_ms);
+    // T=7 additionally checks the production entry point (variant 7 on Battlemage or under STRATA_GDN_REG=1, else
+    // variant 6 on Alchemist or under STRATA_GDN_XE=1, else variant 0) and T=0's no-op contract.
     int extra_bad = 0;
     if (T == 7) {
         run(-1, gotst, goty, got16);
@@ -214,6 +288,7 @@ int main(int argc, char** argv) {
     std::setvbuf(stdout, nullptr, _IONBF, 0);   // (progress lines survive a crash)
     bool selftest = false, prefill_only = false;
     int prefill_tokens = 0, prefill_repeat = 1;
+    bool variants_given = false;
     for (int i = 1; i < argc; ++i) {
         const std::string arg(argv[i]);
         if (arg == "--selftest") selftest = true;
@@ -223,8 +298,14 @@ int main(int argc, char** argv) {
             const long n = std::strtol(argv[++i], &end, 10);
             if (!end || *end || n < 1 || n > (arg == "--prefill-tokens" ? 32768 : 1000)) return 2;
             (arg == "--prefill-tokens" ? prefill_tokens : prefill_repeat) = int(n);
+        } else if (arg == "--prefill-variants" && i + 1 < argc) {
+            if (std::sscanf(argv[++i], "%d,%d", &g_variant_a, &g_variant_b) != 2) return 2;
+            variants_given = true;
+        } else if (arg == "--prefill-fp64" && i + 1 < argc) {
+            g_fp64_heads = std::atoi(argv[++i]);
         } else {
-            std::fprintf(stderr, "usage: gdn_parity [--selftest] [--prefill-only] [--prefill-tokens N] [--prefill-repeat N]\n");
+            std::fprintf(stderr, "usage: gdn_parity [--selftest] [--prefill-only] [--prefill-tokens N] [--prefill-repeat N]"
+                                 " [--prefill-variants A,B] [--prefill-fp64 HEADS]\n");
             return 2;
         }
     }
@@ -234,8 +315,13 @@ int main(int argc, char** argv) {
     for (auto n : device.get_info<sycl::info::device::sub_group_sizes>()) std::printf(" %zu", n);
     std::printf("\n");
     int prefill_bad = 0;
-    for (int t : prefill_tokens ? std::vector<int>{prefill_tokens} : std::vector<int>{1, 7, 256, 1000})
-        for (int seed : {2025, 2026}) prefill_bad += prefill_case(t, seed, prefill_repeat);
+    // without --prefill-variants: variant 0 against 6 and against 7
+    const std::vector<int> cand = variants_given ? std::vector<int>{g_variant_b} : std::vector<int>{6, 7};
+    for (int b : cand) {
+        g_variant_b = b;
+        for (int t : prefill_tokens ? std::vector<int>{prefill_tokens} : std::vector<int>{1, 7, 256, 1000})
+            for (int seed : {2025, 2026}) prefill_bad += prefill_case(t, seed, prefill_repeat);
+    }
     std::printf("prefill gdn: %d failures\n", prefill_bad);
     if (prefill_only) {
         if (selftest && !prefill_bad) std::printf("gdn_parity OK\n");

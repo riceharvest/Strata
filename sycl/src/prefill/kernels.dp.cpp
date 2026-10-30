@@ -9,6 +9,8 @@
 #include "strata/kernels/gfx_arch.hpp"
 #include "strata/kernels/router_top10.hpp"
 #include "strata/core/emulate.hpp"
+#include <sycl/ext/oneapi/matrix/matrix.hpp>
+#include <sycl/ext/intel/experimental/grf_size_properties.hpp>
 
 #include <algorithm>
 
@@ -387,13 +389,14 @@ auto &sh = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[32]>(
 }
 __dpct_inline__ void gr_silu_kernel(const float *__restrict__ lo,
                                     uint16_t *__restrict__ lo16,
-                                    uint16_t *__restrict__ lo16_lo, int64_t n) {
+                                    uint16_t *__restrict__ lo16_lo, int64_t n,
+                                    int64_t ld) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
     const int64_t i =
         (int64_t)item_ct1.get_group(2) * item_ct1.get_local_range(2) +
         item_ct1.get_local_id(2);
     if (i >= n) return;
-    const float x = lo[i] / (float) HC;
+    const float x = (ld == LR ? lo[i] : lo[i / LR * ld + i % LR]) / (float) HC;
     const float v = x / (1.0f + sycl::native::exp(-x));
     const uint16_t h = act16(v);
     lo16[i] = h;
@@ -3307,6 +3310,109 @@ __global__ void __launch_bounds__(256) gr_upmix_kernel(const uint16_t* __restric
         if (mixed_h) mixed_h[t * N + d] = hf(s);
     }
 }
+#else
+// SYCL, Battlemage (Xe2): the same fusion on XMX - joint_matrix BF16 x BF16 -> FP32, 16 x 16 x 16 on sub-group 16 (the
+// shape qsa_prompt_attn_xmx runs).  A work-group is 64 tokens x 64 columns x the 4 streams, 8 sub-groups (2 along the
+// tokens x 4 along the columns); a sub-group holds 2 tiles of 16 tokens x one 16-column tile for all 4 streams (8
+// accumulators, 256 GRF).  lo16 (A, row-major) and the w_up rows (B, col_major: the K-contiguous rows of the [10240, 320]
+// matrix) are loaded straight from global memory - both stay in L2 (10 MB and 6.5 MB per chunk of 16K).  The epilogue
+// stores a token tile's 4 accumulators to the sub-group's own SLM slice (no work-group barrier anywhere, so groups in
+// their products overlap groups in their epilogue) and runs gr_mix_r_kernel's arithmetic over them, in its order: a
+// lane takes 4 adjacent columns of a row (float4 loads of R and of the gates, float4 / 4 x 16-bit stores), 4 rows per
+// instruction.  oneMKL's up GEMM sums K = 320 in this kernel's order on the B70, so the read is the default pair's
+// bits (gr_prompt_bench: mixed, its BF16 and FP16 images identical at T 16384, 3508 and 40).  Work-groups run
+// column-tile fastest, as on gfx11: the groups in flight share a token tile, so the epilogue's R reads stay within
+// ~2.6 MB of rows.  Measured at T 16384: 2.8-3.1 ms against 1.9 + 3.3 ms for the up GEMM and gr_mix_r (a lane per
+// column, scalar: 3.4-3.9 ms; a work-group-wide epilogue behind a barrier: 3.4-5.0 ms; B pre-packed to VNNI, unchecked
+// A loads, 128 GRF, other tile shapes: no better).
+namespace jm = sycl::ext::oneapi::experimental::matrix;
+using um_bf16 = sycl::ext::oneapi::bfloat16;
+constexpr int UX_MT = 2, UX_SGM = 2, UX_SGD = 4, UX_NSG = UX_SGM * UX_SGD;
+constexpr int UX_BT = UX_SGM * UX_MT * 16, UX_BD = UX_SGD * 16;   // a work-group's tokens and columns
+static_assert(N % UX_BD == 0 && LR % 16 == 0, "gr_upmix_xe: the tile does not divide the shapes");
+void gr_upmix_xe(const uint16_t* lo16, const uint16_t* wu, const float* R, const float* rs, const float* w, float* mixed,
+                 uint16_t* mixed16, uint16_t* mixed_h, int64_t T, sycl::queue& q) {
+    const size_t tt = (size_t) ((T + UX_BT - 1) / UX_BT);
+    q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<float, 1> st(UX_NSG * HC * 256, h);   // per sub-group: one token tile's 4 accumulators
+        auto props = sycl::ext::oneapi::experimental::properties{sycl::ext::intel::experimental::grf_size<256>};
+        h.parallel_for<class gr_upmix_xe_kernel>(
+            sycl::nd_range<2>({tt, (size_t) (N / UX_BD) * UX_NSG * 16}, {1, (size_t) UX_NSG * 16}), props,
+            [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(16)]] {
+            auto sg = it.get_sub_group();
+            const int sgid = (int) sg.get_group_linear_id(), lane = (int) sg.get_local_linear_id();
+            const int64_t t0 = (int64_t) it.get_group(0) * UX_BT + (sgid / UX_SGD) * UX_MT * 16;
+            const int d0 = (int) it.get_group(1) * UX_BD + (sgid % UX_SGD) * 16;
+            if (t0 >= T) return;   // (no work-group barrier below)
+            jm::joint_matrix<sycl::sub_group, float, jm::use::accumulator, 16, 16> acc[UX_MT][HC];
+#pragma unroll
+            for (int i = 0; i < UX_MT; ++i)
+#pragma unroll
+                for (int c = 0; c < HC; ++c) jm::joint_matrix_fill(sg, acc[i][c], 0.0f);
+            auto ga = sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(
+                reinterpret_cast<const um_bf16*>(lo16));
+            auto gb = sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(
+                reinterpret_cast<const um_bf16*>(wu));
+#pragma unroll 2
+            for (int k = 0; k < LR; k += 16) {
+                jm::joint_matrix<sycl::sub_group, um_bf16, jm::use::a, 16, 16, jm::layout::row_major> a[UX_MT];
+#pragma unroll
+                for (int i = 0; i < UX_MT; ++i)   // rows past T read as zeros (the chunk's last tile)
+                    sycl::ext::intel::experimental::matrix::joint_matrix_load_checked(sg, a[i], ga, (size_t) LR, (size_t) T,
+                                                                                      (size_t) LR, (size_t) (t0 + 16 * i), (size_t) k);
+#pragma unroll
+                for (int c = 0; c < HC; ++c) {
+                    jm::joint_matrix<sycl::sub_group, um_bf16, jm::use::b, 16, 16, jm::layout::col_major> b;
+                    jm::joint_matrix_load(sg, b, gb + ((size_t) c * N + d0) * LR + k, (size_t) LR);
+#pragma unroll
+                    for (int i = 0; i < UX_MT; ++i) jm::joint_matrix_mad(sg, acc[i][c], a[i], b, acc[i][c]);
+                }
+            }
+            float* my = st.template get_multi_ptr<sycl::access::decorated::no>().get() + (size_t) sgid * HC * 256;
+            auto lmy = sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(my);
+            const int rr = lane / 4, qd = (lane % 4) * 4, d = d0 + qd;   // a lane: columns d .. d + 3 of rows rr + 4 p
+            sycl::float4 wc[HC];
+#pragma unroll
+            for (int c = 0; c < HC; ++c) wc[c] = *reinterpret_cast<const sycl::float4*>(w + c * N + d);
+#pragma unroll
+            for (int i = 0; i < UX_MT; ++i) {
+#pragma unroll
+                for (int c = 0; c < HC; ++c) jm::joint_matrix_store(sg, acc[i][c], lmy + c * 256, (size_t) 16, jm::layout::row_major);
+                sycl::group_barrier(sg);
+#pragma unroll
+                for (int p = 0; p < 4; ++p) {
+                    const int r = 4 * p + rr;
+                    const int64_t t = t0 + 16 * i + r, tl = sycl::min(t, T - 1);   // (the loads clamped, the stores guarded)
+                    float s[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+                    for (int c = 0; c < HC; ++c) {
+                        const sycl::float4 rv = *reinterpret_cast<const sycl::float4*>(R + tl * D + c * N + d);
+                        const sycl::float4 gv = *reinterpret_cast<const sycl::float4*>(my + c * 256 + r * 16 + qd);
+                        const float rsc = rs[tl * HC + c];
+#pragma unroll
+                        for (int e = 0; e < 4; ++e) {
+                            const float x = rv[e] * rsc * wc[c][e];   // gr_mix_r_kernel's order
+                            s[e] = sycl::fma(x, sigm(gv[e]), s[e]);
+                        }
+                    }
+                    sycl::float4 o;
+                    sycl::vec<uint16_t, 4> o16, oh;
+#pragma unroll
+                    for (int e = 0; e < 4; ++e) {
+                        const float v = s[e] / (float) HC;
+                        o[e] = v; o16[e] = act16(v); oh[e] = hf(v);
+                    }
+                    if (t < T) {
+                        *reinterpret_cast<sycl::float4*>(mixed + t * N + d) = o;
+                        if (mixed16) *reinterpret_cast<sycl::vec<uint16_t, 4>*>(mixed16 + t * N + d) = o16;
+                        if (mixed_h) *reinterpret_cast<sycl::vec<uint16_t, 4>*>(mixed_h + t * N + d) = oh;
+                    }
+                }
+                sycl::group_barrier(sg);
+            }
+        });
+    });
+}
 #endif
 }  // namespace
 
@@ -3517,9 +3623,13 @@ bool gr_upmix(const uint16_t* lo16, const uint16_t* w_up, const float* R, const 
     check("gr_upmix");
     return true;
 #else
-    (void) lo16; (void) w_up; (void) R; (void) rs; (void) w_norm; (void) mixed; (void) mixed16; (void) mixed_h;
-    (void) T; (void) stream;
-    return false;
+    // Battlemage only (the 16 x 16 x 16 BF16 shape on sub-group 16 is Xe2's)
+    sycl::queue& q = *strata::q_of(stream);
+    static const bool xe2 = strata::intel_gpu_gen(q.get_device()) == strata::IntelGpuGen::Battlemage;
+    if (!xe2 || T <= 0) return false;
+    gr_upmix_xe(lo16, w_up, R, rs, w_norm, mixed, mixed16, mixed_h, T, q);
+    check("gr_upmix");
+    return true;
 #endif
 }
 void gr_write_norm_rs(float* R, const float* bo, const float* inj, int64_t inj_ld, const float* w_norm_next, float eps,
@@ -3575,20 +3685,21 @@ void gr_write_cvec_norm_rs(float* R, const float* bo, const float* inj, int64_t 
     }
     check("gr_write_cvec_norm_rs");
 }
-void gr_silu(const float* lo, uint16_t* lo16, int64_t T, void* stream, uint16_t* lo16_lo) {
+void gr_silu(const float* lo, uint16_t* lo16, int64_t T, void* stream, uint16_t* lo16_lo, int64_t ld) {
     {
         auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         strata::q_of(stream)
             ->submit([&](sycl::handler &cgh) {
                 auto T_LR_ct3 = T * LR;
+                const int64_t ld_ = ld > 0 ? ld : LR;
 
                 cgh.parallel_for<dpct_kernel_name<class gr_silu_kernel_f26d34>>(
                     sycl::nd_range<3>(sycl::range(1, 1, blocks_for(T * LR)) *
                                           sycl::range(1, 1, 256),
                                       sycl::range(1, 1, 256)),
                     exp_props, [=](sycl::nd_item<3> item_ct1) {
-                        gr_silu_kernel(lo, lo16, lo16_lo, T_LR_ct3);
+                        gr_silu_kernel(lo, lo16, lo16_lo, T_LR_ct3, ld_);
                     });
             });
     }
@@ -3772,6 +3883,22 @@ static bool gdn_xe_on(void* stream) {
     }();
     return on;
 }
+// Variant 7, the register-resident Xe recurrence (gdn_xe.hpp gdn_xe_rg_launch, one barrier per token) and the
+// grid-stride Xe norm, the same bits as variant 0.  B70, T = 16384 (gdn_parity --prefill-tokens 16384): 13.4-14.8 ms a
+// call against 24.4-26.4 ms (the recurrence 11.1-12.0 against 21.3-21.6 ms).  On by default on Battlemage unless
+// STRATA_GDN_XE is set (its A/B keeps its meaning); STRATA_GDN_REG=0: the kernels before (variant 6 or 0),
+// STRATA_GDN_REG=1: variant 7 on any Intel GPU with 16-lane sub-groups.
+static bool gdn_xe_reg_on(void* stream) {
+    static const bool on = [stream] {
+        const char* v = std::getenv("STRATA_GDN_REG");
+        if (v && *v) return std::atoi(v) != 0 && gdn_xe_device(stream);
+        const char* xe = std::getenv("STRATA_GDN_XE");
+        if (xe && *xe) return false;
+        return strata::intel_gpu_gen(strata::q_of(stream)->get_device()) == strata::IntelGpuGen::Battlemage &&
+               gdn_xe_device(stream);
+    }();
+    return on;
+}
 // The recurrence dispatch, shared by the two entry points below so the state-only form cannot drift from the full
 // one.  `with_out` false runs exactly the same kernels minus the output normalization (the CUDA-only KVA path).
 static void gdn_recurrence_impl(int variant, float* state, const float* h, const float* gate, const float* beta,
@@ -3833,10 +3960,13 @@ static void gdn_recurrence_impl(int variant, float* state, const float* h, const
 #else
     (void) variant;   // the quad recurrence kernels are AMD-only
 #endif
-    // variant 6 = the Xe sub-group recurrence + the unchanged norm kernel (gdn_recurrence: gdn_xe_on)
+    // variant 6 = the Xe sub-group recurrence + the unchanged norm kernel (gdn_recurrence: gdn_xe_on); variant 7 = the
+    // register-resident Xe recurrence + the grid-stride Xe norm (gdn_recurrence: gdn_xe_reg_on)
     const bool xe = T > 0 && !serial && variant == 6;
-    if (xe && !gdn_xe_device(stream)) throw std::runtime_error("GDN Xe variant requires an Intel GPU with 16-lane sub-groups");
-    if (!xe && ((serial && with_out) || T <= 0 || variant == 2)) {
+    const bool xreg = T > 0 && !serial && variant == 7;
+    if ((xe || xreg) && !gdn_xe_device(stream))
+        throw std::runtime_error("GDN Xe variant requires an Intel GPU with 16-lane sub-groups");
+    if (!xe && !xreg && ((serial && with_out) || T <= 0 || variant == 2)) {
         /*
         DPCT1049: The work-group size passed to the SYCL kernel may exceed
         the limit. To get the device limit, query
@@ -3862,7 +3992,9 @@ static void gdn_recurrence_impl(int variant, float* state, const float* h, const
         // here is the sub-group recurrence above, gdn_xe_launch).
         static const bool chunked = false;
 #endif
-        if (xe) {
+        if (xreg) {
+            detail::gdn_xe_rg_launch(*strata::q_of(stream), state, h, gate, beta, y, T);
+        } else if (xe) {
             detail::gdn_xe_launch(*strata::q_of(stream), state, h, gate, beta, y, T);
         } else
 #if !defined(__HIPCC__)
@@ -3910,7 +4042,9 @@ static void gdn_recurrence_impl(int variant, float* state, const float* h, const
                         gdn_rec_cols_kernel(state, h, gate, beta, y, T);
                     });
         }
-        if (with_out)
+        if (with_out && xreg)   // the same bits as the kernel below in a fixed grid of 16-lane sub-groups
+            detail::gdn_xe_norm_launch(*strata::q_of(stream), z, gamma, eps, y, y16, T, ld16);
+        else if (with_out)
         {
             auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
@@ -3941,7 +4075,7 @@ void gdn_recurrence(float* state, const float* h, const float* gate, const float
     // (AMD builds only; the arch defaults set STRATA_GDN_HEAD=1 on gfx1151 and leave other cards on the earlier kernels)
     static const bool head = [] { const char* v = std::getenv("STRATA_GDN_HEAD"); return v != nullptr && std::atoi(v) != 0; }();
     static const bool serial = std::getenv("STRATA_GDN_REC_HEADS") != nullptr;
-    const int v = head && !serial ? 1 : (!serial && gdn_xe_on(stream)) ? 6 : 0;
+    const int v = head && !serial ? 1 : serial ? 0 : gdn_xe_reg_on(stream) ? 7 : gdn_xe_on(stream) ? 6 : 0;
     gdn_recurrence_impl(v, state, h, gate, beta, z, gamma, eps, y, y16, T, stream, ld16, true);
 }
 /// KVA: the same recurrence, bit for bit, without the output normalisation (its readers - the output projection
@@ -3951,7 +4085,7 @@ void gdn_recurrence_state_only(float* state, const float* h, const float* gate, 
                                int64_t T, void* stream) {
     static const bool head = [] { const char* v = std::getenv("STRATA_GDN_HEAD"); return v != nullptr && std::atoi(v) != 0; }();
     static const bool serial = std::getenv("STRATA_GDN_REC_HEADS") != nullptr;
-    const int v = head && !serial ? 1 : (!serial && gdn_xe_on(stream)) ? 6 : 0;
+    const int v = head && !serial ? 1 : serial ? 0 : gdn_xe_reg_on(stream) ? 7 : gdn_xe_on(stream) ? 6 : 0;
     gdn_recurrence_impl(v, state, h, gate, beta, nullptr, nullptr, 0.0f, y, nullptr, T, stream, 0, /*with_out=*/false);
 }
 void route(const float* logits, int32_t* ids, float* weights, int64_t T, int64_t n_expert, void* stream) {

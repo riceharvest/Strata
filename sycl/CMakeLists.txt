@@ -246,6 +246,7 @@ foreach(k IN LISTS _kernel_cu)
 endforeach()
 strata_resolve(_kernels ${_kernel_files} src/kernels/ngram.cpp src/ngram/ple_reader.cpp src/platform/direct_file.cpp)
 list(APPEND _kernels ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/cuda/qsa_prompt_attn_xmx.dp.cpp)   # port-only: the XMX prompt attention
+list(APPEND _kernels ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/cuda/qsa_prompt_attn_esimd.dp.cpp)   # port-only: its v3 (ESIMD, INT8 KV)
 add_library(strata_kernels STATIC ${_kernels})
 target_include_directories(strata_kernels PRIVATE ${STRATA_ROOT}/third_party/ggml)
 target_link_libraries(strata_kernels PUBLIC strata_core)
@@ -404,8 +405,8 @@ if(STRATA_SYCL_PARITY)
   target_link_libraries(conversation_snapshot_test PRIVATE strata_engine)
   add_test(NAME conversation_snapshot_test COMMAND conversation_snapshot_test)
   set_tests_properties(conversation_snapshot_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
-  # the prompt-attention parity takes a context length, not --selftest: the XMX prompt kernel (opt-in in the engine;
-  # it refuses Q4_0 pools) and the prompt path's per-cell kernel, both against the warp kernel and FP64
+  # the prompt-attention parity takes a context length, not --selftest: the XMX prompt kernel (v3, the engine's default for
+  # INT8 KV; it refuses FP16 and Q4_0 pools) and the prompt path's per-cell kernel, both against the warp kernel and FP64
   strata_resolve(_src src/kernels/qsa_prompt_attn_parity.cpp)
   add_executable(qsa_prompt_attn_parity ${_src})
   target_link_libraries(qsa_prompt_attn_parity PRIVATE strata_kernels)
@@ -428,6 +429,9 @@ if(STRATA_SYCL_PARITY)
   target_link_libraries(q6k_align_bench PRIVATE strata_kernels)
   add_executable(gr_bench ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/gr_bench.cpp)   # fused GR read timing
   target_link_libraries(gr_bench PRIVATE strata_kernels)
+  add_executable(gr_prompt_bench ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/gr_prompt_bench.cpp)   # the prompt path's HC read / write at T 16384, vs FP64
+  target_link_libraries(gr_prompt_bench PRIVATE strata_prefill)
+  add_test(NAME gr_prompt_parity COMMAND gr_prompt_bench 3508 2 16)   # a 118K prompt's last chunk: partial tiles
   add_executable(sycl_router_fast ${CMAKE_CURRENT_SOURCE_DIR}/probe/router_fast.cpp)
   target_link_libraries(sycl_router_fast PRIVATE strata_kernels)
   add_test(NAME sycl_router_fast COMMAND sycl_router_fast)
