@@ -8,6 +8,7 @@
 #include "strata/kernels/mrope.hpp"
 #include "strata/kernels/gfx_arch.hpp"
 #include "strata/kernels/router_top10.hpp"
+#include "strata/core/emulate.hpp"
 
 #include <algorithm>
 
@@ -72,10 +73,29 @@ __dpct_inline__ uint16_t hf(float f) {
 // A SwiGLU product for an FP16 GEMM: saturated, so a token with a massive activation cannot turn into inf and then
 // NaN in the down projection (decode's q8_1 has room to ~8e6; FP16 ends at 65504).  A NaN stays NaN (fminf/fmaxf
 // would make it -65504 and hide where it came from); finite values below 65504 round exactly as before.
+// STRATA_F16_RANGE=1 (set_f16_range): what reaches FP16's range on this device - the largest |value| the activation
+// images converted (hf_sat is their one funnel) and how many were beyond 65504 or NaN; W and Y are counted in gemm.cu.
+// Off, the cost is one flag read per value.  The max is kept as float bits (positive floats order as unsigned ints),
+// and a thread takes the atomic only when it beats the value it read, so the atomics stop once the max has settled.
+#if defined(__HIPCC__)   // HIP only: the CUDA kernels stay exactly as they were (no flag read in hf_sat)
+__device__ int g_f16_range_on = 0;
+__device__ unsigned g_f16_range_max = 0;
+__device__ unsigned long long g_f16_range_over = 0;
+__device__ __forceinline__ void f16_range_note(float f) {
+    const float a = fabsf(f);
+    const unsigned bits = sycl::bit_cast<uint32_t>(a);
+    if (bits > g_f16_range_max) atomicMax(&g_f16_range_max, bits);
+    if (a > 65504.0f || isnan(f)) atomicAdd(&g_f16_range_over, 1ull);
+}
+#endif
 __dpct_inline__ uint16_t hf_sat(float f) {
+#if defined(__HIPCC__)
+    if (g_f16_range_on) f16_range_note(f);
+#endif
     return hf(sycl::isnan(f) ? f
                              : sycl::fmin(sycl::fmax(f, -65504.0f), 65504.0f));
 }
+
 // The prompt path's 16-bit activation image for the BF16-weight GEMMs: BF16, or FP16 where the GEMM library is fast
 // only in FP16 (prompt_f16() in gemm.cu: rocBLAS on gfx103x).  Set once per device before the first prompt.
 #if defined(__HIPCC__)   // HIP only (#835): the CUDA kernels stay exactly as they were, they never read the flag
@@ -132,11 +152,10 @@ void check(const char* what) {
 unsigned blocks_for(int64_t n, int t = 256) { return (unsigned) ((n + t - 1) / t); }
 
 // ---------------------------------------------------------------- hyper-connection
-__dpct_inline__ void gr_norm_kernel(const float *__restrict__ R,
-                                    const float *__restrict__ w, float eps,
-                                    float *__restrict__ xn,
-                                    uint16_t *__restrict__ xn16,
-                                    uint16_t *__restrict__ xn16_lo) {
+__dpct_inline__ void
+gr_norm_kernel(const float *__restrict__ R, const float *__restrict__ w,
+               float eps, float *__restrict__ xn, uint16_t *__restrict__ xn16,
+               uint16_t *__restrict__ xn16_lo) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
 auto &sh = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[32]>(
     sycl::ext::oneapi::this_work_item::get_work_group<3>());
@@ -218,12 +237,11 @@ gr_mix_r_kernel(const float *__restrict__ R, const float *__restrict__ rs,
 // weights - the same thread-to-element mapping (256 threads, stride 256) and block_sum, so rs and the BF16 image are
 // the same bits, and R is not read back
 constexpr int GRW_PER = (N + 255) / 256;
-__dpct_inline__ void
-gr_write_norm_rs_kernel(float *__restrict__ R, const float *__restrict__ bo,
-                        const float *__restrict__ inj, int64_t inj_ld,
-                        const float *__restrict__ w, float eps,
-                        float *__restrict__ rs_out, uint16_t *__restrict__ xn16,
-                        uint16_t *__restrict__ xn16_lo, int64_t ldx) {
+__dpct_inline__ void gr_write_norm_rs_kernel(
+    float *__restrict__ R, const float *__restrict__ bo,
+    const float *__restrict__ inj, int64_t inj_ld, const float *__restrict__ w,
+    float eps, float *__restrict__ rs_out, uint16_t *__restrict__ xn16,
+    uint16_t *__restrict__ xn16_lo, int64_t ldx) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
 auto &sh = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[32]>(
     sycl::ext::oneapi::this_work_item::get_work_group<3>());
@@ -626,6 +644,62 @@ __dpct_inline__ void gdn_l2_kernel(float *__restrict__ h, float eps) {
     x[item_ct1.get_local_id(2)] = v * sycl::rsqrt(ss + eps);
 }
 constexpr int RG = 4, RPG = S / RG;
+constexpr int CB = 32, NCB = S / CB;  // value columns per block kernel / blocks per head
+// v100/gdn-chunk: Volta-only (sm_70), inside the experimental build.  Main's recurrence kernels above are
+// untouched for every other architecture; the chain-split is dispatched only when the device is cc 7.0.
+#if defined(STRATA_EXPERIMENTAL_SM60)
+// v100/gdn-chunk: the same recurrence with WARP-LOCAL reductions - no __syncthreads at all.  gdn_rec_cols_*'
+// per-token shape is two cross-warp reductions (k^T W and q^T W) behind two barriers each (six barriers per
+// token in the pipelined kernel); here a warp owns 8 columns and the 4 row-groups are lanes within the warp,
+// so the reductions are __shfl's.  The arithmetic is the same expressions in the same order - the four
+// row-group partials still sum as ((p0+p1)+p2)+p3 - so this kernel is BIT-EXACT against gdn_rec_cols_pipe
+// (the parity test asserts it).  The state has the same (S, h_v, S) layout and the same j-fastest column.
+__global__ void __launch_bounds__(S) gdn_rec_cols_warp_kernel(float* __restrict__ state, const float* __restrict__ h,
+                                                             const float* __restrict__ gate,
+                                                             const float* __restrict__ beta,
+                                                             float* __restrict__ oc_out, int64_t T) {
+    const int head = blockIdx.x / NCB, cb = blockIdx.x % NCB;
+    const int w = threadIdx.x >> 5, l = threadIdx.x & 31;   // warp w: columns w*8..w*8+7
+    const int col = cb * CB + w * 8 + (l & 7);              // lane: column within the warp's 8
+    const int rg = l >> 3;                                  // lane group: 4 row-groups of 32 rows
+    const int qh = head % HK;
+    float s[RPG];
+    float* base = state + ((size_t) (rg * RPG) * HV + head) * S + col;
+    const size_t rs = (size_t) HV * S;
+#pragma unroll
+    for (int r = 0; r < RPG; ++r) s[r] = base[r * rs];
+    const unsigned full = 0xffffffffu;
+    for (int64_t t = 0; t < T; ++t) {
+        const float* ht = h + t * C;
+        const float* krow = ht + HK * S + qh * S + rg * RPG;
+        const float* qrow = ht + qh * S + rg * RPG;
+        float kv = 0.0f;
+#pragma unroll
+        for (int r = 0; r < RPG; ++r) kv = fmaf(s[r], krow[r], kv);
+        // ((p0 + p1) + p2) + p3 over the row-groups, exactly as red[0]+red[1]+red[2]+red[3]
+        float p0 = __shfl_sync(full, kv, (l & 7));
+        float p1 = __shfl_sync(full, kv, (l & 7) + 8);
+        float p2 = __shfl_sync(full, kv, (l & 7) + 16);
+        float p3 = __shfl_sync(full, kv, (l & 7) + 24);
+        const float kv_col = ((p0 + p1) + p2) + p3;
+        const float g = __expf(gate[t * HV + head]);
+        const float delta = (ht[2 * HK * S + head * S + col] - g * kv_col) * beta[t * HV + head];
+        float o = 0.0f;
+#pragma unroll
+        for (int r = 0; r < RPG; ++r) {
+            s[r] = fmaf(g, s[r], krow[r] * delta);
+            o = fmaf(s[r], qrow[r], o);
+        }
+        float q0 = __shfl_sync(full, o, (l & 7));
+        float q1 = __shfl_sync(full, o, (l & 7) + 8);
+        float q2 = __shfl_sync(full, o, (l & 7) + 16);
+        float q3 = __shfl_sync(full, o, (l & 7) + 24);
+        oc_out[t * HV * S + head * S + col] = (((q0 + q1) + q2) + q3) * rsqrtf((float) S);
+    }
+#pragma unroll
+    for (int r = 0; r < RPG; ++r) base[r * rs] = s[r];
+}
+#endif
 /*
 DPCT1110: The total declared local variable size in device function
 gdn_rec_kernel exceeds 128 bytes and may cause high register pressure. Consult
@@ -760,7 +834,7 @@ auto &sk = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[S]>(
 // quarter of its threads per __syncthreads), and the output norm - the only step that couples the head's columns -
 // in its own kernel. Per column the same arithmetic in the same order (the 4 row-group partial sums added as
 // red[0] + red[1] + red[2] + red[3]; the norm's warp sums over the same 32-column warps): the same bits.
-constexpr int CB = 32, NCB = S / CB;
+
 /*
 DPCT1110: The total declared local variable size in device function
 gdn_rec_cols_kernel exceeds 128 bytes and may cause high register pressure.
@@ -991,6 +1065,71 @@ __dpct_inline__ void gdn_rec_cols_pipe_kernel(float *__restrict__ state,
 #pragma unroll
     for (int r = 0; r < RPG; ++r) base[r * rs] = s[r];
 }
+// v100/gdn-chunk: gdn_rec_cols_pipe_kernel with the two 32-deep FMA chains (k^T W and q^T W) split into 4
+// accumulators each.  The chain is the recurrence's per-token floor (a 32-step dependent FFMA chain is ~128
+// cycles before the barriers); the split keeps the load pattern, the barriers and the (S, h_v, S) state
+// layout untouched.  FP32-level, NOT bit-exact - the four partial sums group the 32 products differently -
+// so it is opt-in by measured benefit (STRATA_GDN_REC_WARP=2; gdn_chunk_parity bounds the error).
+#if defined(STRATA_EXPERIMENTAL_SM60)
+__global__ void __launch_bounds__(CB * RG) gdn_rec_cols_pipe_fast_kernel(float* __restrict__ state,
+                                                                        const float* __restrict__ h,
+                                                                        const float* __restrict__ gate,
+                                                                        const float* __restrict__ beta,
+                                                                        float* __restrict__ oc_out, int64_t T) {
+    constexpr int NT = CB * RG, LPT = S / NT;
+    __shared__ float sk[S], sq[S], red[RG][CB];
+    const int head = blockIdx.x / NCB, cb = blockIdx.x % NCB;
+    const int c = threadIdx.x, rg = threadIdx.y, tid = rg * CB + c, col = cb * CB + c;
+    const int qh = head % HK;
+    float s[RPG];
+    float* base = state + ((size_t) (rg * RPG) * HV + head) * S + col;
+    const size_t rs = (size_t) HV * S;
+#pragma unroll
+    for (int r = 0; r < RPG; ++r) s[r] = base[r * rs];
+    float nq[LPT], nk[LPT], nv = 0.0f, ng = 0.0f, nb = 0.0f;
+    auto fetch = [&](int64_t t) {
+        const float* ht = h + t * C;
+#pragma unroll
+        for (int u = 0; u < LPT; ++u) { nq[u] = ht[qh * S + tid + u * NT]; nk[u] = ht[HK * S + qh * S + tid + u * NT]; }
+        nv = ht[2 * HK * S + head * S + col];
+        ng = gate[t * HV + head];
+        nb = beta[t * HV + head];
+    };
+    if (T > 0) fetch(0);
+    for (int64_t t = 0; t < T; ++t) {
+        float cq[LPT], ck[LPT];
+#pragma unroll
+        for (int u = 0; u < LPT; ++u) { cq[u] = nq[u]; ck[u] = nk[u]; }
+        const float cv = nv, cg = ng, cbt = nb;
+        __syncthreads();
+#pragma unroll
+        for (int u = 0; u < LPT; ++u) { sq[tid + u * NT] = cq[u]; sk[tid + u * NT] = ck[u]; }
+        __syncthreads();
+        if (t + 1 < T) fetch(t + 1);
+        const float g = __expf(cg);
+        float kv[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+        for (int r = 0; r < RPG; ++r) kv[r & 3] = fmaf(s[r], sk[rg * RPG + r], kv[r & 3]);
+        red[rg][c] = (kv[0] + kv[1]) + (kv[2] + kv[3]);
+        __syncthreads();
+        const float kv_col = red[0][c] + red[1][c] + red[2][c] + red[3][c];
+        const float delta = (cv - g * kv_col) * cbt;
+        float o[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+        for (int r = 0; r < RPG; ++r) {
+            s[r] = fmaf(g, s[r], sk[rg * RPG + r] * delta);
+            o[r & 3] = fmaf(s[r], sq[rg * RPG + r], o[r & 3]);
+        }
+        __syncthreads();
+        red[rg][c] = (o[0] + o[1]) + (o[2] + o[3]);
+        __syncthreads();
+        if (rg == 0) oc_out[t * HV * S + head * S + col] = (red[0][c] + red[1][c] + red[2][c] + red[3][c]) * rsqrtf((float) S);
+    }
+#pragma unroll
+    for (int r = 0; r < RPG; ++r) base[r * rs] = s[r];
+}
+#endif
+
 #if !defined(__HIPCC__)
 // The recurrence with one thread for the three value heads that share a key head (head % HK): column c of heads
 // qh, qh + 16 and qh + 32, row group rg.  gdn_rec_cols_pipe_kernel spends its time in shared memory, not in
@@ -1232,6 +1371,612 @@ bool gdn_keyhead_ok() {
     // key-head kernel is an A/B until measured: STRATA_GDN_KEYHEAD=1 runs it, anything else keeps the kernel before.
     static const bool on = [] { const char* v = std::getenv("STRATA_GDN_KEYHEAD"); return v != nullptr && std::atoi(v) == 1; }();
     return on;
+}
+// STRATA_GDN_CHUNKED=1 (opt-in): the recurrence in chunks of GCH tokens (the WY form of the gated delta rule, as
+// flash-linear-attention computes it), all in FP32.  Per value head, with g_t = exp(gate_t), gamma_t the gate's sum
+// from the chunk's start to t (inclusive) and S0 the state before the chunk:
+//   A[t][i] = beta_t exp(gamma_t - gamma_i) k_t.k_i (i < t),   T = (I + A)^-1 (unit lower triangular),
+//   Y_t = beta_t (v_t - exp(gamma_t) S0^T k_t),   D = T Y (the delta rule's corrections, one per token),
+//   o_t = exp(gamma_t) S0^T q_t + sum_{i <= t} exp(gamma_t - gamma_i) (q_t.k_i) D_i,
+//   S = exp(gamma_last) S0 + sum_t exp(gamma_last - gamma_t) k_t D_t^T,
+// the same state and outputs as the token-by-token kernels up to FP32 rounding (another order of the sums).
+// gdn_chunk_prep_kernel builds T, P = exp(gamma_t - gamma_i) q_t.k_i (i <= t) and gamma for every chunk of a
+// super-block at once (a block per chunk and key head: its three value heads share k and q); gdn_chunk_scan_kernel then
+// walks the super-block's chunks per (value head, 16 columns): the state slice in registers, the products as small
+// register-tiled matmuls from shared memory.  Every exponent is <= 0 (gates are negative), so nothing overflows.
+// STRATA_GDN_CHUNKED=1 takes prompt chunks of this many tokens and more: on an RTX 5090 the two launches cost more
+// than they save below ~100 tokens (gdn_rec_parity --bench: 32 tokens 0.58x gdn_rec_kh_kernel, 96 1.03x, 128 1.20x,
+// 512 1.67x, 2048+ 1.81x)
+constexpr int64_t kGdnChunkedMin = 128;
+constexpr int GCH = 32;            // tokens per chunk (the prep's solve is a lane per token)
+constexpr int GSB = 2048;          // tokens per super-block: the prep's scratch is GSB / GCH chunks of T, P and gamma
+constexpr int GDV = 16;            // value columns per scan block
+constexpr int GKP = S + 4;         // the scan's padded q / k rows (8 rows of a warp land on 8 banks)
+constexpr int GTP = GCH + 1;       // padded T / P rows
+static_assert(GCH == 32, "gdn_chunk_prep_kernel: a lane per token of the chunk");
+/*
+DPCT1083: The size of local memory in the migrated code may be different
+from the original code. Check that the allocated memory size in the migrated
+code is correct.
+*/
+constexpr size_t kChunkPrepSmem =
+    sizeof(float) * (2 * GCH * (S + 1) + 2 * GCH * GTP); // A over k / q
+static_assert(VPK * GCH * GTP <= 2 * GCH * (S + 1), "gdn_chunk_prep_kernel: A fits where k and q were");
+/*
+DPCT1083: The size of local memory in the migrated code may be different
+from the original code. Check that the allocated memory size in the migrated
+code is correct.
+*/
+constexpr size_t kChunkScanSmem =
+    sizeof(float) * (3 * GCH * GKP + VPK * (S * GDV + 3 * GCH * GDV));
+
+/*
+DPCT1110: The total declared local variable size in device function
+gdn_chunk_prep_kernel exceeds 128 bytes and may cause high register pressure.
+Consult with your hardware vendor to find the total register size available and
+adjust the code, or use smaller sub-group size to avoid high register pressure.
+*/
+__dpct_inline__ void gdn_chunk_prep_kernel(const float *__restrict__ h,
+                                           const float *__restrict__ gate,
+                                           const float *__restrict__ beta,
+                                           float *__restrict__ tm,
+                                           float *__restrict__ pm,
+                                           float *__restrict__ gm, int64_t t0,
+                                           int64_t T, uint8_t *dpct_local) {
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    auto gsm = (float *)dpct_local;
+    float* sk = gsm;                       // [GCH][S + 1]
+    float* sq = sk + GCH * (S + 1);        // [GCH][S + 1]
+    float* skk = sq + GCH * (S + 1);       // [GCH][GTP]  k_t.k_i
+    float* sqk = skk + GCH * GTP;          // [GCH][GTP]  q_t.k_i
+    float* sa = gsm;                       // [VPK][GCH][GTP]  A, then T below the diagonal (over k and q:
+                                           // read by then, so two blocks share an SM)
+    const int qh = item_ct1.get_group(1), ch = item_ct1.get_group(2),
+              tid = item_ct1.get_local_id(2), lane = tid & 31, warp = tid >> 5;
+    const int64_t tb = t0 + (int64_t) ch * GCH;
+    const int n = (int)sycl::min((int64_t)GCH, T - tb);
+    {   // k and q as float4, every load issued before the first store
+        constexpr int NP = GCH * S / 4 / 256;   // float4 a thread, each of k and q
+        sycl::float4 kv[NP], qv[NP];
+#pragma unroll
+        for (int m = 0; m < NP; ++m) {
+            const int p = tid + 256 * m, t = p / (S / 4), r = (p % (S / 4)) * 4;
+            kv[m] = t < n ? *reinterpret_cast<const sycl::float4 *>(
+                                h + (tb + t) * C + HK * S + qh * S + r)
+                          : sycl::float4(0.f, 0.f, 0.f, 0.f);
+            qv[m] = t < n ? *reinterpret_cast<const sycl::float4 *>(
+                                h + (tb + t) * C + qh * S + r)
+                          : sycl::float4(0.f, 0.f, 0.f, 0.f);
+        }
+#pragma unroll
+        for (int m = 0; m < NP; ++m) {
+            const int p = tid + 256 * m, t = p / (S / 4), r = (p % (S / 4)) * 4;
+            float* dk = sk + t * (S + 1) + r;
+            float* dq = sq + t * (S + 1) + r;
+            dk[0] = kv[m].x(); dk[1] = kv[m].y(); dk[2] = kv[m].z();
+                dk[3] = kv[m].w();
+            dq[0] = qv[m].x(); dq[1] = qv[m].y(); dq[2] = qv[m].z();
+                dq[3] = qv[m].w();
+        }
+    }
+    item_ct1.barrier(sycl::access::fence_space::local_space);
+    {   // lane i, rows warp + 8m: k_t.k_i and q_t.k_i on eight independent sums (rows 129 apart: 32 banks)
+        constexpr int RW = GCH / 8;
+        float kk[RW] = {}, qk[RW] = {};
+        for (int r = 0; r < S; ++r) {
+            const float ki = sk[lane * (S + 1) + r];
+#pragma unroll
+            for (int m = 0; m < RW; ++m) {
+                kk[m] = sycl::fma(sk[(warp + 8 * m) * (S + 1) + r], (float)ki,
+                                  kk[m]);
+                qk[m] = sycl::fma(sq[(warp + 8 * m) * (S + 1) + r], (float)ki,
+                                  qk[m]);
+            }
+        }
+#pragma unroll
+        for (int m = 0; m < RW; ++m) {
+            const int t = warp + 8 * m;
+            skk[t * GTP + lane] = lane <= t ? kk[m] : 0.0f;
+            sqk[t * GTP + lane] = lane <= t ? qk[m] : 0.0f;
+        }
+    }
+    item_ct1.barrier(sycl::access::fence_space::local_space);
+    if (warp >= VPK) return;
+    const int vh = qh + warp * HK, i = lane;   // warp j: value head j of the key head; lane i: token i (column i)
+    float* a = sa + warp * GCH * GTP;
+    const float b = i < n ? beta[(tb + i) * HV + vh] : 0.0f;
+    float gam = i < n ? gate[(tb + i) * HV + vh] : 0.0f;   // past the end: gate 0, beta 0 (no effect on S)
+#pragma unroll
+    for (int o = 1; o < 32; o <<= 1) {
+        /*
+        DPCT1108: '__shfl_up_sync' was migrated with the experimental
+        feature masked sub_group function which may not be supported by all
+        compilers or runtimes. You may need to adjust the code.
+        */
+        const float u = dpct::experimental::shift_sub_group_right(
+            0xffffffffu, sycl::ext::oneapi::this_work_item::get_sub_group(),
+            gam, o);
+        if (lane >= o) gam += u;
+    }
+    for (int t = 0; t < GCH; ++t) {
+        /*
+        DPCT1108: '__shfl_sync' was migrated with the experimental feature
+        masked sub_group function which may not be supported by all compilers or
+        runtimes. You may need to adjust the code.
+        */
+        const float gt = dpct::experimental::select_from_sub_group(
+                        0xffffffffu,
+                        sycl::ext::oneapi::this_work_item::get_sub_group(), gam,
+                        t),
+                    bt = dpct::experimental::select_from_sub_group(
+                        0xffffffffu,
+                        sycl::ext::oneapi::this_work_item::get_sub_group(), b,
+                        t);
+        a[t * GTP + i] =
+            i < t ? bt * sycl::native::exp(gt - gam) * skk[t * GTP + i]
+                  : (i == t ? 1.0f : 0.0f);
+    }
+    sycl::group_barrier(sycl::ext::oneapi::this_work_item::get_sub_group());
+    // T = (I + A)^-1 by forward substitution, row by row in place: T[t][i] = -sum_{k < t} A[t][k] T[k][i] over the
+    // finished rows (diagonal 1, zeros above it: the terms k < i add an exact 0, so the same bits as summing from k = i)
+    // - a trip the whole warp shares, so the loads go ahead of the sums
+    for (int t = 1; t < GCH; ++t) {
+        float v = 0.0f;
+#pragma unroll 8
+        for (int k = 0; k < t; ++k)
+            v = sycl::fma(-a[t * GTP + k], a[k * GTP + i], v);
+        sycl::group_barrier(sycl::ext::oneapi::this_work_item::get_sub_group());
+        if (i < t) a[t * GTP + i] = v;
+        sycl::group_barrier(sycl::ext::oneapi::this_work_item::get_sub_group());
+    }
+    float* T_ = tm + ((int64_t) ch * HV + vh) * GCH * GCH;
+    float* P_ = pm + ((int64_t) ch * HV + vh) * GCH * GCH;
+    for (int t = 0; t < GCH; ++t) {
+        /*
+        DPCT1108: '__shfl_sync' was migrated with the experimental feature
+        masked sub_group function which may not be supported by all compilers or
+        runtimes. You may need to adjust the code.
+        */
+        const float gt = dpct::experimental::select_from_sub_group(
+            0xffffffffu, sycl::ext::oneapi::this_work_item::get_sub_group(),
+            gam, t);
+        T_[t * GCH + i] = a[t * GTP + i];
+        P_[t * GCH + i] =
+            i <= t ? sycl::native::exp(gt - gam) * sqk[t * GTP + i] : 0.0f;
+    }
+    gm[((int64_t) ch * HV + vh) * GCH + i] = gam;
+}
+
+/*
+DPCT1053: Migration of device assembly code is not supported.
+*/
+__dpct_inline__ void gdn_pf_l2(const float *p) {
+    asm volatile("prefetch.global.L2 [%0];" ::"l"(p));
+}
+__dpct_inline__ void gdn_cp_wait_all() {
+#if STRATA_GDN_CP_ASYNC
+#if defined(__SYCL_DEVICE_ONLY__) && defined(__NVPTX__)
+    asm volatile("cp.async.wait_all;\n" ::);
+#else
+
+#endif
+#endif
+}
+// A block per (key head, 16 value columns): 128 threads for each of the key head's three value heads, which share the
+// staged k and q rows.  128 blocks, one an SM, in one wave (each walks every chunk: a second wave would double the
+// time).  A thread owns one token's row of the products (4 columns) and holds that token's T and P rows in registers,
+// loaded at the chunk's start so they land during the first product; the next chunk's k (a second buffer), q (after
+// this chunk's last read of q), v, gamma and beta load while this chunk computes.  Three barriers a chunk.
+/*
+DPCT1110: The total declared local variable size in device function
+gdn_chunk_scan_kernel exceeds 128 bytes and may cause high register pressure.
+Consult with your hardware vendor to find the total register size available and
+adjust the code, or use smaller sub-group size to avoid high register pressure.
+*/
+__dpct_inline__ void
+gdn_chunk_scan_kernel(float *__restrict__ state, const float *__restrict__ h,
+                      const float *__restrict__ beta,
+                      const float *__restrict__ tm,
+                      const float *__restrict__ pm,
+                      const float *__restrict__ gm, float *__restrict__ oc_out,
+                      int64_t t0, int nch, int64_t T, uint8_t *dpct_local) {
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    auto gsm = (float *)dpct_local;
+    constexpr int NT = 128 * VPK, HEAD = S * GDV + 3 * GCH * GDV;   // threads; a head's shared floats
+    float* kbuf = gsm;                     // [2][GCH][GKP]  k, double-buffered
+    float* sq = kbuf + 2 * GCH * GKP;      // [GCH][GKP]
+    const int qh = item_ct1.get_group(2), c0 = item_ct1.get_group(1) * GDV,
+              j = item_ct1.get_local_id(2) / 128,
+              tid = item_ct1.get_local_id(2) % 128;
+    const int vh = qh + j * HK;
+    float* ss = sq + GCH * GKP + j * HEAD; // [S][GDV]  the state slice at the chunk's start
+    float* sy = ss + S * GDV;              // [GCH][GDV]  Y
+    float* sd = sy + GCH * GDV;            // [GCH][GDV]  D
+    float* sdd = sd + GCH * GDV;           // [GCH][GDV]  exp(gamma_last - gamma_t) D
+    const int rq = tid >> 2, vq = tid & 3;   // the update's tile: rows 4rq..4rq+3; both tiles: columns 4vq..4vq+3
+    const int tt = tid >> 2, vv = 4 * vq;    // the products' tile: token tt
+    const size_t rs = (size_t) HV * S;
+    auto stage_kq = [&](int64_t c_t0, int n, float* dst, bool isq) {   // k or q rows of a chunk, cp.async
+        for (int p = sycl::ext::oneapi::this_work_item::get_nd_item<3>()
+                         .get_local_id(2);
+             p < GCH * (S / 4); p += NT) {
+            const int t = p / (S / 4), r = (p % (S / 4)) * 4;
+            if (t < n) gdn_cp16(dst + t * GKP + r, h + (c_t0 + t) * C + (isq ? 0 : HK * S) + qh * S + r);
+            else *reinterpret_cast<sycl::float4 *>(dst + t * GKP + r) =
+                sycl::float4(0.0f, 0.0f, 0.0f, 0.0f);
+        }
+    };
+    // this tile's v, gamma, beta and the chunk's last gamma (registers)
+    auto load_vgb = [&](int ch, int64_t c_t0, int n, sycl::float4 &v4,
+                        float &gam, float &bet, float &glast) {
+        /*
+        DPCT1098: The '*' expression is used instead of the __ldg call.
+        These two expressions do not provide the exact same functionality. Check
+        the generated code for potential precision and/or performance issues.
+        */
+        v4 = tt < n ? *reinterpret_cast<const sycl::float4*>(h + (c_t0 + tt) * C + 2 * HK * S + vh * S + c0 + vv)
+                    : sycl::float4(0.0f, 0.0f, 0.0f, 0.0f);
+        const float* g = gm + ((int64_t) ch * HV + vh) * GCH;
+        /*
+        DPCT1098: The '*' expression is used instead of the __ldg call.
+        These two expressions do not provide the exact same functionality. Check
+        the generated code for potential precision and/or performance issues.
+        */
+        gam = *(g + tt);
+        /*
+        DPCT1098: The '*' expression is used instead of the __ldg call.
+        These two expressions do not provide the exact same functionality. Check
+        the generated code for potential precision and/or performance issues.
+        */
+        glast = *(g + GCH - 1);
+        /*
+        DPCT1098: The '*' expression is used instead of the __ldg call.
+        These two expressions do not provide the exact same functionality. Check
+        the generated code for potential precision and/or performance issues.
+        */
+        bet = tt < n ? *(beta + (c_t0 + tt) * HV + vh) : 0.0f;
+    };
+    float s[4][4];
+#pragma unroll
+    for (int x = 0; x < 4; ++x) {
+#pragma unroll
+        for (int y = 0; y < 4; ++y) s[x][y] = state[(size_t) (4 * rq + x) * rs + (size_t) vh * S + c0 + vv + y];
+        *reinterpret_cast<sycl::float4 *>(&ss[(4 * rq + x) * GDV + vv]) =
+            sycl::float4(s[x][0], s[x][1], s[x][2], s[x][3]);
+    }
+    const float out_scale = sycl::rsqrt((float)S);
+    sycl::float4 v4;
+    float gam, bet, glast;
+    {
+        const int n0 = (int)sycl::min((int64_t)GCH, T - t0);
+        stage_kq(t0, n0, kbuf, false);
+        stage_kq(t0, n0, sq, true);
+        gdn_cp_commit();
+        load_vgb(0, t0, n0, v4, gam, bet, glast);
+        gdn_cp_wait_all();
+        /*
+        DPCT1065: Consider replacing sycl::nd_item::barrier() with
+        sycl::nd_item::barrier(sycl::access::fence_space::local_space) for
+        better performance if there is no access to global memory.
+        */
+        item_ct1.barrier();
+    }
+    for (int ch = 0; ch < nch; ++ch) {
+        const int64_t c_t0 = t0 + (int64_t) ch * GCH;
+        const int n = (int)sycl::min((int64_t)GCH, T - c_t0);
+        const bool more = ch + 1 < nch;
+        const int64_t n_t0 = c_t0 + GCH;
+        const int nn = more ? (int)sycl::min((int64_t)GCH, T - n_t0) : 0;
+        const float* sk = kbuf + (ch & 1) * GCH * GKP;
+        // this token's T and P rows into registers now: they land while the first product runs
+        float tr[GCH], pr[GCH];
+        {
+            const sycl::float4 *T4 = reinterpret_cast<const sycl::float4 *>(
+                tm + (((int64_t)ch * HV + vh) * GCH + tt) * GCH);
+            const sycl::float4 *P4 = reinterpret_cast<const sycl::float4 *>(
+                pm + (((int64_t)ch * HV + vh) * GCH + tt) * GCH);
+#pragma unroll
+            for (int i = 0; i < GCH / 4; ++i) {
+                /*
+                DPCT1098: The '*' expression is used instead of the __ldg
+                call. These two expressions do not provide the exact same
+                functionality. Check the generated code for potential precision
+                and/or performance issues.
+                */
+                const sycl::float4 a = *(T4 + i), b = *(P4 + i);
+                tr[4 * i] = a.x(); tr[4 * i + 1] = a.y(); tr[4 * i + 2] = a.z();
+                    tr[4 * i + 3] = a.w();
+                pr[4 * i] = b.x(); pr[4 * i + 1] = b.y(); pr[4 * i + 2] = b.z();
+                    pr[4 * i + 3] = b.w();
+            }
+        }
+        sycl::float4 nv4 = sycl::float4(0.0f, 0.0f, 0.0f, 0.0f);
+        float ngam = 0.0f, nbet = 0.0f, nglast = 0.0f;
+        if (more) {   // the next chunk's v, gamma and beta; the one after into L2 (its k and q: after barrier A)
+            load_vgb(ch + 1, n_t0, nn, nv4, ngam, nbet, nglast);
+            const int64_t f_t0 = n_t0 + GCH;
+            const int t = item_ct1.get_local_id(2) >> 3,
+                      l = item_ct1.get_local_id(2) & 7;
+            if (t < GCH && f_t0 + t < T) gdn_pf_l2(h + (f_t0 + t) * C + (l < 4 ? HK * S : 0) + qh * S + 32 * (l & 3));
+            if (tid < GCH) {
+                gdn_pf_l2(tm + (((int64_t) (ch + 1) * HV + vh) * GCH + tid) * GCH);
+                gdn_pf_l2(pm + (((int64_t) (ch + 1) * HV + vh) * GCH + tid) * GCH);
+            }
+        }
+        // X = K S0 and Q S0 for token tt, then Y = beta (V - exp(gamma) X)
+        float x[4] = {0.f, 0.f, 0.f, 0.f}, qs[4] = {0.f, 0.f, 0.f, 0.f};
+#pragma unroll 4
+        for (int r = 0; r < S; r += 4) {
+            const sycl::float4 k4 =
+                *reinterpret_cast<const sycl::float4 *>(&sk[tt * GKP + r]);
+            const sycl::float4 q4 =
+                *reinterpret_cast<const sycl::float4 *>(&sq[tt * GKP + r]);
+            const float kk[4] = {k4.x(), k4.y(), k4.z(), k4.w()},
+                        qq[4] = {q4.x(), q4.y(), q4.z(), q4.w()};
+#pragma unroll
+            for (int jj = 0; jj < 4; ++jj) {
+                const sycl::float4 s4 = *reinterpret_cast<const sycl::float4 *>(
+                    &ss[(r + jj) * GDV + vv]);
+                x[0] = sycl::fma((float)(kk[jj]), (float)(s4.x()), x[0]);
+                    x[1] = sycl::fma((float)(kk[jj]), (float)(s4.y()), x[1]);
+                x[2] = sycl::fma((float)(kk[jj]), (float)(s4.z()), x[2]);
+                    x[3] = sycl::fma((float)(kk[jj]), (float)(s4.w()), x[3]);
+                qs[0] = sycl::fma((float)(qq[jj]), (float)(s4.x()), qs[0]);
+                    qs[1] = sycl::fma((float)(qq[jj]), (float)(s4.y()), qs[1]);
+                qs[2] = sycl::fma((float)(qq[jj]), (float)(s4.z()), qs[2]);
+                    qs[3] = sycl::fma((float)(qq[jj]), (float)(s4.w()), qs[3]);
+            }
+        }
+        const float e = sycl::native::exp(gam);
+        *reinterpret_cast<sycl::float4 *>(&sy[tt * GDV + vv]) =
+            sycl::float4(bet * (v4.x() - e * x[0]), bet * (v4.y() - e * x[1]),
+                         bet * (v4.z() - e * x[2]), bet * (v4.w() - e * x[3]));
+        /*
+        DPCT1118: SYCL group functions and algorithms must be encountered in
+        converged control flow. You may need to adjust the code.
+        */
+        /*
+        DPCT1065: Consider replacing sycl::nd_item::barrier() with
+        sycl::nd_item::barrier(sycl::access::fence_space::local_space) for
+        better performance if there is no access to global memory.
+        */
+        item_ct1.barrier(); // (A) Y complete; every read of q done
+        if (more) {        // the next chunk's k into the other buffer, its q into the single q buffer
+            stage_kq(n_t0, nn, kbuf + ((ch + 1) & 1) * GCH * GKP, false);
+            stage_kq(n_t0, nn, sq, true);
+            gdn_cp_commit();
+        }
+        // D = T Y (T is zero above its diagonal), and D decayed to the chunk's end for the update
+        float d[4] = {0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+        for (int i = 0; i < GCH; ++i) {
+            const sycl::float4 y4 =
+                *reinterpret_cast<const sycl::float4 *>(&sy[i * GDV + vv]);
+            d[0] = sycl::fma(tr[i], (float)(y4.x()), d[0]);
+                d[1] = sycl::fma(tr[i], (float)(y4.y()), d[1]);
+            d[2] = sycl::fma(tr[i], (float)(y4.z()), d[2]);
+                d[3] = sycl::fma(tr[i], (float)(y4.w()), d[3]);
+        }
+        const float f = sycl::native::exp(glast - gam);
+        *reinterpret_cast<sycl::float4 *>(&sd[tt * GDV + vv]) =
+            sycl::float4(d[0], d[1], d[2], d[3]);
+        *reinterpret_cast<sycl::float4 *>(&sdd[tt * GDV + vv]) =
+            sycl::float4(f * d[0], f * d[1], f * d[2], f * d[3]);
+        /*
+        DPCT1118: SYCL group functions and algorithms must be encountered in
+        converged control flow. You may need to adjust the code.
+        */
+        /*
+        DPCT1065: Consider replacing sycl::nd_item::barrier() with
+        sycl::nd_item::barrier(sycl::access::fence_space::local_space) for
+        better performance if there is no access to global memory.
+        */
+        item_ct1.barrier(); // (B) D complete
+        // o = exp(gamma) Q S0 + P D (P is zero above its diagonal), the output
+        float o[4] = {e * qs[0], e * qs[1], e * qs[2], e * qs[3]};
+#pragma unroll
+        for (int i = 0; i < GCH; ++i) {
+            const sycl::float4 d4 =
+                *reinterpret_cast<const sycl::float4 *>(&sd[i * GDV + vv]);
+            o[0] = sycl::fma(pr[i], (float)(d4.x()), o[0]);
+                o[1] = sycl::fma(pr[i], (float)(d4.y()), o[1]);
+            o[2] = sycl::fma(pr[i], (float)(d4.z()), o[2]);
+                o[3] = sycl::fma(pr[i], (float)(d4.w()), o[3]);
+        }
+        if (tt < n)
+            *reinterpret_cast<sycl::float4 *>(oc_out + (c_t0 + tt) * HV * S +
+                                              vh * S + c0 + vv) =
+                sycl::float4(o[0] * out_scale, o[1] * out_scale,
+                             o[2] * out_scale, o[3] * out_scale);
+        // S = exp(gamma_last) S0 + K^T (decayed D)
+        const float gL = sycl::native::exp(glast);
+#pragma unroll
+        for (int xx = 0; xx < 4; ++xx)
+#pragma unroll
+            for (int y = 0; y < 4; ++y) s[xx][y] *= gL;
+#pragma unroll 4
+        for (int t = 0; t < GCH; ++t) {
+            const sycl::float4 k4 =
+                *reinterpret_cast<const sycl::float4 *>(&sk[t * GKP + 4 * rq]);
+            const sycl::float4 d4 =
+                *reinterpret_cast<const sycl::float4 *>(&sdd[t * GDV + vv]);
+            const float kx[4] = {k4.x(), k4.y(), k4.z(), k4.w()},
+                        dy[4] = {d4.x(), d4.y(), d4.z(), d4.w()};
+#pragma unroll
+            for (int xx = 0; xx < 4; ++xx)
+#pragma unroll
+                for (int y = 0; y < 4; ++y) s[xx][y] =
+                    sycl::fma((float)(kx[xx]), (float)(dy[y]), s[xx][y]);
+        }
+#pragma unroll
+        for (int xx = 0; xx < 4; ++xx)
+            *reinterpret_cast<sycl::float4 *>(&ss[(4 * rq + xx) * GDV + vv]) =
+                sycl::float4(s[xx][0], s[xx][1], s[xx][2], s[xx][3]);
+        v4 = nv4; gam = ngam; bet = nbet; glast = nglast;
+        gdn_cp_wait_all();
+        /*
+        DPCT1118: SYCL group functions and algorithms must be encountered in
+        converged control flow. You may need to adjust the code.
+        */
+        /*
+        DPCT1065: Consider replacing sycl::nd_item::barrier() with
+        sycl::nd_item::barrier(sycl::access::fence_space::local_space) for
+        better performance if there is no access to global memory.
+        */
+        item_ct1.barrier(); // (C) the new ss, the next k and q landed; every
+                            // read of sd, sdd and this k buffer done
+    }
+#pragma unroll
+    for (int xx = 0; xx < 4; ++xx)
+#pragma unroll
+        for (int y = 0; y < 4; ++y) state[(size_t) (4 * rq + xx) * rs + (size_t) vh * S + c0 + vv + y] = s[xx][y];
+}
+// The scratch, one a device: allocated on first use at its largest (GSB / GCH chunks of T, P and gamma: 25.6 MB) and
+// kept (a device runs its prompt on one stream).  A stream-ordered allocation and free per call, even from a pool that
+// keeps its memory, cost host time the GPU waited for (a 2K prompt's recurrence took 78 ms against 34 ms for
+// gdn_rec_kh_kernel).
+float *gdn_chunk_scratch() try {
+    static float* bufs[64] = {};
+    int dev = 0;
+    /*
+    DPCT1026: The call to cudaGetLastError was removed because this
+    functionality is redundant in SYCL.
+    */
+    if (DPCT_CHECK_ERROR(dev = dpct::get_current_device_id()) != 0 || dev < 0 ||
+        dev >= 64) {
+        ; return nullptr;
+    }
+    if (bufs[dev] == nullptr) {
+        const size_t n = (size_t) (GSB / GCH) * HV * (2 * GCH * GCH + GCH);
+        if (DPCT_CHECK_ERROR(bufs[dev] = sycl::malloc_device<float>(
+                                 n, dpct::get_in_order_queue())) != 0) {
+            /*
+            DPCT1026: The call to cudaGetLastError was removed because this
+            functionality is redundant in SYCL.
+            */
+            bufs[dev] = nullptr;
+        }
+    }
+    return bufs[dev];
+}
+catch (sycl::exception const &exc) {
+  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
+            << ", line:" << __LINE__ << std::endl;
+  std::exit(1);
+}
+
+// The whole recurrence of T tokens in super-blocks of GSB: a prep and a scan launch each, the scratch (T, P and gamma
+// of a super-block's chunks: up to GSB / GCH x 48 heads x (2 x 32 x 32 + 32) floats, 25.6 MB) from gdn_chunk_scratch.
+// y: the [T][HV][S] output.  An error return means nothing was launched (the caller takes another kernel): the scratch
+// could not be had, or the card has fewer than 128 SMs (a second wave of the scan would double it) or too little
+// shared memory for it (Turing).
+dpct::err0 gdn_rec_chunked(float *state, const float *h, const float *gate,
+                           const float *beta, float *y, int64_t T,
+                           dpct::queue_ptr s) {
+    if (T <= 0) return 0;
+    {   // sm_80+ (cp.async), the scan's 128 blocks one an SM in one wave, and its 93.7 KB of shared memory (else:
+        // another kernel)
+        int dev = 0, major = 0, sms = 0, smem = 0;
+        if (DPCT_CHECK_ERROR(dev = dpct::get_current_device_id()) != 0 ||
+            DPCT_CHECK_ERROR(
+                major = dpct::get_device(dev).get_major_version()) != 0 ||
+            DPCT_CHECK_ERROR(
+                sms = dpct::get_device(dev).get_max_compute_units()) != 0 ||
+            /*
+            DPCT1019: local_mem_size in SYCL is not a complete equivalent
+            of cudaDevAttrMaxSharedMemoryPerBlockOptin in CUDA. You may need to
+            adjust the code.
+            */
+            DPCT_CHECK_ERROR(
+                smem = dpct::get_device(dev).get_local_mem_size()) != 0) {
+            /*
+            DPCT1026: The call to cudaGetLastError was removed because this
+            functionality is redundant in SYCL.
+            */
+            return 801;
+        }
+        // STRATA_GDN_CHUNKED=2 skips the SM-count test (measurement on a card under 128 SMs: the scan then runs in
+        // several waves and is expected to be slower than the default kernel; the architecture and shared-memory
+        // tests stay)
+        static const bool any_sms = [] { const char* v = std::getenv("STRATA_GDN_CHUNKED"); return v != nullptr && std::atoi(v) >= 2; }();
+        if (strata::cc_major_of(major) < 8 || (!any_sms && sms < HK * (S / GDV)) || (size_t) strata::smem_optin_of(smem) < kChunkScanSmem)
+            return 801;
+    }
+    float* scratch = gdn_chunk_scratch();
+    if (scratch == nullptr) return 2;
+    const int nb = (int) ((std::min<int64_t>(GSB, T) + GCH - 1) / GCH);
+    const size_t tsz = (size_t) nb * HV * GCH * GCH;
+    float *tm = scratch, *pm = tm + tsz, *gm = pm + tsz;
+    {   // once a device
+        static bool attrs[64] = {};
+        int dev = 0;
+        dev = dpct::get_current_device_id();
+        if (dev >= 0 && dev < 64 && !attrs[dev]) {
+            /*
+            DPCT1026: The call to cudaFuncSetAttribute was removed because
+            SYCL currently does not support corresponding setting.
+            */
+            /*
+            DPCT1026: The call to cudaFuncSetAttribute was removed because
+            SYCL currently does not support corresponding setting.
+            */
+            attrs[dev] = true;
+        }
+    }
+    for (int64_t t0 = 0; t0 < T; t0 += GSB) {
+        const int nch = (int) ((std::min<int64_t>(GSB, T - t0) + GCH - 1) / GCH);
+        {
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};
+
+            s->submit([&](sycl::handler &cgh) {
+                sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
+                    sycl::range(kChunkPrepSmem), cgh);
+
+                cgh.parallel_for<
+                    dpct_kernel_name<class gdn_chunk_prep_kernel_c650a7>>(
+                    sycl::nd_range<3>(sycl::range(1, HK, (unsigned)nch) *
+                                          sycl::range(1, 1, 256),
+                                      sycl::range(1, 1, 256)),
+                    exp_props,
+                    [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(
+                        32)]] {
+                        gdn_chunk_prep_kernel(
+                            h, gate, beta, tm, pm, gm, t0, T,
+                            dpct_local_acc_ct1
+                                .get_multi_ptr<sycl::access::decorated::no>()
+                                .get());
+                    });
+            });
+        }
+        /*
+        DPCT1049: The work-group size passed to the SYCL kernel may exceed
+        the limit. To get the device limit, query
+        info::device::max_work_group_size. Adjust the work-group size if needed.
+        */
+        {
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};
+
+            s->submit([&](sycl::handler &cgh) {
+                sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
+                    sycl::range(kChunkScanSmem), cgh);
+
+                cgh.parallel_for<
+                    dpct_kernel_name<class gdn_chunk_scan_kernel_92dcf0>>(
+                    sycl::nd_range<3>(sycl::range(1, S / GDV, HK) *
+                                          sycl::range(1, 1, 128 * VPK),
+                                      sycl::range(1, 1, 128 * VPK)),
+                    exp_props, [=](sycl::nd_item<3> item_ct1) {
+                        gdn_chunk_scan_kernel(
+                            state, h, beta, tm, pm, gm, y, t0, nch, T,
+                            dpct_local_acc_ct1
+                                .get_multi_ptr<sycl::access::decorated::no>()
+                                .get());
+                    });
+            });
+        }
+    }
+    return 0; // launch errors surface at the caller's check; an error above
+              // means nothing ran
 }
 #endif
 #if defined(__HIPCC__)   // the Aurora (gfx11) recurrence kernels: AMD builds only
@@ -1641,6 +2386,340 @@ __global__ void __launch_bounds__(S) gdn_out_norm_loop_kernel(const float* __res
         }
     }
 }
+// STRATA_GDN_CHUNKED=1 on the gfx11 matrix cores: the recurrence in chunks of 16 tokens (the WY form of the CUDA
+// chunked path above), FP16 operands and FP32 accumulation, the output norm fused.  Per value head, gamma_t the
+// gate's sum from the chunk's start to t (inclusive; the code's sg) and S0 the state before the chunk:
+//   A[t][i] = beta_t exp(gamma_t - gamma_i) k_t.k_i (i < t),  T = (I + A)^-1,  P[t][i] = exp(gamma_t - gamma_i) q_t.k_i (i <= t),
+//   Y = beta (V - exp(gamma) K S0),  D = T Y,  o = exp(gamma) Q S0 + P D,
+//   S = exp(gamma_last) S0 + K^T (exp(gamma_last - gamma) D).
+// gdn_wmma_prep_kernel computes T and P of every chunk at once (they do not depend on the state); gdn_wmma_scan_kernel
+// walks the chunks, a block per value head and a wave per 16 value columns, the state in the waves' WMMA accumulators
+// (FP32), each product a 16 x 16 x 16 WMMA: k, q, T, P, D and the state as an operand are rounded to FP16 (relative
+// 2^-11), so the output differs from the FP32 kernels by more than their rounding (tests/hip/gdn_chunked.cpp holds it
+// to the bounds of its Error::ok).  The norm and the z gate run in the scan.
+#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1150__) || defined(__gfx1151__)
+#define STRATA_GDN_WMMA 1   // device pass with the gfx11 WMMA intrinsic (the list of gfx_arch_is_gfx11_wmma)
+#endif
+constexpr int GW_CK = 16;          // tokens per chunk (a WMMA tile)
+constexpr int GW_NW = S / 16;      // the scan's waves per block: one per 16 value columns
+constexpr int GW_VPK = HV / HK;    // value heads per key head: the prep's waves per block
+constexpr int GW_KP = S + 8;       // the scan's padded FP16 k / q rows
+constexpr int GW_AHEAD = 3;        // the scan warms the cache this many chunks ahead
+constexpr int64_t kGdnWmmaMin = 64;   // STRATA_GDN_CHUNKED=1 takes prompt chunks of this many tokens and more
+typedef _Float16 gw_h16 __attribute__((ext_vector_type(16)));
+typedef _Float16 gw_h8 __attribute__((ext_vector_type(8)));
+typedef _Float16 gw_h2 __attribute__((ext_vector_type(2)));
+typedef float gw_f8 __attribute__((ext_vector_type(8)));
+typedef float gw_f4 __attribute__((ext_vector_type(4)));   // (HIP's float4 copies through memcpy, which kept a staged
+                                                           // copy in scratch: a store that waits for the load)
+__device__ __forceinline__ gw_f8 gw_mma(gw_h16 a, gw_h16 b, gw_f8 c) {
+#if defined(STRATA_GDN_WMMA)
+    return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, c);
+#else
+    (void) a; (void) b; (void) c;
+    __builtin_trap();   // not a gfx11 device pass: the runtime gate never launches it
+#endif
+}
+// An accumulator tile (lane l: rows 2v + (l >> 4) for v = 0..7, column l & 15) as a B operand (lane l: column l & 15,
+// rows 0..15, both halves of the wave alike): pairs of rows rounded to FP16 and packed, the other half's pairs fetched
+// across (permlanex16), then interleaved by a byte permute whose selector depends on the lane's half (gw_sel).
+struct GwSel { unsigned even, odd; };
+__device__ __forceinline__ GwSel gw_sel(int hi) { return hi ? GwSel{0x01000504u, 0x03020706u} : GwSel{0x05040100u, 0x07060302u}; }
+__device__ __forceinline__ gw_h16 gw_acc_to_b(gw_f8 x, GwSel ps) {
+    unsigned wd[8];
+#pragma unroll
+    for (int m = 0; m < 4; ++m) {
+        const gw_h2 p = {(_Float16) x[2 * m], (_Float16) x[2 * m + 1]};
+        const unsigned own = __builtin_bit_cast(unsigned, p);
+#if defined(STRATA_GDN_WMMA)
+        const unsigned other = __builtin_amdgcn_permlanex16(own, own, 0x76543210u, 0xfedcba98u, false, false);
+#else
+        const unsigned other = own;
+#endif
+        wd[2 * m] = __builtin_amdgcn_perm(other, own, ps.even);
+        wd[2 * m + 1] = __builtin_amdgcn_perm(other, own, ps.odd);
+    }
+    return __builtin_bit_cast(gw_h16, wd);
+}
+__device__ __forceinline__ gw_h16 gw_ld(const _Float16* p) {   // 32 bytes of LDS, 16-byte aligned
+    const uint4 a = *reinterpret_cast<const uint4*>(p), b = *reinterpret_cast<const uint4*>(p + 8);
+    const uint4 ab[2] = {a, b};
+    return __builtin_bit_cast(gw_h16, ab);
+}
+// The wave's own LDS writes complete (read back across its lanes).  A gfx11 instruction: gfx12 device passes never run these kernels.
+__device__ __forceinline__ void gw_lds_wait() {
+#if defined(STRATA_GDN_WMMA)
+    __asm__ volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
+#endif
+}
+// A barrier over LDS only.  __syncthreads() is a workgroup fence over all memory, which on gfx11 also waits for every
+// global load in flight: the scan's loads of the next chunk would have to land before each barrier.
+__device__ __forceinline__ void gw_lds_barrier() {
+#if defined(STRATA_GDN_WMMA)
+    __asm__ volatile("s_waitcnt lgkmcnt(0)\n\ts_barrier" ::: "memory");
+#else
+    __syncthreads();   // the gfx11-only instruction must not reach a gfx12 device pass
+#endif
+}
+
+// A block per (key head, chunk) - the grid's x the key head, so the blocks in flight read the same token rows (blocks
+// that walked the key heads' slices of far-apart rows took 14 ms against 2.2 ms for 16K tokens on gfx1151) - and a wave per value head of the key head.
+// T then P, FP16 row-major (1 KB), at tp[(chunk * HV + value head) * 512].
+__global__ void __launch_bounds__(32 * GW_VPK) gdn_wmma_prep_kernel(const float* __restrict__ h, const float* __restrict__ gate,
+                                                                 const float* __restrict__ beta, _Float16* __restrict__ tp,
+                                                                 int64_t T) {
+    __shared__ float sa[GW_VPK][GW_CK * GW_CK], sg[GW_VPK][GW_CK], sb[GW_VPK][GW_CK];
+    const int qh = blockIdx.x, ch = blockIdx.y, w = threadIdx.x >> 5, l = threadIdx.x & 31, c = l & 15, hi = l >> 4;
+    const int vh = qh + w * HK;
+    const int64_t t0 = (int64_t) ch * GW_CK;
+    gw_f8 kk = {}, qk = {};   // k_t.k_i and q_t.k_i (lane: column i = c, rows t = 2v + hi)
+    {
+        const bool ok = t0 + c < T;   // past the end: zero rows
+        const float* ht = h + (ok ? t0 + c : 0) * C;
+#pragma unroll
+        for (int j = 0; j < S / 16; ++j) {
+            gw_h16 ka, qa;
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const gw_f4 k4 = *reinterpret_cast<const gw_f4*>(ht + HK * S + qh * S + 16 * j + 4 * i);
+                const gw_f4 q4 = *reinterpret_cast<const gw_f4*>(ht + qh * S + 16 * j + 4 * i);
+#pragma unroll
+                for (int e = 0; e < 4; ++e) {
+                    ka[4 * i + e] = (_Float16) (ok ? k4[e] : 0.0f);
+                    qa[4 * i + e] = (_Float16) (ok ? q4[e] : 0.0f);
+                }
+            }
+            kk = gw_mma(ka, ka, kk);   // B = K^T: lane i holds column i of K^T, row i of K - the A operand itself
+            qk = gw_mma(qa, ka, qk);
+        }
+    }
+    if (l < GW_CK) {   // past the end: gate 0, beta 0
+        const bool ok = t0 + l < T;
+        float g = ok ? gate[(t0 + l) * HV + vh] : 0.0f;
+#pragma unroll
+        for (int o = 1; o < GW_CK; o <<= 1) {
+            const float u = __shfl_up(g, o, GW_CK);
+            if (l >= o) g += u;
+        }
+        sg[w][l] = g;
+        sb[w][l] = ok ? beta[(t0 + l) * HV + vh] : 0.0f;
+    }
+    gw_lds_wait();   // the wave's own LDS writes, read across its lanes
+    _Float16* out = tp + ((int64_t) ch * HV + vh) * (2 * GW_CK * GW_CK);
+#pragma unroll
+    for (int v = 0; v < 8; ++v) {
+        const int t = 2 * v + hi;
+        sa[w][t * GW_CK + c] = c < t ? sb[w][t] * __expf(sg[w][t] - sg[w][c]) * kk[v] : 0.0f;
+        out[GW_CK * GW_CK + t * GW_CK + c] = (_Float16) (c <= t ? __expf(sg[w][t] - sg[w][c]) * qk[v] : 0.0f);
+    }
+    gw_lds_wait();
+    if (l < GW_CK) {   // lane c: column c of T = (I + A)^-1 by forward substitution
+        float tc[GW_CK];
+#pragma unroll
+        for (int t = 0; t < GW_CK; ++t) {
+            float v = t == c ? 1.0f : 0.0f;
+#pragma unroll
+            for (int k = 0; k < t; ++k) v = fmaf(-sa[w][t * GW_CK + k], tc[k], v);
+            tc[t] = v;
+            out[t * GW_CK + c] = (_Float16) v;
+        }
+    }
+}
+
+// A thread's slice of a chunk in the scan (token threadIdx / 16, columns (threadIdx % 16) * 8 .. + 7): k, q and v,
+// loaded a chunk ahead, and one word of the chunk's T and P; lanes 0..15 of wave 0 also gate and beta of token l.
+// Rows past the end read the last row (finite: their gate and beta become 0 at staging, which keeps them out of the
+// state, of the real rows' products and of the output) - no select on the loaded values, which would wait for them.
+struct GwChunk {
+    gw_f4 k0, k1, q0, q1, v0, v1;
+    float g, b;
+    unsigned tp;
+};
+__device__ __forceinline__ void gw_load(GwChunk& in, const float* __restrict__ h, const float* __restrict__ gate,
+                                        const float* __restrict__ beta, const unsigned* __restrict__ tp, int64_t t0,
+                                        int64_t T, int vh, int qh) {
+    const int t = threadIdx.x >> 4, r = (threadIdx.x & 15) * 8;
+    const float* ht = h + std::min<int64_t>(t0 + t, T - 1) * C;
+    in.tp = tp[((t0 / GW_CK) * HV + vh) * (GW_CK * GW_CK) + threadIdx.x];
+    in.k0 = *reinterpret_cast<const gw_f4*>(ht + HK * S + qh * S + r);
+    in.k1 = *reinterpret_cast<const gw_f4*>(ht + HK * S + qh * S + r + 4);
+    in.q0 = *reinterpret_cast<const gw_f4*>(ht + qh * S + r);
+    in.q1 = *reinterpret_cast<const gw_f4*>(ht + qh * S + r + 4);
+    in.v0 = *reinterpret_cast<const gw_f4*>(ht + 2 * HK * S + vh * S + r);
+    in.v1 = *reinterpret_cast<const gw_f4*>(ht + 2 * HK * S + vh * S + r + 4);
+    if (threadIdx.x < GW_CK) {
+        const int64_t tl = std::min<int64_t>(t0 + threadIdx.x, T - 1);
+        in.g = gate[tl * HV + vh];
+        in.b = beta[tl * HV + vh];
+    }
+}
+// Brings a later chunk's lines (this block's k, q, v and z rows: 256 lines of 128 bytes, one a thread) into the cache
+// with a load whose result is not used, so the real loads of that chunk hit the cache.  An ordinary load: the compiler
+// tracks it, and the result is consumed (by an empty asm) one chunk later, after the store of the previous chunk's output
+// rows, where the wait for the loads issued before that point also covers it.
+__device__ __forceinline__ unsigned gw_touch(const float* __restrict__ h, const float* __restrict__ z, int64_t t0,
+                                             int64_t T, int vh, int qh) {
+    const int t = threadIdx.x >> 4, part = threadIdx.x & 15, kind = part >> 2;
+    if (t0 + t >= T) return 0u;
+    const float* p = kind == 0 ? h + (t0 + t) * C + HK * S + qh * S
+                   : kind == 1 ? h + (t0 + t) * C + qh * S
+                   : kind == 2 ? h + (t0 + t) * C + 2 * HK * S + vh * S
+                               : z + (t0 + t) * HV * S + vh * S;
+    return sycl::bit_cast<uint32_t>(p[32 * (part & 3)]);
+}
+// Per chunk: stage it (k / q FP16, k also transposed, v, the gate's running sum, beta, T and P); barrier (1); store
+// the previous chunk's output rows (the z gate on its normed output, 16 bytes a thread); X = K S0, QS = Q S0; Y, D,
+// o and the wave's sums of o^2; the state update; barrier (2); the norm.  LDS is single-buffered: an array written in
+// the staging of chunk c + 1 or after its barrier (2) was last read before that wave reached barrier (1) of c + 1.
+__global__ void __launch_bounds__(GW_NW * 32) gdn_wmma_scan_kernel(float* __restrict__ state, const float* __restrict__ h,
+                                                                   const float* __restrict__ gate, const float* __restrict__ beta,
+                                                                   const float* __restrict__ z, const float* __restrict__ gamma,
+                                                                   const unsigned* __restrict__ tp, float eps,
+                                                                   uint16_t* __restrict__ y16, int64_t T, int64_t ld16) {
+    __shared__ __attribute__((aligned(16))) _Float16 sk[GW_CK * GW_KP], sq[GW_CK * GW_KP], skt[S * GW_CK],
+        stp[2 * GW_CK * GW_CK];
+    __shared__ __attribute__((aligned(16))) float sv[GW_CK * S], so[GW_CK * S], sn[GW_CK * GW_NW];
+    __shared__ float sg[GW_CK], sb[GW_CK], sgam[S];
+    const _Float16 *st_ = stp, *sp_ = stp + GW_CK * GW_CK;   // T, P
+    const int vh = blockIdx.x, qh = vh % HK, w = threadIdx.x >> 5, l = threadIdx.x & 31, c = l & 15, hi = l >> 4;
+    const int col = 16 * w + c;                                       // this lane's column in the products
+    const int st = threadIdx.x >> 4, sr = (threadIdx.x & 15) * 8;    // this thread's staging slice
+    const size_t rs = (size_t) HV * S;
+    const GwSel ps = gw_sel(hi);
+    gw_f8 s[S / 16];   // the state: rows 16j + 2v + hi, column col
+#pragma unroll
+    for (int j = 0; j < S / 16; ++j)
+#pragma unroll
+        for (int v = 0; v < 8; ++v) s[j][v] = state[(size_t) (16 * j + 2 * v + hi) * rs + (size_t) vh * S + col];
+    if (threadIdx.x < S) sgam[threadIdx.x] = gamma[threadIdx.x];
+    const float out_scale = rsqrtf((float) S);
+    GwChunk cur;
+    gw_load(cur, h, gate, beta, tp, 0, T, vh, qh);
+    unsigned touched = 0;
+    gw_f4 z0 = {}, z1 = {};   // the z slice of the chunk whose output rows are stored next
+    auto store_rows = [&](int64_t c0) {   // the output rows of the chunk at c0 (its norm in so): z gate, FP16
+        if (c0 + st >= T) return;
+        const float* o = &so[st * S + sr];
+        gw_h8 r;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) r[i] = (_Float16) (o[i] * sigm(i < 4 ? z0[i] : z1[i - 4]));
+        *reinterpret_cast<uint4*>(y16 + (c0 + st) * ld16 + vh * S + sr) = __builtin_bit_cast(uint4, r);
+    };
+    for (int64_t t0 = 0; t0 < T; t0 += GW_CK) {
+        {   // stage this chunk
+            gw_h8 kh, qq;
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                kh[i] = (_Float16) (i < 4 ? cur.k0[i] : cur.k1[i - 4]);
+                qq[i] = (_Float16) (i < 4 ? cur.q0[i] : cur.q1[i - 4]);
+                skt[(sr + i) * GW_CK + st] = kh[i];
+            }
+            *reinterpret_cast<uint4*>(&sk[st * GW_KP + sr]) = __builtin_bit_cast(uint4, kh);
+            *reinterpret_cast<uint4*>(&sq[st * GW_KP + sr]) = __builtin_bit_cast(uint4, qq);
+            *reinterpret_cast<gw_f4*>(&sv[st * S + sr]) = cur.v0;
+            *reinterpret_cast<gw_f4*>(&sv[st * S + sr + 4]) = cur.v1;
+            reinterpret_cast<unsigned*>(stp)[threadIdx.x] = cur.tp;
+            if (threadIdx.x < GW_CK) {   // past the end: gate 0, beta 0
+                const bool ok = t0 + l < T;
+                float g = ok ? cur.g : 0.0f;
+#pragma unroll
+                for (int o = 1; o < GW_CK; o <<= 1) {
+                    const float u = __shfl_up(g, o, GW_CK);
+                    if (l >= o) g += u;
+                }
+                sg[l] = g;
+                sb[l] = ok ? cur.b : 0.0f;
+            }
+        }
+        if (t0 + GW_CK < T) gw_load(cur, h, gate, beta, tp, t0 + GW_CK, T, vh, qh);   // lands during this chunk
+        const unsigned touch_now = gw_touch(h, z, t0 + GW_AHEAD * GW_CK, T, vh, qh);
+        gw_lds_barrier();   // (1) this chunk staged; the previous chunk's norm in so
+        if (t0 > 0) store_rows(t0 - GW_CK);
+        __asm__ volatile("" ::"v"(touched));   // the previous touch, consumed here
+        touched = touch_now;
+        {   // this chunk's z slice, for its output rows after barrier (1) of the next chunk
+            const int64_t tz = std::min<int64_t>(t0 + st, T - 1);
+            z0 = *reinterpret_cast<const gw_f4*>(z + tz * HV * S + vh * S + sr);
+            z1 = *reinterpret_cast<const gw_f4*>(z + tz * HV * S + vh * S + sr + 4);
+        }
+        gw_f8 x = {}, qs = {};   // K S0 and Q S0, this wave's columns
+#pragma unroll
+        for (int j = 0; j < S / 16; ++j) {
+            const gw_h16 b = gw_acc_to_b(s[j], ps);
+            x = gw_mma(gw_ld(sk + c * GW_KP + 16 * j), b, x);
+            qs = gw_mma(gw_ld(sq + c * GW_KP + 16 * j), b, qs);
+        }
+        gw_f8 y;
+#pragma unroll
+        for (int v = 0; v < 8; ++v) {
+            const int t = 2 * v + hi;
+            y[v] = sb[t] * (sv[t * S + col] - __expf(sg[t]) * x[v]);
+        }
+        const gw_f8 d = gw_mma(gw_ld(st_ + c * GW_CK), gw_acc_to_b(y, ps), gw_f8{});
+        gw_f8 o;
+#pragma unroll
+        for (int v = 0; v < 8; ++v) o[v] = __expf(sg[2 * v + hi]) * qs[v];
+        o = gw_mma(gw_ld(sp_ + c * GW_CK), gw_acc_to_b(d, ps), o);
+#pragma unroll
+        for (int v = 0; v < 8; ++v) {   // the wave's 16 columns of o^2 per token, then the 8 waves' through LDS
+            o[v] *= out_scale;
+            float p = o[v] * o[v];
+#pragma unroll
+            for (int m = 1; m < 16; m <<= 1) p += __shfl_xor(p, m);
+            if (c == 0) sn[(2 * v + hi) * GW_NW + w] = p;
+        }
+        const float gl = sg[GW_CK - 1];
+        gw_f8 dd;
+#pragma unroll
+        for (int v = 0; v < 8; ++v) dd[v] = __expf(gl - sg[2 * v + hi]) * d[v];
+        const gw_h16 db = gw_acc_to_b(dd, ps);
+        const float eg = __expf(gl);
+#pragma unroll
+        for (int j = 0; j < S / 16; ++j) s[j] = gw_mma(gw_ld(skt + (16 * j + c) * GW_CK), db, s[j] * eg);
+        gw_lds_barrier();   // (2) the sums of o^2
+        const float g_col = sgam[col];
+#pragma unroll
+        for (int v = 0; v < 8; ++v) {
+            const int t = 2 * v + hi;
+            const gw_f4 n0 = *reinterpret_cast<const gw_f4*>(&sn[t * GW_NW]), n1 = *reinterpret_cast<const gw_f4*>(&sn[t * GW_NW + 4]);
+            const float ss = n0[0] + n0[1] + n0[2] + n0[3] + n1[0] + n1[1] + n1[2] + n1[3];
+            so[t * S + col] = o[v] * rsqrtf(ss * (1.0f / S) + eps) * g_col;
+        }
+    }
+    __asm__ volatile("" ::"v"(touched));
+    gw_lds_barrier();
+    store_rows((T - 1) / GW_CK * GW_CK);
+    __asm__ volatile("" : "+s"(state));   // the state's addresses recomputed here, not kept (spilled) since the start
+#pragma unroll
+    for (int j = 0; j < S / 16; ++j)
+#pragma unroll
+        for (int v = 0; v < 8; ++v) state[(size_t) (16 * j + 2 * v + hi) * rs + (size_t) vh * S + col] = s[j][v];
+}
+// The opt-in chunked recurrence on gfx11 (STRATA_GDN_CHUNKED=1): false (nothing launched) on another part.  y, the
+// FP32 scratch of the other kernels (T x 6144 floats), holds T and P (1 KB per chunk and value head: T x 3 KB).
+bool gdn_rec_wmma(float* state, const float* h, const float* gate, const float* beta, const float* z, const float* gamma,
+                  float eps, float* y, uint16_t* y16, int64_t T, cudaStream_t s, int64_t ld16) {
+    if (T < kGdnWmmaMin || ld16 % 8 != 0) return false;   // the rows are stored 16 bytes at a time
+    // A layer-split worker can change devices: a process-wide answer for the first card can launch a trapping
+    // gfx11 kernel on a later gfx12 card.  Cache only the current thread's last device, as properties are not cheap.
+    static thread_local int last_device = -1;
+    static thread_local bool gfx11 = false;
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) return false;
+    if (dev != last_device) {
+        cudaDeviceProp p{};
+        if (cudaGetDeviceProperties(&p, dev) != cudaSuccess) return false;
+        gfx11 = strata::kernels::gfx_arch_is_gfx11_wmma(p.gcnArchName);
+        last_device = dev;
+    }
+    if (!gfx11) return false;
+    const int64_t nch = (T + GW_CK - 1) / GW_CK;
+    _Float16* tp = reinterpret_cast<_Float16*>(y);
+    gdn_wmma_prep_kernel<<<dim3(HK, (unsigned) nch), 32 * GW_VPK, 0, s>>>(h, gate, beta, tp, T);
+    gdn_wmma_scan_kernel<<<HV, GW_NW * 32, 0, s>>>(state, h, gate, beta, z, gamma, reinterpret_cast<const unsigned*>(tp),
+                                                   eps, y16, T, ld16);
+    return true;
+}
 #endif   // __HIPCC__
 __dpct_inline__ void gdn_out_norm_kernel(const float *__restrict__ z,
                                          const float *__restrict__ gamma,
@@ -1785,6 +2864,22 @@ __dpct_inline__ void swiglu_il_kernel(const float *__restrict__ gu,
     const float g = gu[r * 1280 + 2 * k], u = gu[r * 1280 + 2 * k + 1];
     h16[i] = hf_sat(g / (1.0f + sycl::native::exp(-g)) * u);
 }
+// The Volta prompt experts (gemm_iq_f16_grouped): SwiGLU of the gate/up product's rows (gate 0..n_ff, up n_ff..2 n_ff,
+// or interleaved) to the FP16 input of the down product, saturated as swiglu_il_kernel
+__dpct_inline__ void swiglu_split_f16_kernel(const float *__restrict__ gu,
+                                             uint16_t *__restrict__ h16,
+                                             int64_t rows, int n_ff,
+                                             bool interleaved) {
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    const int64_t i =
+        (int64_t)item_ct1.get_group(2) * item_ct1.get_local_range(2) +
+        item_ct1.get_local_id(2);
+    if (i >= rows * n_ff) return;
+    const int64_t r = i / n_ff, k = i % n_ff;
+    const float* row = gu + r * 2 * n_ff;
+    const float g = interleaved ? row[2 * k] : row[k], u = interleaved ? row[2 * k + 1] : row[n_ff + k];
+    h16[i] = hf_sat(g / (1.0f + sycl::native::exp(-g)) * u);
+}
 __dpct_inline__ void swiglu_pair_kernel(const float *__restrict__ g,
                                         const float *__restrict__ u,
                                         uint16_t *__restrict__ h16, int64_t n) {
@@ -1815,7 +2910,8 @@ __dpct_inline__ void moe_combine_kernel(const float *__restrict__ Dm,
                                         const float *__restrict__ w,
                                         const float *__restrict__ shared,
                                         const float *__restrict__ sg,
-                                        float *__restrict__ bo, int64_t T) {
+                                        float *__restrict__ bo, int64_t T,
+                                        const float *__restrict__ row_sd) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
     const int64_t i =
         (int64_t)item_ct1.get_group(2) * item_ct1.get_local_range(2) +
@@ -1824,9 +2920,11 @@ __dpct_inline__ void moe_combine_kernel(const float *__restrict__ Dm,
     const int64_t t = i / N, d = i % N;
     float s = 0.0f;
 #pragma unroll
-    for (int k = 0; k < 10; ++k)
-        s = sycl::fma((float)(w[t * 10 + k]),
-                      (float)(Dm[(int64_t)slot[t * 10 + k] * N + d]), s);
+    for (int k = 0; k < 10; ++k) {
+        const int64_t r = slot[t * 10 + k];
+        const float v = row_sd ? Dm[r * N + d] * row_sd[r] : Dm[r * N + d];   // the product scale_down_rows stored
+        s = sycl::fma((float)(w[t * 10 + k]), (float)v, s);
+    }
     bo[i] = s + shared[i] * sigm(sg[t]);
 }
 
@@ -1841,7 +2939,8 @@ adjust the code, or use smaller sub-group size to avoid high register pressure.
 __dpct_inline__ void moe_combine4_kernel(
     const float *__restrict__ Dm, const int32_t *__restrict__ slot,
     const float *__restrict__ w, const sycl::float4 *__restrict__ shared,
-    const float *__restrict__ sg, sycl::float4 *__restrict__ bo, int64_t T) {
+    const float *__restrict__ sg, sycl::float4 *__restrict__ bo, int64_t T,
+    const float *__restrict__ row_sd) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
     const int64_t i =
         (int64_t)item_ct1.get_group(2) * item_ct1.get_local_range(2) +
@@ -1854,8 +2953,13 @@ __dpct_inline__ void moe_combine4_kernel(
 #pragma unroll
     for (int k = 0; k < 10; ++k) {
         ww[k] = w[t * 10 + k];
-        v[k] = *reinterpret_cast<const sycl::float4 *>(
-            Dm + (int64_t)slot[t * 10 + k] * N + d);
+        const int64_t r = slot[t * 10 + k];
+        v[k] = *reinterpret_cast<const sycl::float4 *>(Dm + r * N + d);
+        if (row_sd) {   // NVFP4 in MMQ: the row's s_down, as moe_combine_kernel applies it
+            const float sd = row_sd[r];
+            v[k] = sycl::float4(v[k].x() * sd, v[k].y() * sd, v[k].z() * sd,
+                                v[k].w() * sd);
+        }
     }
 #pragma unroll
     for (int k = 0; k < 10; ++k) {
@@ -1868,6 +2972,37 @@ __dpct_inline__ void moe_combine4_kernel(
     const sycl::float4 sh = shared[i];
     bo[i] = sycl::float4(s.x() + sh.x() * g, s.y() + sh.y() * g,
                          s.z() + sh.z() * g, s.w() + sh.w() * g);
+}
+
+__dpct_inline__ void moe_shared_init_kernel(const float *__restrict__ shared,
+                                            const float *__restrict__ sg,
+                                            float *__restrict__ acc,
+                                            int64_t T) {
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    const int64_t i =
+        (int64_t)item_ct1.get_group(2) * item_ct1.get_local_range(2) +
+        item_ct1.get_local_id(2);
+    if (i >= T * N) return;
+    acc[i] = shared[i] * sigm(sg[i / N]);
+}
+// grid (n_u, ceil(N / 256)): one token of the group per block row, its rows summed in order
+__dpct_inline__ void moe_scatter_add_kernel(const float *__restrict__ Dm,
+                                            const int32_t *__restrict__ u_tok,
+                                            const int32_t *__restrict__ u_off,
+                                            const int32_t *__restrict__ u_rows,
+                                            const float *__restrict__ u_w,
+                                            float *__restrict__ acc) {
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    const int64_t u = item_ct1.get_group(2);
+    const int64_t d =
+        (int64_t)item_ct1.get_group(1) * item_ct1.get_local_range(2) +
+        item_ct1.get_local_id(2);
+    if (d >= N) return;
+    float s = 0.0f;
+#pragma unroll
+    for (int32_t j = u_off[u]; j < u_off[u + 1]; ++j) s =
+        sycl::fma((float)(u_w[j]), (float)(Dm[(int64_t)u_rows[j] * N + d]), s);
+    acc[(int64_t) u_tok[u] * N + d] += s;
 }
 
 // ---------------------------------------------------------------- QSA helpers
@@ -2063,7 +3198,11 @@ __dpct_inline__ void to_f16_kernel(const float *__restrict__ x,
              item_ct1.get_local_id(2);
          i < n; i += (int64_t)item_ct1.get_group_range(2) *
                      item_ct1.get_local_range(2))
-        y[i] = hf(x[i]);
+#if defined(__HIPCC__)
+        y[i] = hf_sat(x[i]);   // saturated and counted like every other FP16 image (the hc / embedding image on gfx103x)
+#else
+        y[i] = hf(x[i]);       // CUDA: as it was
+#endif
 }
 __dpct_inline__ void round_f16_kernel(const float *__restrict__ x,
                                       float *__restrict__ y, int64_t n) {
@@ -2104,7 +3243,7 @@ __dpct_inline__ void to_bf16_kernel(const float *__restrict__ x,
 typedef __bf16 um_b16 __attribute__((ext_vector_type(16)));
 typedef float um_f8 __attribute__((ext_vector_type(8)));
 __device__ __forceinline__ um_f8 um_wmma(um_b16 a, um_b16 b, um_f8 c) {
-#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1150__) || defined(__gfx1151__)
+#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__) || defined(__gfx1150__) || defined(__gfx1151__)
     return __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a, b, c);
 #else
     (void) a; (void) b; return c;   // not a gfx11 device pass: never launched (runtime gate)
@@ -2215,6 +3354,33 @@ void set_act_f16(bool on) {
     }
 #endif
 }
+void set_f16_range(bool on) {
+#if defined(__HIPCC__)
+    const int v = on ? 1 : 0;
+    if (cudaMemcpyToSymbol(g_f16_range_on, &v, sizeof v) != cudaSuccess) {
+        std::fprintf(stderr, "prefill: setting the FP16 range check failed: %s\n", cudaGetErrorString(cudaGetLastError()));
+        std::exit(1);
+    }
+#else
+    (void) on;
+#endif
+}
+bool f16_range_read(float& max_abs, unsigned long long& over, bool reset) {
+#if !defined(__HIPCC__)
+    (void) max_abs; (void) over; (void) reset;
+    return false;
+#else
+    unsigned bits = 0; unsigned long long o = 0;
+    if (cudaMemcpyFromSymbol(&bits, g_f16_range_max, sizeof bits) != cudaSuccess ||
+        cudaMemcpyFromSymbol(&o, g_f16_range_over, sizeof o) != cudaSuccess) { cudaGetLastError(); return false; }
+    union { unsigned u; float f; } c; c.u = bits; max_abs = c.f; over = o;
+    if (reset) {
+        const unsigned z = 0; const unsigned long long zz = 0;
+        cudaMemcpyToSymbol(g_f16_range_max, &z, sizeof z); cudaMemcpyToSymbol(g_f16_range_over, &zz, sizeof zz);
+    }
+    return true;
+#endif
+}
 void to_f16(const float* x, uint16_t* y, int64_t n, void* stream) {
     if (n <= 0) return;
     {
@@ -2274,7 +3440,7 @@ void to_bf16(const float* x, uint16_t* y, int64_t n, void* stream, uint16_t* ylo
 }
 
 void gr_norm(const float* R, const float* w_norm, float eps, float* xn, uint16_t* xn16, int64_t T, void* stream,
-             uint16_t* xn16_lo, bool /*f16img: the Turing FP16 image of xn16 (CUDA only)*/) {
+             uint16_t* xn16_lo, bool /*f16img*/) {
     {
         auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
@@ -2370,9 +3536,9 @@ void gr_write_norm_rs(float* R, const float* bo, const float* inj, int64_t inj_l
                     exp_props,
                     [=](sycl::nd_item<3> item_ct1)
                         [[sycl::reqd_sub_group_size(32)]] {
-                            gr_write_norm_rs_kernel(R, bo, inj, inj_ld,
-                                                    w_norm_next, eps, rs, xn16,
-                                                    xn16_lo, ldx_ldx_D_ct9);
+                            gr_write_norm_rs_kernel(
+                                R, bo, inj, inj_ld, w_norm_next, eps, rs, xn16,
+                                xn16_lo, ldx_ldx_D_ct9);
                         });
             });
     }
@@ -2602,15 +3768,28 @@ static bool gdn_xe_on(void* stream) {
     }();
     return on;
 }
-void gdn_recurrence_variant(int variant, float* state, const float* h, const float* gate, const float* beta,
-                            const float* z, const float* gamma, float eps, float* y, uint16_t* y16, int64_t T,
-                            void* stream, int64_t ld16) {
+// The recurrence dispatch, shared by the two entry points below so the state-only form cannot drift from the full
+// one.  `with_out` false runs exactly the same kernels minus the output normalization (the CUDA-only KVA path).
+static void gdn_recurrence_impl(int variant, float* state, const float* h, const float* gate, const float* beta,
+                                const float* z, const float* gamma, float eps, float* y, uint16_t* y16, int64_t T,
+                                void* stream, int64_t ld16, bool with_out) {
     if (ld16 <= 0) ld16 = (int64_t) HV * S;
+    static const bool serial = std::getenv("STRATA_GDN_REC_HEADS") != nullptr;   // the one-block-per-head kernel (A/B)
 #if defined(__HIPCC__)
+    if (variant == 0 || variant == 1) {
+        // STRATA_GDN_CHUNKED=1 (opt-in): the chunked recurrence on the gfx11 matrix cores, FP16 operands (other bits;
+        // a shorter chunk or another part takes the kernels below)
+        static const bool chunked = [] { const char* v = std::getenv("STRATA_GDN_CHUNKED"); return v != nullptr && std::atoi(v) != 0; }();
+        if (chunked && !serial && gdn_rec_wmma(state, h, gate, beta, z, gamma, eps, y, y16, T, (cudaStream_t) stream, ld16)) {
+            check("gdn_recurrence (chunked, WMMA)");
+            return;
+        }
+    }
     if (variant == 3) {   // diagnostics: the quad recurrence + the old norm kernel
         if (T > 0) {
             gdn_rec_quad_kernel<<<HV * (S / QCB), QTH, 0, (cudaStream_t) stream>>>(state, h, gate, beta, y, T);
-            gdn_out_norm_kernel<<<dim3((unsigned) T, HV), S, 0, (cudaStream_t) stream>>>(z, gamma, eps, y, y16, ld16);
+            if (with_out)
+                gdn_out_norm_kernel<<<dim3((unsigned) T, HV), S, 0, (cudaStream_t) stream>>>(z, gamma, eps, y, y16, ld16);
         }
         return;
     }
@@ -2620,8 +3799,9 @@ void gdn_recurrence_variant(int variant, float* state, const float* h, const flo
                 gdn_rec_quad2c_kernel<<<HV * (S / C2CB), QTH, 0, (cudaStream_t) stream>>>(state, h, gate, beta, y, T);
             else
                 gdn_rec_quad_pp_kernel<<<HV * (S / QCB), QTH, 0, (cudaStream_t) stream>>>(state, h, gate, beta, y, T);
-            gdn_out_norm_loop_kernel<true><<<(unsigned) std::min<int64_t>(T * HV, 4096), S, 0, (cudaStream_t) stream>>>(
-                z, gamma, eps, y, y16, T * HV, ld16);
+            if (with_out)
+                gdn_out_norm_loop_kernel<true><<<(unsigned) std::min<int64_t>(T * HV, 4096), S, 0, (cudaStream_t) stream>>>(
+                    z, gamma, eps, y, y16, T * HV, ld16);
         }
         check("gdn_recurrence (quad pp)");
         return;
@@ -2636,10 +3816,10 @@ void gdn_recurrence_variant(int variant, float* state, const float* h, const flo
             else
                 gdn_rec_quad_kernel<<<HV * (S / QCB), QTH, 0, (cudaStream_t) stream>>>(state, h, gate, beta, y, T);
             static const bool noy = [] { const char* v = std::getenv("STRATA_GDN_NOY"); return v && std::atoi(v) != 0; }();
-            if (noy)
+            if (with_out && noy)
                 gdn_out_norm_loop_kernel<false><<<(unsigned) std::min<int64_t>(T * HV, 4096), S, 0, (cudaStream_t) stream>>>(
                     z, gamma, eps, y, y16, T * HV, ld16);
-            else
+            else if (with_out)
                 gdn_out_norm_loop_kernel<true><<<(unsigned) std::min<int64_t>(T * HV, 4096), S, 0, (cudaStream_t) stream>>>(
                     z, gamma, eps, y, y16, T * HV, ld16);
         }
@@ -2649,11 +3829,10 @@ void gdn_recurrence_variant(int variant, float* state, const float* h, const flo
 #else
     (void) variant;   // the quad recurrence kernels are AMD-only
 #endif
-    static const bool serial = std::getenv("STRATA_GDN_REC_HEADS") != nullptr;   // the one-block-per-head kernel (A/B)
     // variant 6 = the Xe sub-group recurrence + the unchanged norm kernel (gdn_recurrence: gdn_xe_on)
     const bool xe = T > 0 && !serial && variant == 6;
     if (xe && !gdn_xe_device(stream)) throw std::runtime_error("GDN Xe variant requires an Intel GPU with 16-lane sub-groups");
-    if (!xe && (serial || T <= 0 || variant == 2)) {
+    if (!xe && ((serial && with_out) || T <= 0 || variant == 2)) {
         /*
         DPCT1049: The work-group size passed to the SYCL kernel may exceed
         the limit. To get the device limit, query
@@ -2673,11 +3852,19 @@ void gdn_recurrence_variant(int variant, float* state, const float* h, const flo
                     });
     } else {
         static const bool pipe = [] { const char* v = std::getenv("STRATA_GDN_PIPELINE"); return v == nullptr || std::atoi(v) != 0; }();
+#if !defined(__HIPCC__)
+        // STRATA_GDN_CHUNKED=1 (opt-in): the recurrence in chunks for prompt chunks of kGdnChunkedMin+ tokens (other
+        // bits; a shorter chunk, a card it does not fit or a failed scratch allocation takes the kernels below)
+        static const bool chunked = [] { const char* v = std::getenv("STRATA_GDN_CHUNKED"); return v != nullptr && std::atoi(v) != 0; }();
+#endif
         if (xe) {
             detail::gdn_xe_launch(*strata::q_of(stream), state, h, gate, beta, y, T);
         } else
 #if !defined(__HIPCC__)
-        if (pipe && gdn_keyhead_ok())   // the value heads of a key head in one thread (same bits)
+        if (chunked && T >= kGdnChunkedMin &&
+                   gdn_rec_chunked(state, h, gate, beta, y, T,
+                                   strata::q_of(stream)) == 0) {
+        } else if (pipe && gdn_keyhead_ok())   // the value heads of a key head in one thread (same bits)
         {
             auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
@@ -2718,6 +3905,7 @@ void gdn_recurrence_variant(int variant, float* state, const float* h, const flo
                         gdn_rec_cols_kernel(state, h, gate, beta, y, T);
                     });
         }
+        if (with_out)
         {
             auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
@@ -2736,6 +3924,11 @@ void gdn_recurrence_variant(int variant, float* state, const float* h, const flo
     }
     check("gdn_recurrence");
 }
+void gdn_recurrence_variant(int variant, float* state, const float* h, const float* gate, const float* beta,
+                            const float* z, const float* gamma, float eps, float* y, uint16_t* y16, int64_t T,
+                            void* stream, int64_t ld16) {
+    gdn_recurrence_impl(variant, state, h, gate, beta, z, gamma, eps, y, y16, T, stream, ld16, /*with_out=*/true);
+}
 void gdn_recurrence(float* state, const float* h, const float* gate, const float* beta, const float* z,
                     const float* gamma, float eps, float* y, uint16_t* y16, int64_t T, void* stream, int64_t ld16) {
     // Aurora (S23): four lanes per column + the grid-stride norm, the same bits (tests/hip/gdn_rec_head.cpp);
@@ -2744,7 +3937,17 @@ void gdn_recurrence(float* state, const float* h, const float* gate, const float
     static const bool head = [] { const char* v = std::getenv("STRATA_GDN_HEAD"); return v != nullptr && std::atoi(v) != 0; }();
     static const bool serial = std::getenv("STRATA_GDN_REC_HEADS") != nullptr;
     const int v = head && !serial ? 1 : (!serial && gdn_xe_on(stream)) ? 6 : 0;
-    gdn_recurrence_variant(v, state, h, gate, beta, z, gamma, eps, y, y16, T, stream, ld16);
+    gdn_recurrence_impl(v, state, h, gate, beta, z, gamma, eps, y, y16, T, stream, ld16, true);
+}
+/// KVA: the same recurrence, bit for bit, without the output normalisation (its readers - the output projection
+/// and the gated residual write - have no consumer when only the state advances).  `y` is still the scratch the
+/// recurrence kernels write; `z`/`gamma` are not read.
+void gdn_recurrence_state_only(float* state, const float* h, const float* gate, const float* beta, float* y,
+                               int64_t T, void* stream) {
+    static const bool head = [] { const char* v = std::getenv("STRATA_GDN_HEAD"); return v != nullptr && std::atoi(v) != 0; }();
+    static const bool serial = std::getenv("STRATA_GDN_REC_HEADS") != nullptr;
+    const int v = head && !serial ? 1 : (!serial && gdn_xe_on(stream)) ? 6 : 0;
+    gdn_recurrence_impl(v, state, h, gate, beta, nullptr, nullptr, 0.0f, y, nullptr, T, stream, 0, /*with_out=*/false);
 }
 void route(const float* logits, int32_t* ids, float* weights, int64_t T, int64_t n_expert, void* stream) {
     if (n_expert == 512)
@@ -2830,6 +4033,23 @@ void swiglu_interleaved(const float* gu, uint16_t* h16, int64_t n, void* stream)
                 });
     }
     check("swiglu_interleaved");
+}
+void swiglu_split_f16(const float* gu, uint16_t* h16, int64_t rows, int n_ff, bool interleaved, void* stream) {
+    if (rows <= 0) return;
+    {
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
+
+        strata::q_of(stream)
+            ->parallel_for<
+                dpct_kernel_name<class swiglu_split_f16_kernel_4afb8d>>(
+                sycl::nd_range<3>(sycl::range(1, 1, blocks_for(rows * n_ff)) *
+                                      sycl::range(1, 1, 256),
+                                  sycl::range(1, 1, 256)),
+                exp_props, [=](sycl::nd_item<3> item_ct1) {
+                    swiglu_split_f16_kernel(gu, h16, rows, n_ff, interleaved);
+                });
+    }
+    check("swiglu_split_f16");
 }
 void swiglu_pair(const float* g, const float* u, uint16_t* h16, int64_t n, void* stream) {
     {
@@ -2928,6 +4148,223 @@ void gather_rows16(const uint16_t* x16, const int32_t* src, uint16_t* dst16, int
     }
     check("gather_rows16");
 }
+namespace {
+__dpct_inline__ void moe_combine_peer_kernel(
+    const float *__restrict__ Dm, const int32_t *__restrict__ slot,
+    const float *__restrict__ w, const float *__restrict__ shared,
+    const float *__restrict__ sg, const float *__restrict__ peer,
+    int64_t rows_local, float *__restrict__ bo, int64_t T) {
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    const int64_t i =
+        (int64_t)item_ct1.get_group(2) * item_ct1.get_local_range(2) +
+        item_ct1.get_local_id(2);
+    if (i >= T * N) return;
+    const int64_t t = i / N, d = i % N;
+    float s = 0.0f;
+#pragma unroll
+    for (int k = 0; k < 10; ++k) {
+        const int32_t r = slot[t * 10 + k];
+        if (r < rows_local) s = sycl::fma((float)(w[t * 10 + k]),
+                                          (float)(Dm[(int64_t)r * N + d]), s);
+    }
+    bo[i] = (s + peer[i]) + shared[i] * sigm(sg[t]);
+}
+__dpct_inline__ void peer_scatter_add_kernel(float *__restrict__ sum,
+                                             const float *__restrict__ rows,
+                                             const float *__restrict__ wk,
+                                             const int32_t *__restrict__ pair,
+                                             int64_t n) {
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    const int64_t i =
+        (int64_t)item_ct1.get_group(2) * item_ct1.get_local_range(2) +
+        item_ct1.get_local_id(2);
+    if (i >= n * N) return;
+    const int64_t r = i / N, d = i % N;
+    const int32_t p = pair[r];
+    float* o = sum + (int64_t) (p / 10) * N + d;
+    *o = sycl::fma((float)(wk[p]), (float)(rows[i]), *o);
+}
+__dpct_inline__ void moe_combine_peer16_kernel(
+    const float *__restrict__ Dm, const int32_t *__restrict__ slot,
+    const float *__restrict__ w, const float *__restrict__ shared,
+    const float *__restrict__ sg, const uint16_t *__restrict__ peer16,
+    int64_t rows_local, float *__restrict__ bo, int64_t T) {
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    const int64_t i =
+        (int64_t)item_ct1.get_group(2) * item_ct1.get_local_range(2) +
+        item_ct1.get_local_id(2);
+    if (i >= T * N) return;
+    const int64_t t = i / N, d = i % N;
+    float s = 0.0f;
+#pragma unroll
+    for (int k = 0; k < 10; ++k) {
+        const int32_t r = slot[t * 10 + k];
+        if (r < rows_local) s = sycl::fma((float)(w[t * 10 + k]),
+                                          (float)(Dm[(int64_t)r * N + d]), s);
+    }
+    bo[i] = (s + sycl::vec<sycl::half, 1>(
+                     sycl::bit_cast<sycl::half, unsigned short>(peer16[i]))
+                     .convert<float, sycl::rounding_mode::automatic>()[0]) +
+            shared[i] * sigm(sg[t]);
+}
+__dpct_inline__ void peer_gather_add_kernel(
+    float *__restrict__ sum, const float *__restrict__ rows, int64_t r0,
+    const float *__restrict__ wk, const int32_t *__restrict__ pair,
+    const int32_t *__restrict__ tok, const int32_t *__restrict__ start,
+    const int32_t *__restrict__ list) {
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    const int64_t d =
+        (int64_t)item_ct1.get_group(2) * item_ct1.get_local_range(2) +
+        item_ct1.get_local_id(2);
+    if (d >= N) return;
+    const int b = item_ct1.get_group(1);
+    float* o = sum + (int64_t) tok[b] * N + d;
+    float s = *o;
+    for (int i = start[b]; i < start[b + 1]; ++i) {
+        const int r = list[i];
+        s = sycl::fma((float)(wk[pair[r]]), (float)(rows[(r - r0) * N + d]), s);
+    }
+    *o = s;
+}
+__dpct_inline__ void sums_to_f16_kernel(const float *__restrict__ x,
+                                        uint16_t *__restrict__ y, int64_t n) {
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    const int64_t i =
+        (int64_t)item_ct1.get_group(2) * item_ct1.get_local_range(2) +
+        item_ct1.get_local_id(2);
+    if (i < n) y[i] = hf_sat(x[i]);
+}
+__dpct_inline__ void f16_to_f32_wide_kernel(sycl::float4 *__restrict__ dst,
+                                            const sycl::uint4 *__restrict__ src,
+                                            int64_t n8) {
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    const int64_t i =
+        (int64_t)item_ct1.get_group(2) * item_ct1.get_local_range(2) +
+        item_ct1.get_local_id(2); // eight values
+    if (i >= n8) return;
+    const sycl::uint4 v = src[i];
+    const sycl::half2 *h = reinterpret_cast<const sycl::half2 *>(&v);
+    const sycl::float2
+        a = h[0].template convert<float, sycl::rounding_mode::automatic>(),
+        b = h[1].template convert<float, sycl::rounding_mode::automatic>(),
+        c = h[2].template convert<float, sycl::rounding_mode::automatic>(),
+        e = h[3].template convert<float, sycl::rounding_mode::automatic>();
+    dst[2 * i] = sycl::float4(a.x(), a.y(), b.x(), b.y());
+    dst[2 * i + 1] = sycl::float4(c.x(), c.y(), e.x(), e.y());
+}
+}  // namespace
+void moe_combine_peer16(const float* Dm, const int32_t* slot, const float* w, const float* shared, const float* sg,
+                        const uint16_t* peer16, int64_t rows_local, float* bo, int64_t T, void* stream) {
+    {
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
+
+        strata::q_of(stream)
+            ->parallel_for<
+                dpct_kernel_name<class moe_combine_peer16_kernel_2bb405>>(
+                sycl::nd_range<3>(sycl::range(1, 1, blocks_for(T * N)) *
+                                      sycl::range(1, 1, 256),
+                                  sycl::range(1, 1, 256)),
+                exp_props, [=](sycl::nd_item<3> item_ct1) {
+                    moe_combine_peer16_kernel(Dm, slot, w, shared, sg, peer16,
+                                              rows_local, bo, T);
+                });
+    }
+    check("moe_combine_peer16");
+}
+void peer_gather_add(float* sum, const float* rows, int64_t r0, const float* wk, const int32_t* pair, const int32_t* tok,
+                     const int32_t* start, const int32_t* list, int64_t n_tok, void* stream) {
+    if (n_tok <= 0) return;
+    {
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
+
+        strata::q_of(stream)
+            ->parallel_for<
+                dpct_kernel_name<class peer_gather_add_kernel_c811d6>>(
+                sycl::nd_range<3>(sycl::range(1, (unsigned)n_tok,
+                                              (unsigned)((N + 255) / 256)) *
+                                      sycl::range(1, 1, 256),
+                                  sycl::range(1, 1, 256)),
+                exp_props, [=](sycl::nd_item<3> item_ct1) {
+                    peer_gather_add_kernel(sum, rows, r0, wk, pair, tok, start,
+                                           list);
+                });
+    }
+    check("peer_gather_add");
+}
+void sums_to_f16(const float* x, uint16_t* y, int64_t n, void* stream) {
+    if (n <= 0) return;
+    {
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
+
+        strata::q_of(stream)
+            ->parallel_for<dpct_kernel_name<class sums_to_f16_kernel_8b7a94>>(
+                sycl::nd_range<3>(sycl::range(1, 1, blocks_for(n)) *
+                                      sycl::range(1, 1, 256),
+                                  sycl::range(1, 1, 256)),
+                exp_props, [=](sycl::nd_item<3> item_ct1) {
+                    sums_to_f16_kernel(x, y, n);
+                });
+    }
+    check("sums_to_f16");
+}
+void f16_to_f32_wide(float* dst, const uint16_t* src, int64_t n, void* stream) {
+    if (n <= 0) return;
+    {
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
+
+        strata::q_of(stream)
+            ->submit([&](sycl::handler &cgh) {
+                auto n_ct2 = n / 8;
+
+                cgh.parallel_for<
+                    dpct_kernel_name<class f16_to_f32_wide_kernel_dd3408>>(
+                    sycl::nd_range<3>(sycl::range(1, 1, blocks_for(n / 8)) *
+                                          sycl::range(1, 1, 256),
+                                      sycl::range(1, 1, 256)),
+                    exp_props, [=](sycl::nd_item<3> item_ct1) {
+                        f16_to_f32_wide_kernel(
+                            reinterpret_cast<sycl::float4 *>(dst),
+                            reinterpret_cast<const sycl::uint4 *>(src), n_ct2);
+                    });
+            });
+    }
+    check("f16_to_f32_wide");
+}
+void moe_combine_peer(const float* Dm, const int32_t* slot, const float* w, const float* shared, const float* sg,
+                      const float* peer, int64_t rows_local, float* bo, int64_t T, void* stream) {
+    {
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
+
+        strata::q_of(stream)
+            ->parallel_for<
+                dpct_kernel_name<class moe_combine_peer_kernel_9e19f2>>(
+                sycl::nd_range<3>(sycl::range(1, 1, blocks_for(T * N)) *
+                                      sycl::range(1, 1, 256),
+                                  sycl::range(1, 1, 256)),
+                exp_props, [=](sycl::nd_item<3> item_ct1) {
+                    moe_combine_peer_kernel(Dm, slot, w, shared, sg, peer,
+                                            rows_local, bo, T);
+                });
+    }
+    check("moe_combine_peer");
+}
+void peer_scatter_add(float* sum, const float* rows, const float* wk, const int32_t* pair, int64_t n, void* stream) {
+    if (n <= 0) return;
+    {
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
+
+        strata::q_of(stream)
+            ->parallel_for<
+                dpct_kernel_name<class peer_scatter_add_kernel_cd43f2>>(
+                sycl::nd_range<3>(sycl::range(1, 1, blocks_for(n * N)) *
+                                      sycl::range(1, 1, 256),
+                                  sycl::range(1, 1, 256)),
+                exp_props, [=](sycl::nd_item<3> item_ct1) {
+                    peer_scatter_add_kernel(sum, rows, wk, pair, n);
+                });
+    }
+    check("peer_scatter_add");
+}
 void moe_combine(const float* Dm, const int32_t* slot, const float* w, const float* shared, const float* sg, float* bo,
                  int64_t T, void* stream, const float* row_sd) {
     if (row_sd != nullptr) { std::fprintf(stderr, "moe_combine: per-row scales (NVFP4) are CUDA only\n"); std::exit(1); }
@@ -2947,7 +4384,7 @@ void moe_combine(const float* Dm, const int32_t* slot, const float* w, const flo
                         moe_combine4_kernel(
                             Dm, slot, w,
                             reinterpret_cast<const sycl::float4 *>(shared), sg,
-                            reinterpret_cast<sycl::float4 *>(bo), T);
+                            reinterpret_cast<sycl::float4 *>(bo), T, row_sd);
                     });
         }
         check("moe_combine");
@@ -2963,10 +4400,45 @@ void moe_combine(const float* Dm, const int32_t* slot, const float* w, const flo
                                       sycl::range(1, 1, 256),
                                   sycl::range(1, 1, 256)),
                 exp_props, [=](sycl::nd_item<3> item_ct1) {
-                    moe_combine_kernel(Dm, slot, w, shared, sg, bo, T);
+                    moe_combine_kernel(Dm, slot, w, shared, sg, bo, T, row_sd);
                 });
     }
     check("moe_combine");
+}
+void moe_shared_init(const float* shared, const float* sg, float* acc, int64_t T, void* stream) {
+    if (T <= 0) return;
+    {
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
+
+        strata::q_of(stream)
+            ->parallel_for<
+                dpct_kernel_name<class moe_shared_init_kernel_e3d22c>>(
+                sycl::nd_range<3>(sycl::range(1, 1, blocks_for(T * N)) *
+                                      sycl::range(1, 1, 256),
+                                  sycl::range(1, 1, 256)),
+                exp_props, [=](sycl::nd_item<3> item_ct1) {
+                    moe_shared_init_kernel(shared, sg, acc, T);
+                });
+    }
+    check("moe_shared_init");
+}
+void moe_scatter_add(const float* Dm, const int32_t* u_tok, const int32_t* u_off, const int32_t* u_rows,
+                     const float* u_w, int64_t n_u, float* acc, void* stream) {
+    if (n_u <= 0) return;
+    const dpct::dim3 grid((unsigned)n_u, (unsigned)((N + 255) / 256));
+    {
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
+
+        strata::q_of(stream)
+            ->parallel_for<
+                dpct_kernel_name<class moe_scatter_add_kernel_bed1b1>>(
+                sycl::nd_range<3>(grid * sycl::range(1, 1, 256),
+                                  sycl::range(1, 1, 256)),
+                exp_props, [=](sycl::nd_item<3> item_ct1) {
+                    moe_scatter_add_kernel(Dm, u_tok, u_off, u_rows, u_w, acc);
+                });
+    }
+    check("moe_scatter_add");
 }
 void rms_rows(float* x, const float* w, int64_t rows, int64_t cols, int64_t ld, float eps, void* stream) {
     if (rows <= 0) return;

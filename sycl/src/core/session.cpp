@@ -4,6 +4,7 @@
 #include <dpct/dpct.hpp>
 #include "strata/sycl_queue.hpp"
 #include "strata/core/session.hpp"
+#include "strata/core/pin_budget.hpp"
 #include "strata/kernels/mrope.hpp"
 #include "strata/core/progress.hpp"
 
@@ -12,6 +13,7 @@
 #include "strata/kernels/quantize_act.hpp"
 #include "strata/kernels/s2_expert_grouped.hpp"
 #include "strata/kernels/cpu/pool.hpp"
+#include "strata/platform/aux_cpus.hpp"
 #include "strata/kernels/ngram.hpp"
 
 #include <atomic>
@@ -21,14 +23,9 @@
 #include <cstring>
 #include <vector>
 
-// `_mm_pause` for the doorbell spin.  Guarded because it is x86-only; a target without it still builds, the
-// spin is just less polite to the pipeline.
-#if defined(_MSC_VER) || defined(__x86_64__) || defined(__i386__)
-#include <immintrin.h>
-#define STRATA_SPIN_PAUSE() _mm_pause()
-#else
-#define STRATA_SPIN_PAUSE() ((void) 0)
-#endif
+// The doorbell spin.  x86 pauses, aarch64 yields (include/strata/platform/cpu_relax.hpp).
+#include "strata/platform/cpu_relax.hpp"
+#define STRATA_SPIN_PAUSE() strata_cpu_pause()
 
 namespace strata::core {
 namespace {
@@ -138,7 +135,24 @@ void session_release(SessionState& s) {
         }
 }
 
+#if defined(STRATA_GPU_METAL)
+}  // namespace strata::core
+namespace strata::metal_engine {
+void window_reset();   // metal/src/engine/window.cpp: the decode window's running state back to a new sequence's
+}  // namespace strata::metal_engine
+namespace strata::core {
+#endif
+
 void session_zero(SessionState& s, const ModelGeometry& g, const float* R_init, void* stream) {
+#if defined(STRATA_GPU_METAL)
+    // the running state lives in the Metal decode window; the session's own device buffers are not read there
+    (void) g; (void) R_init; (void) stream;
+    strata::metal_engine::window_reset();
+    s.ple_prev[0] = -1;
+    s.ple_prev[1] = -1;
+    s.ple_token = -1;
+    return;
+#endif
     dpct::queue_ptr cs = strata::q_of(stream);
     // the residual: `hc` copies of the one vector a caller hands in.  A real sequence's first token is the
     // embedding broadcast to every stream, which is the reference's own initial condition.
@@ -776,7 +790,8 @@ bool SessionLoopScratch::init(size_t parts_bytes_in, std::string &err) try {
     // core or its SMT sibling.  The symptom is not an error: it is a CPU path at 26.9 GB/s where the same pool
     // runs at 36.32.  It was being done and undone on EVERY token, which is a syscall pair on the critical path
     // for a property that wants to hold for the whole session.
-    // The host's core is the pool's reserved one: the first physical core, or the last with --host-core last (F12).
+    // The host's core is the pool's reserved one: the first physical core, or the last with --host-core last (F12),
+    // or the first core's SMT sibling with --host-core sibling.
     const int host_core = strata::kernels::cpu::planned_host_core();
     if (host_core >= 0) {
         pinned_core = strata::kernels::cpu::pin_current_thread(host_core);
@@ -788,6 +803,8 @@ bool SessionLoopScratch::init(size_t parts_bytes_in, std::string &err) try {
             pinned = pinned_core.valid;
         }
     }
+    strata::platform::name_this_thread("strata-host");
+    strata::aux_cpus::note_owned_thread();   // the host: --aux-cpus leaves it where it is
     return true;
 }
 catch (sycl::exception const &exc) {
@@ -986,6 +1003,7 @@ bool session_loop(const ModelGeometry &g, int64_t pos, int32_t pos_base,
             if (rang) break;                             // rung, and the graph is still running: the overlap
             STRATA_SPIN_PAUSE();
         }
+        strata_load_fence();   // the ring was seen: the GPU's x_f / ids / weights are read after it (a no-op on x86)
         if (mid_graph) ++gr.rings_mid_graph;
         // the window, from just before the launch to the instant the ring was seen
         const auto t_ring = std::chrono::steady_clock::now();
@@ -1402,11 +1420,12 @@ bool session_run_token(const ModelGeometry &g, int64_t pos, int32_t pos_base,
                 return false;
             }
         }
+        strata_load_fence();   // as above, for the token loop's wait
         const auto t1 = Clock::now();
         progress_at("token: the CPU experts of layer", l);
         if (pool != nullptr) pool(user, s.db->h_x_f, s.db->h_ids, s.db->h_weights, g.n_embd, s.k, y_miss_host);
         std::atomic_thread_fence(std::memory_order_seq_cst);
-        _mm_sfence();
+        strata_store_fence();
         *flag = want;
         const auto t2 = Clock::now();
         tg.ms_wait += std::chrono::duration<double, std::milli>(t1 - t0).count();

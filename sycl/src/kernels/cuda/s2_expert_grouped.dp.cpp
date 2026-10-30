@@ -20,6 +20,7 @@
 #include "strata/sycl_math.hpp"
 #include "strata/sycl_queue.hpp"
 #include "strata/kernels/s2_expert_grouped.hpp"
+#include "strata/core/geometry.hpp"
 #include "strata/kernels/dp4a.hpp"
 #include "strata/kernels/f16_bits.hpp"
 
@@ -182,6 +183,9 @@ gu_kernel(const uint8_t *__restrict__ blob_base,
     gate_up[base + (size_t) r] = s;
 }
 
+// `silu(gate) * up` lives in `strata/kernels/swiglu.cuh` (the fused kernels call it in their epilogues);
+// the standalone pass it replaced is gone.  The scratch layout is unchanged: `[0, n_pairs)` ends up holding
+// the products, `[n_pairs, 2*n_pairs)` the raw up rows.
 /// `silu(gate) * up`, in place, over a GATE-MAJOR buffer: `[0, n_pairs)` is every hit's gate and
 /// `[n_pairs, 2*n_pairs)` is every hit's up, so hit `h`'s row `r` meets itself at `h*FF + r`.
 ///
@@ -527,17 +531,17 @@ __dpct_inline__ float row_dot_cpu_order(const uint8_t *codes,
         const int hi = dot4(codes + b * 16 + 8 + lane,
                            (const int8_t*) (xq + (size_t) (2 * b + 1) * 34 + 2) + lane * 4);
         /*
-        DPCT1013: The rounding mode could not be specified and the generated
-        code may have different accuracy than the original code. Verify the
-        correctness. SYCL math built-in function rounding mode is aligned with
-        OpenCL C 1.2 standard.
+        DPCT1013: The rounding mode could not be specified and the
+        generated code may have different accuracy than the original code.
+        Verify the correctness. SYCL math built-in function rounding mode is
+        aligned with OpenCL C 1.2 standard.
         */
         acc = sycl::fma(d * xs[2 * b], (float)lo, acc);
         /*
-        DPCT1013: The rounding mode could not be specified and the generated
-        code may have different accuracy than the original code. Verify the
-        correctness. SYCL math built-in function rounding mode is aligned with
-        OpenCL C 1.2 standard.
+        DPCT1013: The rounding mode could not be specified and the
+        generated code may have different accuracy than the original code.
+        Verify the correctness. SYCL math built-in function rounding mode is
+        aligned with OpenCL C 1.2 standard.
         */
         acc = sycl::fma(d * xs[2 * b + 1], (float)hi, acc);
         if (lane == 0)
@@ -683,17 +687,17 @@ __dpct_inline__ void cpu_order_quantize_kernel(const float *x, uint8_t *blocks,
     int sum = 0;
     for (int j = 0; j < 32; ++j) {
         /*
-        DPCT1013: The rounding mode could not be specified and the generated
-        code may have different accuracy than the original code. Verify the
-        correctness. SYCL math built-in function rounding mode is aligned with
-        OpenCL C 1.2 standard.
+        DPCT1013: The rounding mode could not be specified and the
+        generated code may have different accuracy than the original code.
+        Verify the correctness. SYCL math built-in function rounding mode is
+        aligned with OpenCL C 1.2 standard.
         */
         const float t = xb[j] * inv;
         /*
-        DPCT1013: The rounding mode could not be specified and the generated
-        code may have different accuracy than the original code. Verify the
-        correctness. SYCL math built-in function rounding mode is aligned with
-        OpenCL C 1.2 standard.
+        DPCT1013: The rounding mode could not be specified and the
+        generated code may have different accuracy than the original code.
+        Verify the correctness. SYCL math built-in function rounding mode is
+        aligned with OpenCL C 1.2 standard.
         */
         int v = (int) (t + (t >= 0.0f ? 0.5f : -0.5f));   // SYCL port: dpct dropped the parentheses (it rounded every value to 0)
         v = v < -127 ? -127 : (v > 127 ? 127 : v);
@@ -899,7 +903,12 @@ void moe_hit_grouped_s2(const uint8_t* blob_base, const int32_t* slot_index, con
                       0, cs);
         check("moe_hit_grouped_s2/gu", stream);
     }
-    // 2. silu(gate) * up.
+    // 2+3. silu(gate) * up, then the intermediate's own contract - ONE kernel where two ran.  The products
+    //    land in the gate half exactly as `swiglu_kernel` left them (the parity test compares that scratch),
+    //    and the q8_0 blocks are the same bytes `quantize_q8_0` produced.  `swilu_kind` 1 is this file's
+    //    `swiglu_kernel` expression (see `strata/kernels/swiglu.cuh`).
+    //    The down weight is Q2_0, whose `vec_dot_type` is Q8_0 - `ggml_mul_mat`'s rule, not a choice.  With
+    //    `x_scales` the intermediate takes the CPU's contract (`quantize_q8_0_scaled`), R4.2h.
     {
         const long long pairs = n_hits * (long long) FF;
         const unsigned blocks = (unsigned) ((pairs + THREADS - 1) / THREADS);
@@ -915,14 +924,9 @@ void moe_hit_grouped_s2(const uint8_t* blob_base, const int32_t* slot_index, con
                 });
         }
         check("moe_hit_grouped_s2/swiglu", stream);
+        if (x_scales != nullptr) quantize_q8_0_scaled(gate_up, h_q8_0, h_scales, n_hits * (int64_t) FF, stream);
+        else quantize_q8_0(gate_up, h_q8_0, n_hits * (int64_t) FF, stream);
     }
-    // 3. the intermediate's own contract, which is `ggml_mul_mat`'s rule and NOT a choice: the down weight is
-    //    Q2_0, whose `vec_dot_type` is Q8_0.  `gate_up` holds the pairs; the product went into the first half.
-    //    **R4.2h: the CPU quantizes this intermediate into `a2` with fp32 scales too** (`expert.cpp:232`), so
-    //    when the caller supplies `x_scales` the intermediate gets the CPU's contract as well - otherwise the
-    //    down projection would keep the very disagreement the gate/up projection just had removed.
-    if (x_scales != nullptr) quantize_q8_0_scaled(gate_up, h_q8_0, h_scales, n_hits * (int64_t) FF, stream);
-    else quantize_q8_0(gate_up, h_q8_0, n_hits * (int64_t) FF, stream);
     // 4. down.
     {
         launch_hit_down(fast, blob_base, slot_index, dst_index, blob_bytes, h_q8_0,
@@ -1056,6 +1060,8 @@ void moe_hit_grouped_s2_dev(const uint8_t* blob_base, const int32_t* slot_index,
                       cs);
         check("moe_hit_grouped_s2_dev/gu", stream);
     }
+    // silu + intermediate quantization in one kernel (same full-capacity range as the two kernels it replaces,
+    // sentinel rows included - the parity test compares that scratch).
     {
         const long long pairs = cap * (long long) FF;
         {
@@ -1072,9 +1078,9 @@ void moe_hit_grouped_s2_dev(const uint8_t* blob_base, const int32_t* slot_index,
                 });
         }
         check("moe_hit_grouped_s2_dev/swiglu", stream);
+        if (x_scales != nullptr) quantize_q8_0_scaled(gate_up, h_q8_0, h_scales, cap * (int64_t) FF, stream);
+        else quantize_q8_0(gate_up, h_q8_0, cap * (int64_t) FF, stream);
     }
-    if (x_scales != nullptr) quantize_q8_0_scaled(gate_up, h_q8_0, h_scales, cap * (int64_t) FF, stream);
-    else quantize_q8_0(gate_up, h_q8_0, cap * (int64_t) FF, stream);
     {
         launch_hit_down(fast, blob_base, slot_index, dst_index, blob_bytes, h_q8_0,
                         x_scales != nullptr ? h_scales : nullptr, out, cap, d_count, cs);
@@ -1135,9 +1141,9 @@ void moe_hit_grouped_s2_multi(const uint8_t* blob_base, const int32_t* slot_inde
                 });
         }
         check("moe_hit_grouped_s2_multi/swiglu", stream);
+        if (x_scales != nullptr) quantize_q8_0_scaled(gate_up, h_q8_0, h_scales, cap * (int64_t) FF, stream);
+        else quantize_q8_0(gate_up, h_q8_0, cap * (int64_t) FF, stream);
     }
-    if (x_scales != nullptr) quantize_q8_0_scaled(gate_up, h_q8_0, h_scales, cap * (int64_t) FF, stream);
-    else quantize_q8_0(gate_up, h_q8_0, cap * (int64_t) FF, stream);
     {
         launch_hit_down(fast, blob_base, slot_index, dst_index, blob_bytes, h_q8_0,
                         x_scales != nullptr ? h_scales : nullptr, out, cap, d_count, cs);
@@ -1152,9 +1158,14 @@ namespace {
 // hit kernel's.
 constexpr int GU_CHUNKS = (H / 32 + 31) / 32;   // 3: chunks of a gate/up row per lane (80 chunks / 32 lanes)
 constexpr int GMAX = 8;                          // entries per group (tokens routed to one expert in a window)
-// a group holds one entry per token of the window routed to its expert, and the kernels below keep at
-// most GMAX of them (`min(..., GMAX)`): a longer window would drop entries without a word.
-static_assert(GMAX >= kVerifyMaxT, "a verify window's group can exceed GMAX entries");
+// a group holds one entry per token of the window routed to its expert, and a kernel keeps at most GMAX of them
+// (`min(..., GMAX)`): a longer group would drop entries without a word.  A window of 9..16 rows can route more tokens
+// than that to one expert, so `moe_grouped_s2` takes the window's largest group and runs the kernel again with
+// SKIP = GMAX over the entries from the GMAX-th on (the staging is GMAX entries wide in shared memory: 51 KB at 16
+// would not compile on CUDA, whose static limit is 48 KB).  Every entry's output is its own dot products, so the
+// passes are bitwise the one wide pass; SKIP = 0 is the kernel as it was.
+constexpr int kGroupPasses = (kVerifyMaxT + GMAX - 1) / GMAX;
+static_assert(kGroupPasses * GMAX >= kVerifyMaxT, "a verify window's group can exceed the passes' entries");
 constexpr int GU_ROWS = 32;                      // gate/up rows per block: 4 per warp
 constexpr int D_ROWS = 64;                       // down rows per block: 8 per warp
 
@@ -1179,6 +1190,7 @@ __dpct_inline__ float chunk_dot(sycl::uint2 cb, const int *xw, float dw,
 // Gate/up: a block = GU_ROWS rows of ONE group.  The group's activations (each entry's token row of x_q8_0 and
 // its fp32 scales) are staged once into shared memory as aligned words; each warp then walks its rows, loading
 // each lane's code chunks once and dotting them with every entry.
+template <int SKIP>
 /*
 DPCT1110: The total declared local variable size in device function
 gu_grouped_kernel exceeds 128 bytes and may cause high register pressure.
@@ -1201,7 +1213,9 @@ auto &xs_q =
         sycl::ext::oneapi::this_work_item::get_work_group<3>());
     const int g = item_ct1.get_group(1);
     if (g >= *n_groups) return;
-    const int e0 = grp_start[g], ne = sycl::min(grp_start[g + 1] - e0, GMAX);
+    const int e0 = grp_start[g] + SKIP,
+              ne = sycl::min(grp_start[g + 1] - e0, GMAX);
+    if (SKIP > 0 && ne <= 0) return;
     const int t = item_ct1.get_local_id(2), lane = t & 31, warp = t >> 5;
     for (int i = t; i < ne * (H / 32); i += item_ct1.get_local_range(2)) {
         const int k = i / (H / 32), c = i - k * (H / 32);
@@ -1252,6 +1266,7 @@ auto &xs_q =
 
 // Down: a block = D_ROWS rows of ONE group; the entries' quantized intermediates staged once.  A down row is 20
 // chunks, so lanes 0..19 each hold one chunk, as in the per-entry kernel.
+template <int SKIP>
 __dpct_inline__ void down_grouped_kernel(
     const unsigned long long *__restrict__ grp_ptr,
     const int32_t *__restrict__ grp_start, const int32_t *__restrict__ n_groups,
@@ -1266,7 +1281,9 @@ auto &hs_q =
         sycl::ext::oneapi::this_work_item::get_work_group<3>());
     const int g = item_ct1.get_group(1);
     if (g >= *n_groups) return;
-    const int e0 = grp_start[g], ne = sycl::min(grp_start[g + 1] - e0, GMAX);
+    const int e0 = grp_start[g] + SKIP,
+              ne = sycl::min(grp_start[g + 1] - e0, GMAX);
+    if (SKIP > 0 && ne <= 0) return;
     const int t = item_ct1.get_local_id(2), lane = t & 31, warp = t >> 5;
     for (int i = t; i < ne * (FF / 32); i += item_ct1.get_local_range(2)) {
         const int k = i / (FF / 32), c = i - k * (FF / 32);
@@ -1329,6 +1346,7 @@ __dpct_inline__ void stage_chunk(const uint8_t *__restrict__ xb, float dx,
     xs_dh[i] = sycl::int2(sycl::bit_cast<int>(dx), hx);
 }
 
+template <int SKIP>
 /*
 DPCT1110: The total declared local variable size in device function
 gu_grouped_t_kernel exceeds 128 bytes and may cause high register pressure.
@@ -1354,7 +1372,9 @@ __dpct_inline__ void gu_grouped_t_kernel(
                                                                  // bits, hx)
     const int g = item_ct1.get_group(1);
     if (g >= *n_groups) return;
-    const int e0 = grp_start[g], ne = sycl::min(grp_start[g + 1] - e0, GMAX);
+    const int e0 = grp_start[g] + SKIP,
+              ne = sycl::min(grp_start[g + 1] - e0, GMAX);
+    if (SKIP > 0 && ne <= 0) return;
     const int t = item_ct1.get_local_id(2), lane = t & 31, warp = t >> 5;
     for (int i = t; i < ne * NC; i += item_ct1.get_local_range(2)) {
         const int k = i / NC, c = i - k * NC;
@@ -1412,6 +1432,7 @@ __dpct_inline__ void gu_grouped_t_kernel(
     }
 }
 
+template <int SKIP>
 /*
 DPCT1110: The total declared local variable size in device function
 down_grouped_t_kernel exceeds 128 bytes and may cause high register pressure.
@@ -1434,7 +1455,9 @@ __dpct_inline__ void down_grouped_t_kernel(
         sycl::ext::oneapi::this_work_item::get_work_group<3>());
     const int g = item_ct1.get_group(1);
     if (g >= *n_groups) return;
-    const int e0 = grp_start[g], ne = sycl::min(grp_start[g + 1] - e0, GMAX);
+    const int e0 = grp_start[g] + SKIP,
+              ne = sycl::min(grp_start[g + 1] - e0, GMAX);
+    if (SKIP > 0 && ne <= 0) return;
     const int t = item_ct1.get_local_id(2), lane = t & 31, warp = t >> 5;
     for (int i = t; i < ne * NC; i += item_ct1.get_local_range(2)) {
         const int k = i / NC, c = i - k * NC;
@@ -1568,10 +1591,18 @@ void moe_group_resident(const int32_t* ids, int n, int k_per_tok, const uint8_t*
     check("moe_group_resident", stream);
 }
 
-void moe_grouped_s2(const unsigned long long* grp_ptr, const int32_t* grp_start, const int32_t* n_groups,
-                    const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups, int64_t cap_entries,
-                    const uint8_t* x_q8_0, const float* x_scales, void* scratch, float* out, void* stream) {
+static void grouped_s2_impl(const unsigned long long* grp_ptr, const int32_t* grp_start, const int32_t* n_groups,
+                            const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups, int64_t cap_entries,
+                            const uint8_t* x_q8_0, const float* x_scales, void* scratch, float* out, void* stream,
+                            int max_group) {
     if (cap_groups <= 0 || cap_entries <= 0) return;
+    if (max_group < 1 || max_group > kGroupPasses * GMAX) {
+        std::fprintf(stderr, "moe_grouped_s2: a group of %d entries, at most %d\n", max_group, kGroupPasses * GMAX);
+        std::exit(1);
+    }
+    // a group of more than GMAX entries (a window of 9..16 rows, wide builds only): the entries from the GMAX-th on, too
+    constexpr bool kWide = kGroupPasses > 1;
+    const bool second = kWide && max_group > GMAX;
     dpct::queue_ptr cs = strata::q_of(stream);
     const uint64_t gu_bytes = ((uint64_t) cap_entries * (uint64_t) (2 * FF) * 4 + 15) & ~15ull;
     const uint64_t q8_bytes = ((uint64_t) cap_entries * (uint64_t) (FF / 32) * 34 + 15) & ~15ull;
@@ -1582,34 +1613,78 @@ void moe_grouped_s2(const unsigned long long* grp_ptr, const int32_t* grp_start,
     {
         const dpct::dim3 grid((unsigned)(2 * FF / GU_ROWS),
                               (unsigned)cap_groups);
-        if (fast)
-        {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{};
+        if (fast) {
+            {
+                auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
-            cs->parallel_for<
-                dpct_kernel_name<class gu_grouped_t_kernel_998f94>>(
-                sycl::nd_range<3>(grid * sycl::range(1, 1, 256),
-                                  sycl::range(1, 1, 256)),
-                exp_props,
-                [=](sycl::nd_item<3> item_ct1)
-                    [[sycl::reqd_sub_group_size(32)]] {
-                        gu_grouped_t_kernel(grp_ptr, grp_start, n_groups,
-                                            ent_tok, x_q8_0, x_scales, gate_up,
-                                            (int)cap_entries);
-                    });
+                cs->parallel_for<dpct_kernel_name<
+                    class gu_grouped_t_kernel_998f94, dpct_kernel_scalar<0>>>(
+                    sycl::nd_range<3>(grid * sycl::range(1, 1, 256),
+                                      sycl::range(1, 1, 256)),
+                    exp_props,
+                    [=](sycl::nd_item<3> item_ct1)
+                        [[sycl::reqd_sub_group_size(32)]] {
+                            gu_grouped_t_kernel<0>(grp_ptr, grp_start, n_groups,
+                                                   ent_tok, x_q8_0, x_scales,
+                                                   gate_up, (int)cap_entries);
+                        });
+            }
+            if constexpr (kWide)
+                if (second)
+                {
+                    auto exp_props =
+                        sycl::ext::oneapi::experimental::properties{};
+
+                    cs->parallel_for<
+                        dpct_kernel_name<class gu_grouped_t_kernel_998f94,
+                                         dpct_kernel_scalar<GMAX>>>(
+                        sycl::nd_range<3>(grid * sycl::range(1, 1, 256),
+                                          sycl::range(1, 1, 256)),
+                        exp_props,
+                        [=](sycl::nd_item<3> item_ct1)
+                            [[sycl::reqd_sub_group_size(32)]] {
+                                gu_grouped_t_kernel<GMAX>(
+                                    grp_ptr, grp_start, n_groups, ent_tok,
+                                    x_q8_0, x_scales, gate_up,
+                                    (int)cap_entries);
+                            });
+                }
         } else {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{};
+            {
+                auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
-            cs->parallel_for<dpct_kernel_name<class gu_grouped_kernel_c9eb4d>>(
-                sycl::nd_range<3>(grid * sycl::range(1, 1, 256),
-                                  sycl::range(1, 1, 256)),
-                exp_props,
-                [=](sycl::nd_item<3> item_ct1)
-                    [[sycl::reqd_sub_group_size(32)]] {
-                        gu_grouped_kernel(grp_ptr, grp_start, n_groups, ent_tok,
-                                          x_q8_0, x_scales, gate_up,
-                                          (int)cap_entries);
-                    });
+                cs->parallel_for<dpct_kernel_name<
+                    class gu_grouped_kernel_c9eb4d, dpct_kernel_scalar<0>>>(
+                    sycl::nd_range<3>(grid * sycl::range(1, 1, 256),
+                                      sycl::range(1, 1, 256)),
+                    exp_props,
+                    [=](sycl::nd_item<3> item_ct1)
+                        [[sycl::reqd_sub_group_size(32)]] {
+                            gu_grouped_kernel<0>(grp_ptr, grp_start, n_groups,
+                                                 ent_tok, x_q8_0, x_scales,
+                                                 gate_up, (int)cap_entries);
+                        });
+            }
+            if constexpr (kWide)
+                if (second)
+                {
+                    auto exp_props =
+                        sycl::ext::oneapi::experimental::properties{};
+
+                    cs->parallel_for<
+                        dpct_kernel_name<class gu_grouped_kernel_c9eb4d,
+                                         dpct_kernel_scalar<GMAX>>>(
+                        sycl::nd_range<3>(grid * sycl::range(1, 1, 256),
+                                          sycl::range(1, 1, 256)),
+                        exp_props,
+                        [=](sycl::nd_item<3> item_ct1)
+                            [[sycl::reqd_sub_group_size(32)]] {
+                                gu_grouped_kernel<GMAX>(
+                                    grp_ptr, grp_start, n_groups, ent_tok,
+                                    x_q8_0, x_scales, gate_up,
+                                    (int)cap_entries);
+                            });
+                }
         }
         check("moe_grouped_s2/gu", stream);
     }
@@ -1664,37 +1739,94 @@ void moe_grouped_s2(const unsigned long long* grp_ptr, const int32_t* grp_start,
     {
         const dpct::dim3 grid((unsigned)(H / D_ROWS), (unsigned)cap_groups);
         const float* hs = x_scales != nullptr ? h_scales : nullptr;
-        if (fast)
-        {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{};
+        if (fast) {
+            {
+                auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
-            cs->parallel_for<
-                dpct_kernel_name<class down_grouped_t_kernel_12b16d>>(
-                sycl::nd_range<3>(grid * sycl::range(1, 1, 256),
-                                  sycl::range(1, 1, 256)),
-                exp_props,
-                [=](sycl::nd_item<3> item_ct1)
-                    [[sycl::reqd_sub_group_size(32)]] {
-                        down_grouped_t_kernel(grp_ptr, grp_start, n_groups,
-                                              ent_dst, h_q8_0, hs, out);
-                    });
+                cs->parallel_for<dpct_kernel_name<
+                    class down_grouped_t_kernel_12b16d, dpct_kernel_scalar<0>>>(
+                    sycl::nd_range<3>(grid * sycl::range(1, 1, 256),
+                                      sycl::range(1, 1, 256)),
+                    exp_props,
+                    [=](sycl::nd_item<3> item_ct1)
+                        [[sycl::reqd_sub_group_size(32)]] {
+                            down_grouped_t_kernel<0>(grp_ptr, grp_start,
+                                                     n_groups, ent_dst, h_q8_0,
+                                                     hs, out);
+                        });
+            }
+            if constexpr (kWide)
+                if (second) {
+                    auto exp_props =
+                        sycl::ext::oneapi::experimental::properties{};
+
+                    cs->parallel_for<
+                        dpct_kernel_name<class down_grouped_t_kernel_12b16d,
+                                         dpct_kernel_scalar<GMAX>>>(
+                        sycl::nd_range<3>(grid * sycl::range(1, 1, 256),
+                                          sycl::range(1, 1, 256)),
+                        exp_props,
+                        [=](sycl::nd_item<3> item_ct1)
+                            [[sycl::reqd_sub_group_size(32)]] {
+                                down_grouped_t_kernel<GMAX>(grp_ptr, grp_start,
+                                                            n_groups, ent_dst,
+                                                            h_q8_0, hs, out);
+                            });
+                }
         } else {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{};
+            {
+                auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
-            cs->parallel_for<
-                dpct_kernel_name<class down_grouped_kernel_ea4417>>(
-                sycl::nd_range<3>(grid * sycl::range(1, 1, 256),
-                                  sycl::range(1, 1, 256)),
-                exp_props,
-                [=](sycl::nd_item<3> item_ct1)
-                    [[sycl::reqd_sub_group_size(32)]] {
-                        down_grouped_kernel(grp_ptr, grp_start, n_groups,
-                                            ent_dst, h_q8_0, hs, out);
-                    });
+                cs->parallel_for<dpct_kernel_name<
+                    class down_grouped_kernel_ea4417, dpct_kernel_scalar<0>>>(
+                    sycl::nd_range<3>(grid * sycl::range(1, 1, 256),
+                                      sycl::range(1, 1, 256)),
+                    exp_props,
+                    [=](sycl::nd_item<3> item_ct1)
+                        [[sycl::reqd_sub_group_size(32)]] {
+                            down_grouped_kernel<0>(grp_ptr, grp_start, n_groups,
+                                                   ent_dst, h_q8_0, hs, out);
+                        });
+            }
+            if constexpr (kWide)
+                if (second) {
+                    auto exp_props =
+                        sycl::ext::oneapi::experimental::properties{};
+
+                    cs->parallel_for<
+                        dpct_kernel_name<class down_grouped_kernel_ea4417,
+                                         dpct_kernel_scalar<GMAX>>>(
+                        sycl::nd_range<3>(grid * sycl::range(1, 1, 256),
+                                          sycl::range(1, 1, 256)),
+                        exp_props,
+                        [=](sycl::nd_item<3> item_ct1)
+                            [[sycl::reqd_sub_group_size(32)]] {
+                                down_grouped_kernel<GMAX>(grp_ptr, grp_start,
+                                                          n_groups, ent_dst,
+                                                          h_q8_0, hs, out);
+                            });
+                }
         }
         check("moe_grouped_s2/down", stream);
     }
 }
+
+void moe_grouped_s2(const unsigned long long* grp_ptr, const int32_t* grp_start, const int32_t* n_groups,
+                    const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups, int64_t cap_entries,
+                    const uint8_t* x_q8_0, const float* x_scales, void* scratch, float* out, void* stream) {
+    grouped_s2_impl(grp_ptr, grp_start, n_groups, ent_dst, ent_tok, cap_groups, cap_entries, x_q8_0, x_scales, scratch, out, stream,
+                    GMAX);
+}
+
+#if STRATA_VERIFY_MAX_T > 8
+void moe_grouped_s2_wide(const unsigned long long* grp_ptr, const int32_t* grp_start, const int32_t* n_groups,
+                         const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups, int64_t cap_entries,
+                         const uint8_t* x_q8_0, const float* x_scales, void* scratch, float* out, void* stream,
+                         int max_group) {
+    grouped_s2_impl(grp_ptr, grp_start, n_groups, ent_dst, ent_tok, cap_groups, cap_entries, x_q8_0, x_scales, scratch, out, stream,
+                    max_group);
+}
+#endif
 
 void moe_hit_add(float* parts, const float* hit_out, const int32_t* dst, const int32_t* count, int64_t cap,
                  int64_t n_embd, void* stream) {

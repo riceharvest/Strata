@@ -24,6 +24,7 @@
 #include <dpct/dpct.hpp>
 #include "strata/sycl_queue.hpp"
 #include "strata/kernels/native_ple_postops.hpp"
+#include "strata/core/geometry.hpp"
 #include "strata/kernels/native_gr_norm.hpp"
 #include "strata/kernels/ngram.hpp"
 #include <cmath>
@@ -60,10 +61,10 @@ __dpct_inline__ void gate_kernel(const float *key, const float *query,
     for (int j = 0; j < 8; ++j) {
         const int d = item_ct1.get_local_id(2) + j * 512;
         /*
-        DPCT1013: The rounding mode could not be specified and the generated
-        code may have different accuracy than the original code. Verify the
-        correctness. SYCL math built-in function rounding mode is aligned with
-        OpenCL C 1.2 standard.
+        DPCT1013: The rounding mode could not be specified and the
+        generated code may have different accuracy than the original code.
+        Verify the correctness. SYCL math built-in function rounding mode is
+        aligned with OpenCL C 1.2 standard.
         */
         const float p = d < N ? key[item_ct1.get_group(2) * N + d] *
                                     query[item_ct1.get_group(2) * N + d]
@@ -84,19 +85,19 @@ __dpct_inline__ void gate_kernel(const float *key, const float *query,
     sum = warp_sum(sum);
     if (item_ct1.get_local_id(2) == 0) {
         /*
-        DPCT1013: The rounding mode could not be specified and the generated
-        code may have different accuracy than the original code. Verify the
-        correctness. SYCL math built-in function rounding mode is aligned with
-        OpenCL C 1.2 standard.
+        DPCT1013: The rounding mode could not be specified and the
+        generated code may have different accuracy than the original code.
+        Verify the correctness. SYCL math built-in function rounding mode is
+        aligned with OpenCL C 1.2 standard.
         */
         const float s = sycl::fma(scale, sum, 0.0f); // ggml SCALE's zero bias
         const float mag = sycl::sqrt(sycl::fmax(sycl::fabs(s), 1e-6f));
         const float sign = float((s > 0.0f) - (s < 0.0f));
         /*
-        DPCT1013: The rounding mode could not be specified and the generated
-        code may have different accuracy than the original code. Verify the
-        correctness. SYCL math built-in function rounding mode is aligned with
-        OpenCL C 1.2 standard.
+        DPCT1013: The rounding mode could not be specified and the
+        generated code may have different accuracy than the original code.
+        Verify the correctness. SYCL math built-in function rounding mode is
+        aligned with OpenCL C 1.2 standard.
         */
         gate[item_ct1.get_group(2)] =
             1.0f / (1.0f + sycl::native::exp(-sign * mag));
@@ -132,17 +133,17 @@ conv_residual_kernel(const float *history, const float *normalized,
                 sycl::bit_cast<sycl::half, unsigned short>(weights[c * 4 + k]))
                 .convert<float, sycl::rounding_mode::automatic>()[0];
         /*
-        DPCT1013: The rounding mode could not be specified and the generated
-        code may have different accuracy than the original code. Verify the
-        correctness. SYCL math built-in function rounding mode is aligned with
-        OpenCL C 1.2 standard.
+        DPCT1013: The rounding mode could not be specified and the
+        generated code may have different accuracy than the original code.
+        Verify the correctness. SYCL math built-in function rounding mode is
+        aligned with OpenCL C 1.2 standard.
         */
         const float term = x * w;
         /*
-        DPCT1013: The rounding mode could not be specified and the generated
-        code may have different accuracy than the original code. Verify the
-        correctness. SYCL math built-in function rounding mode is aligned with
-        OpenCL C 1.2 standard.
+        DPCT1013: The rounding mode could not be specified and the
+        generated code may have different accuracy than the original code.
+        Verify the correctness. SYCL math built-in function rounding mode is
+        aligned with OpenCL C 1.2 standard.
         */
         sum = k == 0 ? term : sum + term;
     }
@@ -204,6 +205,41 @@ __dpct_inline__ void rms_rep_kernel(const float *__restrict__ input,
     for (int col = tid; col < N; col += BlockSize)
         output[col] = scale * input[col] * gamma[col];
 }
+// rms_rep_kernel with the column count as a RUN-TIME divisor, as weighted_rms_norm<1024> (native_gr_rms_norm_weighted,
+// the per-token path) divides: under --use_fast_math a division by the constant N may become a multiplication by its
+// rounded reciprocal, which is not bitwise the run-time division.
+__dpct_inline__ void rms_rep_rt_kernel(const float *__restrict__ input,
+                                       const float *__restrict__ gamma,
+                                       float *__restrict__ output, int n_cols,
+                                       float epsilon) {
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    constexpr int BlockSize = 1024;
+    const int tid = item_ct1.get_local_id(2);
+    const size_t row_offset = size_t(item_ct1.get_group(2)) * n_cols;
+    input += row_offset;
+    output += row_offset;
+    gamma += size_t(item_ct1.get_group(2) % H) * n_cols;
+    float partial = 0.0f;
+    for (int col = tid; col < n_cols; col += BlockSize) {
+        const float value = input[col];
+        partial += value * value;
+    }
+    auto &sums =
+        *sycl::ext::oneapi::group_local_memory_for_overwrite<float[32]>(
+            sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    partial = norm_warp_sum(partial);
+    const int lane = tid % 32;
+    if (lane == 0) sums[tid / 32] = partial;
+    item_ct1.barrier(sycl::access::fence_space::local_space);
+    partial = 0.0f;
+    if (lane < BlockSize / 32) partial = sums[lane];
+    partial = norm_warp_sum(partial);
+    const float mean = partial / n_cols;
+    const float scale = sycl::rsqrt(mean + epsilon);
+#pragma unroll
+    for (int col = tid; col < n_cols; col += BlockSize)
+        output[col] = scale * input[col] * gamma[col];
+}
 __dpct_inline__ void broadcast_batch_kernel(const float *value,
                                             const float *gate, float *gated,
                                             int T) {
@@ -243,17 +279,17 @@ __dpct_inline__ void conv_residual_batch_kernel(const float *history,
                 sycl::bit_cast<sycl::half, unsigned short>(weights[c * 4 + k]))
                 .convert<float, sycl::rounding_mode::automatic>()[0];
         /*
-        DPCT1013: The rounding mode could not be specified and the generated
-        code may have different accuracy than the original code. Verify the
-        correctness. SYCL math built-in function rounding mode is aligned with
-        OpenCL C 1.2 standard.
+        DPCT1013: The rounding mode could not be specified and the
+        generated code may have different accuracy than the original code.
+        Verify the correctness. SYCL math built-in function rounding mode is
+        aligned with OpenCL C 1.2 standard.
         */
         const float term = x * wk;
         /*
-        DPCT1013: The rounding mode could not be specified and the generated
-        code may have different accuracy than the original code. Verify the
-        correctness. SYCL math built-in function rounding mode is aligned with
-        OpenCL C 1.2 standard.
+        DPCT1013: The rounding mode could not be specified and the
+        generated code may have different accuracy than the original code.
+        Verify the correctness. SYCL math built-in function rounding mode is
+        aligned with OpenCL C 1.2 standard.
         */
         sum = k == 0 ? term : sum + term;
     }
@@ -281,6 +317,33 @@ __dpct_inline__ void history_batch_kernel(float *history,
     }
 #pragma unroll
     for (int r = 0; r < HISTORY; ++r) history[size_t(c) * HISTORY + r] = h[r];
+}
+
+// history_batch_kernel that also writes the history after each of the T tokens (`snap`, T x 9 x 10240): pure copies,
+// the values T history advances (ple_history_advance) leave
+__dpct_inline__ void history_batch_snap_kernel(float *history,
+                                               const float *normalized, int T,
+                                               float *snap) {
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    const int c = item_ct1.get_group(2) * item_ct1.get_local_range(2) +
+                  item_ct1.get_local_id(2);
+    if (c >= D) return;
+    float h0[HISTORY];
+#pragma unroll
+    for (int r = 0; r < HISTORY; ++r) h0[r] = history[size_t(c) * HISTORY + r];
+    for (int t = 0; t < T; ++t) {
+        float* out = snap + size_t(t) * HISTORY * D + size_t(c) * HISTORY;
+#pragma unroll
+        for (int r = 0; r < HISTORY; ++r) {
+            const int p = r + t + 1 - HISTORY;      // after t + 1 advances row r holds token p, or an older row
+            out[r] = p >= 0 ? normalized[size_t(p) * D + c] : h0[r + t + 1];
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < HISTORY; ++r) {
+        const int p = r + T - HISTORY;
+        history[size_t(c) * HISTORY + r] = p >= 0 ? normalized[size_t(p) * D + c] : h0[r + T];
+    }
 }
 
 struct Span { const void* p; size_t bytes; size_t alignment; };
@@ -501,6 +564,154 @@ void native_ple_postops_batch(float* key, float* hidden, const float* value, flo
                               sycl::range(1, 1, 256)),
             exp_props, [=](sycl::nd_item<3> item_ct1) {
                 history_batch_kernel(history, query_norm, T);
+            });
+    }
+    launch_check();
+}
+
+void native_ple_postops_batch_snap(float* key, float* hidden, const float* value, float* history, const PleWeights& w,
+                                   float* query_norm, float* gated, float* gate, int T, float* snap, void* stream) {
+    if (!stream || T <= 0 || !key || !hidden || !value || !history || !query_norm || !gated || !gate || !snap)
+        throw std::invalid_argument("native PLE postops batch (snapshots): null input or empty batch");
+    auto st = strata::q_of(stream);
+    const unsigned rows = unsigned(T) * H;
+    const unsigned blocks = unsigned((size_t(T) * D + 255) / 256);
+    /*
+    DPCT1049: The work-group size passed to the SYCL kernel may exceed the
+    limit. To get the device limit, query info::device::max_work_group_size.
+    Adjust the work-group size if needed.
+    */
+    {
+        auto exp_props = sycl::ext::oneapi::experimental::properties{
+            sycl::ext::oneapi::experimental::use_root_sync};
+
+        st->submit([&](sycl::handler &cgh) {
+            auto N_ct3 = N;
+            auto NG_RMS_EPS_ct4 = NG_RMS_EPS;
+
+            cgh.parallel_for<dpct_kernel_name<class rms_rep_rt_kernel_328b44>>(
+                sycl::nd_range<3>(sycl::range(1, 1, rows) *
+                                      sycl::range(1, 1, 1024),
+                                  sycl::range(1, 1, 1024)),
+                exp_props,
+                [=](sycl::nd_item<3> item_ct1)
+                    [[sycl::reqd_sub_group_size(32)]] {
+                        rms_rep_rt_kernel(key, w.norm_key, key, N_ct3,
+                                          NG_RMS_EPS_ct4);
+                    });
+        });
+    }
+    /*
+    DPCT1049: The work-group size passed to the SYCL kernel may exceed the
+    limit. To get the device limit, query info::device::max_work_group_size.
+    Adjust the work-group size if needed.
+    */
+    {
+        auto exp_props = sycl::ext::oneapi::experimental::properties{
+            sycl::ext::oneapi::experimental::use_root_sync};
+
+        st->submit([&](sycl::handler &cgh) {
+            auto N_ct3 = N;
+            auto NG_RMS_EPS_ct4 = NG_RMS_EPS;
+
+            cgh.parallel_for<dpct_kernel_name<class rms_rep_rt_kernel_3d39a3>>(
+                sycl::nd_range<3>(sycl::range(1, 1, rows) *
+                                      sycl::range(1, 1, 1024),
+                                  sycl::range(1, 1, 1024)),
+                exp_props,
+                [=](sycl::nd_item<3> item_ct1)
+                    [[sycl::reqd_sub_group_size(32)]] {
+                        rms_rep_rt_kernel(hidden, w.norm_query, query_norm,
+                                          N_ct3, NG_RMS_EPS_ct4);
+                    });
+        });
+    }
+    /*
+    DPCT1049: The work-group size passed to the SYCL kernel may exceed the
+    limit. To get the device limit, query info::device::max_work_group_size.
+    Adjust the work-group size if needed.
+    */
+    {
+        auto exp_props = sycl::ext::oneapi::experimental::properties{
+            sycl::ext::oneapi::experimental::use_root_sync};
+
+        st->submit([&](sycl::handler &cgh) {
+            auto std_sqrt_float_N_ct3 = 1.0f / std::sqrt(float(N));
+
+            cgh.parallel_for<dpct_kernel_name<class gate_kernel_2c35c0>>(
+                sycl::nd_range<3>(sycl::range(1, 1, rows) *
+                                      sycl::range(1, 1, 512),
+                                  sycl::range(1, 1, 512)),
+                exp_props,
+                [=](sycl::nd_item<3> item_ct1)
+                    [[sycl::reqd_sub_group_size(32)]] {
+                        gate_kernel(key, query_norm, gate,
+                                    std_sqrt_float_N_ct3);
+                    });
+        });
+    }
+    {
+        auto exp_props = sycl::ext::oneapi::experimental::properties{
+            sycl::ext::oneapi::experimental::use_root_sync};
+
+        st->parallel_for<dpct_kernel_name<class broadcast_batch_kernel_24ebb0>>(
+            sycl::nd_range<3>(sycl::range(1, 1, blocks) *
+                                  sycl::range(1, 1, 256),
+                              sycl::range(1, 1, 256)),
+            exp_props, [=](sycl::nd_item<3> item_ct1) {
+                broadcast_batch_kernel(value, gate, gated, T);
+            });
+    }
+    /*
+    DPCT1049: The work-group size passed to the SYCL kernel may exceed the
+    limit. To get the device limit, query info::device::max_work_group_size.
+    Adjust the work-group size if needed.
+    */
+    {
+        auto exp_props = sycl::ext::oneapi::experimental::properties{
+            sycl::ext::oneapi::experimental::use_root_sync};
+
+        st->submit([&](sycl::handler &cgh) {
+            auto N_ct3 = N;
+            auto NG_RMS_EPS_ct4 = NG_RMS_EPS;
+
+            cgh.parallel_for<dpct_kernel_name<class rms_rep_rt_kernel_c6122c>>(
+                sycl::nd_range<3>(sycl::range(1, 1, rows) *
+                                      sycl::range(1, 1, 1024),
+                                  sycl::range(1, 1, 1024)),
+                exp_props,
+                [=](sycl::nd_item<3> item_ct1)
+                    [[sycl::reqd_sub_group_size(32)]] {
+                        rms_rep_rt_kernel(gated, w.norm_conv, query_norm, N_ct3,
+                                          NG_RMS_EPS_ct4);
+                    });
+        });
+    }
+    {
+        auto exp_props = sycl::ext::oneapi::experimental::properties{
+            sycl::ext::oneapi::experimental::use_root_sync};
+
+        st->parallel_for<
+            dpct_kernel_name<class conv_residual_batch_kernel_3906ff>>(
+            sycl::nd_range<3>(sycl::range(1, 1, blocks) *
+                                  sycl::range(1, 1, 256),
+                              sycl::range(1, 1, 256)),
+            exp_props, [=](sycl::nd_item<3> item_ct1) {
+                conv_residual_batch_kernel(history, query_norm, w.conv1d_f16,
+                                           hidden, gated, T);
+            });
+    }
+    {
+        auto exp_props = sycl::ext::oneapi::experimental::properties{
+            sycl::ext::oneapi::experimental::use_root_sync};
+
+        st->parallel_for<
+            dpct_kernel_name<class history_batch_snap_kernel_c2a4cc>>(
+            sycl::nd_range<3>(sycl::range(1, 1, D / 256) *
+                                  sycl::range(1, 1, 256),
+                              sycl::range(1, 1, 256)),
+            exp_props, [=](sycl::nd_item<3> item_ct1) {
+                history_batch_snap_kernel(history, query_norm, T, snap);
             });
     }
     launch_check();

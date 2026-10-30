@@ -26,6 +26,8 @@
 #include "strata/sycl_math.hpp"
 #include "strata/kernels/sampler.hpp"
 #include "strata/core/coupled_draft.hpp"
+#include "strata/core/spec_prob.hpp"
+#include "strata/core/spec_proposal.hpp"
 #include "strata/core/emulate.hpp"
 
 #include <cmath>
@@ -75,6 +77,23 @@ __dpct_inline__ float philox_uniform(uint64_t seed, uint64_t counter) {
     }
     // 24 bits of mantissa, so the value is uniform in [0,1) with no rounding to 1.0
     return (float) (c0 >> 8) * (1.0f / 16777216.0f);
+}
+
+// GUMBEL-MAX COUPLING (STRATA_SPEC_GUMBEL=1, ported from llama.cpp-lab's --spec-coupled, lab PRs #26/#30).  The pick
+// is argmax_i p_i / E_i with E_i = -log(u_i) ~ Exp(1) and u_i a hash of (seed, counter, TOKEN ID) - exactly
+// equivalent to argmax(log p_i + Gumbel_i), so it is an exact sample of p.  Unlike the inverse-CDF pick over a
+// probability-sorted list, the noise a token gets does not depend on which other tokens survived the cut, so a
+// drafter whose candidate set differs from the target's still agrees with it on the tokens they share ("support
+// invariant").  The MTP drafter keys on the draft's token id (via sub_to_id), the target on its row's token id.
+__dpct_inline__ strata::samp_acc_t gumbel_exp(uint64_t seed, uint64_t counter,
+                                  uint32_t token) {
+    uint64_t z = seed ^ (counter * 0x9E3779B97F4A7C15ull) ^ ((uint64_t) token * 0xD1B54A32D192ED03ull);
+    z += 0x9E3779B97F4A7C15ull;
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+    z ^= z >> 31;
+    const strata::samp_acc_t u = ((strata::samp_acc_t) (z >> 11) + 0.5) * (1.0 / 9007199254740992.0);   // (0, 1), never 0 or 1
+    return -sycl::log((strata::samp_acc_t)u);
 }
 
 // `count_in_history` and the penalty application, transcribed from `llama_sampler_penalties_apply`.
@@ -176,7 +195,9 @@ sampler_greedy_kernel(const float *__restrict__ logits, int n_vocab,
     int best = n_vocab;
     for (int v = item_ct1.get_local_id(2); v < n_vocab;
          v += item_ct1.get_local_range(2)) {
-        const float s = apply_penalties(l[v], hit_count(v, dpct_local), p);
+        const float s =
+            apply_penalties(p.logit_bias ? l[v] + p.logit_bias[v] : l[v],
+                            hit_count(v, dpct_local), p);
         if (s > bv) { bv = s; best = v; }
     }
     for (int off = 16; off > 0; off >>= 1) {
@@ -518,7 +539,9 @@ __dpct_inline__ void sampler_kernel(const float *__restrict__ logits,
                 taken = true; break;
             }
             if (taken) continue;
-            const float s = apply_penalties(l[v], hit_count(v, dpct_local), p);
+            const float s =
+                apply_penalties(p.logit_bias ? l[v] + p.logit_bias[v] : l[v],
+                                hit_count(v, dpct_local), p);
             if (s > bv) { bv = s; best = v; }
         }
         for (int off = 16; off > 0; off >>= 1) {
@@ -628,13 +651,23 @@ __dpct_inline__ void sampler_kernel(const float *__restrict__ logits,
 #pragma unroll
     for (int i = 0; i < n_keep; ++i) sum +=
         sycl::exp((strata::samp_acc_t)scaled(i) - (strata::samp_acc_t)smx);
-    const float u = philox_uniform(p.seed, p.counter + (uint64_t) t);
-    strata::samp_acc_t cum = 0.0;
     int pick = sel_ids[n_keep - 1];
+    if (p.gumbel) {
+        strata::samp_acc_t best = -1.0;
+        for (int i = 0; i < n_keep; ++i) {
+            const strata::samp_acc_t r = sycl::exp((strata::samp_acc_t)scaled(i) - (strata::samp_acc_t)smx) / sum /
+                             gumbel_exp(p.seed, p.counter + (uint64_t)t,
+                                        (uint32_t)sel_ids[i]);
+            if (r > best) { best = r; pick = sel_ids[i]; }
+        }
+    } else {
+        const float u = philox_uniform(p.seed, p.counter + (uint64_t) t);
+        strata::samp_acc_t cum = 0.0;
 #pragma unroll
-    for (int i = 0; i < n_keep; ++i) {
-        cum += sycl::exp((strata::samp_acc_t)scaled(i) - (strata::samp_acc_t)smx) / sum;
-        if ((strata::samp_acc_t) u < cum) { pick = sel_ids[i]; break; }
+        for (int i = 0; i < n_keep; ++i) {
+            cum += sycl::exp((strata::samp_acc_t)scaled(i) - (strata::samp_acc_t)smx) / sum;
+            if ((strata::samp_acc_t) u < cum) { pick = sel_ids[i]; break; }
+        }
     }
     if (item_ct1.get_local_id(2) == 0) out[t] = pick;
 }
@@ -698,10 +731,17 @@ __dpct_inline__ void warp_first(float &bv, int &bi) {
 /// kProb (the coupled draft only): lane 0 also writes the pick's probability under the final distribution to
 /// `*prob_out`.  The sampler's own calls take kProb = false, whose code is the tail above, unchanged.
 template <bool kProb = false>
+/*
+DPCT1110: The total declared local variable size in device function
+sampled_tail_warp exceeds 128 bytes and may cause high register pressure.
+Consult with your hardware vendor to find the total register size available and
+adjust the code, or use smaller sub-group size to avoid high register pressure.
+*/
 inline void sampled_tail_warp(const int *sel_ids, const float *sel_logit, int k,
                               const SamplerParams &p, int t,
                               int *__restrict__ out, strata::samp_acc_t *ex,
-                              float *prob_out = nullptr) {
+                              float *prob_out = nullptr,
+                              const int32_t *__restrict__ sub_to_id = nullptr) {
     const int lane =
         (int)(sycl::ext::oneapi::this_work_item::get_nd_item<3>().get_local_id(
                   2) &
@@ -788,14 +828,23 @@ inline void sampled_tail_warp(const int *sel_ids, const float *sel_logit, int k,
     for (int i = lane; i < n_keep; i += 32) ex[i] = ex[i] / sum;
     sycl::group_barrier(sycl::ext::oneapi::this_work_item::get_sub_group());
     if (lane == 0) {
-        const float u = philox_uniform(p.seed, p.counter + (uint64_t) t);
-        strata::samp_acc_t cum = 0.0;
         int pi = n_keep > 0 ? n_keep - 1 : 0;
         int pick = sel_ids[pi];
+        if (p.gumbel) {
+            strata::samp_acc_t best = -1.0;
+            for (int i = 0; i < n_keep; ++i) {
+                const int id = sub_to_id != nullptr ? sub_to_id[sel_ids[i]] : sel_ids[i];
+                const strata::samp_acc_t r = ex[i] / gumbel_exp(p.seed, p.counter + (uint64_t) t, (uint32_t) id);
+                if (r > best) { best = r; pick = sel_ids[i]; pi = i; }
+            }
+        } else {
+            const float u = philox_uniform(p.seed, p.counter + (uint64_t) t);
+            strata::samp_acc_t cum = 0.0;
 #pragma unroll
-        for (int i = 0; i < n_keep; ++i) {
-            cum += ex[i];
-            if ((strata::samp_acc_t) u < cum) { pick = sel_ids[i]; pi = i; break; }
+            for (int i = 0; i < n_keep; ++i) {
+                cum += ex[i];
+                if ((strata::samp_acc_t) u < cum) { pick = sel_ids[i]; pi = i; break; }
+            }
         }
         out[t] = pick;
         if constexpr (kProb) *prob_out = n_keep > 0 ? (float) ex[pi] : 1.0f;
@@ -886,7 +935,9 @@ sampler_one_block_kernel(const float *__restrict__ logits, int n_vocab,
         int best = n_vocab;
         for (int v = item_ct1.get_local_id(2); v < n_vocab;
              v += item_ct1.get_local_range(2)) {
-            const float s = apply_penalties(l[v], hit_count(v, dpct_local), p);
+            const float s =
+                apply_penalties(p.logit_bias ? l[v] + p.logit_bias[v] : l[v],
+                                hit_count(v, dpct_local), p);
             if ((s < prev_v || (s == prev_v && v > prev_i)) && s > bv) { bv = s; best = v; }
         }
         for (int off = 16; off > 0; off >>= 1) {
@@ -1087,7 +1138,8 @@ sampler_split_part_kernel(const float *__restrict__ logits, int n_vocab,
 #pragma unroll
     for (int j = 0; j < kSplitPerLane; ++j) {
         const int v = lo + 32 * j + lane;
-        s[j] = v < n_vocab ? l[v] : sycl::bit_cast<float, int>(0xff800000);
+        s[j] = v < n_vocab ? (p.logit_bias ? l[v] + p.logit_bias[v] : l[v])
+                           : sycl::bit_cast<float, int>(0xff800000);
     }
     if (use_bits) {
 #pragma unroll
@@ -1181,7 +1233,8 @@ sampler_split_merge_kernel(const sycl::int2 *__restrict__ cand, int n_blocks,
 __dpct_inline__ void coupled_stage_kernel(const SamplerParams *__restrict__ mp,
                                           const int *__restrict__ mh,
                                           SamplerParams *__restrict__ dp,
-                                          int *__restrict__ ring, int cap) {
+                                          int *__restrict__ ring, int cap,
+                                          int gumbel) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
     const volatile int *s = (const volatile int *)mp;
     int* d = (int*) dp;
@@ -1189,6 +1242,13 @@ __dpct_inline__ void coupled_stage_kernel(const SamplerParams *__restrict__ mp,
     for (int i = item_ct1.get_local_id(2);
          i < (int)(sizeof(SamplerParams) / sizeof(int));
          i += item_ct1.get_local_range(2)) d[i] = s[i];
+    /*
+    DPCT1065: Consider replacing sycl::nd_item::barrier() with
+    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
+    performance if there is no access to global memory.
+    */
+    item_ct1.barrier(); // the word holding `gumbel` was just copied
+    if (item_ct1.get_local_id(2) == 0) dp->gumbel = gumbel != 0;
     const int h = strata::core::coupled_hist_len(((const volatile SamplerParams*) mp)->penalty_last_n, cap);
     const volatile int* vh = (const volatile int*) mh;
 #pragma unroll
@@ -1214,12 +1274,7 @@ __dpct_inline__ void coupled_penalize_kernel(
 #pragma unroll
     for (int w = item_ct1.get_local_id(2); w < words;
          w += item_ct1.get_local_range(2)) seen[w] = 0u;
-    /*
-    DPCT1065: Consider replacing sycl::nd_item::barrier() with
-    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
-    performance if there is no access to global memory.
-    */
-    item_ct1.barrier();
+    item_ct1.barrier(sycl::access::fence_space::local_space);
     for (int i = item_ct1.get_local_id(2); i < h;
          i += item_ct1.get_local_range(2)) {
         const int v = hrow[i];
@@ -1274,7 +1329,7 @@ __dpct_inline__ void coupled_merge_kernel(
     if (p.greedy || p.temperature <= 0.0f) {   // never launched for greedy requests; the argmax, defensively
         if (lane == 0) { pick[0] = sel_ids[0]; prob[0] = 1.0f; }
     } else {
-        sampled_tail_warp<true>(sel_ids, sel_logit, k, p, 0, pick, ex, prob);
+        sampled_tail_warp<true>(sel_ids, sel_logit, k, p, 0, pick, ex, prob, sub_to_id);
     }
     sycl::group_barrier(sycl::ext::oneapi::this_work_item::get_sub_group());
     if (lane == 0) {
@@ -1286,6 +1341,341 @@ __dpct_inline__ void coupled_merge_kernel(
     }
 }
 
+// ---- PROBABILISTIC DRAFT ACCEPTANCE (include/strata/core/spec_prob.hpp, STRATA_SPEC_PROB=1) ----
+//
+// `sampled_probs_warp` is `sampled_tail_warp`'s chain without the pick: the same arithmetic instruction for
+// instruction (top_p's cut in double over the top_k list, min_p's threshold in logit space, temperature, the two
+// ordered sums), leaving the row's probabilities in `ex[0 .. n_keep)` and returning n_keep in every lane.  It is a
+// copy, not a refactor, so the sampler's own kernels keep their SASS.
+inline int sampled_probs_warp(const float *sel_logit, int k,
+                              const SamplerParams &p, strata::samp_acc_t *ex) {
+    const int lane =
+        (int)(sycl::ext::oneapi::this_work_item::get_nd_item<3>().get_local_id(
+                  2) &
+              31);
+    const float inv_t = p.temperature > 0.0f ? 1.0f / p.temperature : 0.0f;
+    int n_keep = k;
+    float mx = sel_logit[0];
+#pragma unroll
+    for (int i = 1; i < k; ++i) mx = sycl::fmax(mx, sel_logit[i]);
+    if (p.top_p < 1.0f) {
+#pragma unroll
+        for (int i = lane; i < k; i += 32)
+            ex[i] = sycl::exp((strata::samp_acc_t)sel_logit[i] - (strata::samp_acc_t)mx);
+        sycl::group_barrier(sycl::ext::oneapi::this_work_item::get_sub_group());
+        strata::samp_acc_t sum = 0.0;
+        if (lane == 0)
+#pragma unroll
+            for (int i = 0; i < k; ++i) sum += ex[i];
+        /*
+        DPCT1108: '__shfl_sync' was migrated with the experimental feature
+        masked sub_group function which may not be supported by all compilers or
+        runtimes. You may need to adjust the code.
+        */
+        sum = dpct::experimental::select_from_sub_group(
+            kFullMask, sycl::ext::oneapi::this_work_item::get_sub_group(), sum,
+            0);
+        sycl::group_barrier(sycl::ext::oneapi::this_work_item::get_sub_group());
+#pragma unroll
+        for (int i = lane; i < k; i += 32) ex[i] = ex[i] / sum;
+        sycl::group_barrier(sycl::ext::oneapi::this_work_item::get_sub_group());
+        int cut = k;
+        if (lane == 0) {
+            strata::samp_acc_t cum = 0.0;
+#pragma unroll
+            for (int i = 0; i < k; ++i) {
+                cum += ex[i];
+                if (cum >= (strata::samp_acc_t) p.top_p) { cut = i + 1; break; }
+            }
+        }
+        /*
+        DPCT1108: '__shfl_sync' was migrated with the experimental feature
+        masked sub_group function which may not be supported by all compilers or
+        runtimes. You may need to adjust the code.
+        */
+        cut = dpct::experimental::select_from_sub_group(
+            kFullMask, sycl::ext::oneapi::this_work_item::get_sub_group(), cut,
+            0);
+        if (cut < p.min_keep) cut = p.min_keep < k ? p.min_keep : k;
+        n_keep = cut;
+        sycl::group_barrier(sycl::ext::oneapi::this_work_item::get_sub_group());
+    }
+    if (p.min_p > 0.0f) {
+        const float thresh = sel_logit[0] + sycl::log((float)(p.min_p));
+#pragma unroll
+        for (int i = 0; i < n_keep; ++i)
+            if (sel_logit[i] < thresh) { n_keep = i; break; }
+    }
+    float smx = sel_logit[0] * inv_t;
+#pragma unroll
+    for (int i = 1; i < n_keep; ++i)
+        smx = sycl::fmax(smx, sel_logit[i] * inv_t);
+#pragma unroll
+    for (int i = lane; i < n_keep; i += 32)
+        ex[i] = sycl::exp((strata::samp_acc_t)(sel_logit[i] * inv_t) - (strata::samp_acc_t)smx);
+    sycl::group_barrier(sycl::ext::oneapi::this_work_item::get_sub_group());
+    strata::samp_acc_t sum = 0.0;
+    if (lane == 0)
+#pragma unroll
+        for (int i = 0; i < n_keep; ++i) sum += ex[i];
+    /*
+    DPCT1108: '__shfl_sync' was migrated with the experimental feature
+    masked sub_group function which may not be supported by all compilers or
+    runtimes. You may need to adjust the code.
+    */
+    sum = dpct::experimental::select_from_sub_group(
+        kFullMask, sycl::ext::oneapi::this_work_item::get_sub_group(), sum, 0);
+    sycl::group_barrier(sycl::ext::oneapi::this_work_item::get_sub_group());
+#pragma unroll
+    for (int i = lane; i < n_keep; i += 32) ex[i] = ex[i] / sum;
+    sycl::group_barrier(sycl::ext::oneapi::this_work_item::get_sub_group());
+    return n_keep;
+}
+
+/// The drafter's last kernel in probabilistic mode (replaces `coupled_merge_kernel`): the merge of the draft head's
+/// block lists, the chain's distribution q over them, ONE draw from q with the drafter's own Philox stream
+/// (counter = the verifying row's position | kSpecCtrDraft - not the verifier's uniform), and q itself - the
+/// (token id, probability) list - into `qrow` (kSpecQStride int32: ids, -1 terminated, then float bits).  The draft's
+/// id goes to *out_id and the ring, its probability under q to *out_prob (`--spec-min-p` gates on it).
+/*
+DPCT1110: The total declared local variable size in device function
+spec_draft_merge_kernel exceeds 128 bytes and may cause high register pressure.
+Consult with your hardware vendor to find the total register size available and
+adjust the code, or use smaller sub-group size to avoid high register pressure.
+*/
+__dpct_inline__ void spec_draft_merge_kernel(
+    const sycl::int2 *__restrict__ cand, int n_blocks, int nv, int kpart,
+    const SamplerParams *__restrict__ dp, const int *__restrict__ step_rec,
+    const int *__restrict__ sub_to_id, int *__restrict__ ring, int cap, int j,
+    int *__restrict__ out_id, float *__restrict__ out_prob,
+    int *__restrict__ qrow, int gate_pick, float tscale) {
+    const int lane =
+        (int)sycl::ext::oneapi::this_work_item::get_nd_item<3>().get_local_id(
+            2);
+    SamplerParams p = *dp;
+    p.temperature *= tscale;   // 1 unless STRATA_SPEC_PROB_DT: any q is valid, a sharper one may be kept more often
+    const int k = sampled_k(p.top_k, nv);
+    auto &lists = *sycl::ext::oneapi::group_local_memory_for_overwrite<
+        sycl::int2[kSplitMaxBlocks * kSelMax]>(
+        sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    auto &sel_ids =
+        *sycl::ext::oneapi::group_local_memory_for_overwrite<int[kSelMax]>(
+            sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    auto &sel_logit =
+        *sycl::ext::oneapi::group_local_memory_for_overwrite<float[kSelMax]>(
+            sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    auto &ex =
+        *sycl::ext::oneapi::group_local_memory_for_overwrite<strata::samp_acc_t[kSelMax]>(
+            sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    auto &pick = *sycl::ext::oneapi::group_local_memory_for_overwrite<int[1]>(
+        sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    auto &prob = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[1]>(
+        sycl::ext::oneapi::this_work_item::get_work_group<3>());
+#pragma unroll
+    for (int e = lane; e < n_blocks * kpart; e += 32) lists[e] = cand[e];
+    sycl::group_barrier(sycl::ext::oneapi::this_work_item::get_sub_group());
+    warp_merge_lists(lists, n_blocks, kpart, k, nv, [&](int i, float v, int id) {
+        if (lane == 0) { sel_ids[i] = id < nv ? id : 0; sel_logit[i] = v; }
+    });
+    sycl::group_barrier(sycl::ext::oneapi::this_work_item::get_sub_group());
+    int n_keep = 1;
+    if (p.greedy || p.temperature <= 0.0f) {   // never launched for greedy requests; the argmax as a point mass
+        if (lane == 0) { pick[0] = 0; prob[0] = 1.0f; ex[0] = 1.0; }
+        sycl::group_barrier(sycl::ext::oneapi::this_work_item::get_sub_group());
+    } else {
+        n_keep = sampled_probs_warp(sel_logit, k, p, ex);
+        if (lane == 0) {
+            const float u = philox_uniform(p.seed, strata::core::coupled_draft_counter((int64_t) step_rec[0]) |
+                                                       strata::core::kSpecCtrDraft);
+            strata::samp_acc_t cum = 0.0;
+            int pi = n_keep > 0 ? n_keep - 1 : 0;
+#pragma unroll
+            for (int i = 0; i < n_keep; ++i) {
+                cum += ex[i];
+                if ((strata::samp_acc_t) u < cum) { pi = i; break; }
+            }
+            pick[0] = pi;
+            // the gate for --spec-min-p: q's top probability (how sure the draft head is), or the drawn token's own
+            prob[0] = n_keep > 0 ? (float) ex[gate_pick ? pi : 0] : 1.0f;
+        }
+        sycl::group_barrier(sycl::ext::oneapi::this_work_item::get_sub_group());
+    }
+    // q's list in token ids (the subset's index mapped back), -1 after the last entry
+    for (int i = lane; i < strata::core::kSpecQEntries; i += 32) {
+        if (i < n_keep) {
+            const int s = sel_ids[i];
+            qrow[i] = sub_to_id != nullptr ? sub_to_id[s] : s;
+            ((float*) qrow)[strata::core::kSpecQEntries + i] = (float) ex[i];
+        } else {
+            qrow[i] = -1;
+            ((float*) qrow)[strata::core::kSpecQEntries + i] = 0.0f;
+        }
+    }
+    sycl::group_barrier(sycl::ext::oneapi::this_work_item::get_sub_group());
+    if (lane == 0) {
+        const int s = sel_ids[pick[0]];
+        const int id = sub_to_id != nullptr ? sub_to_id[s] : s;
+        *out_id = id;
+        *out_prob = prob[0];
+        ring[cap + j] = id;
+    }
+}
+
+/// THE VERIFIER (one warp per window row): the row's post-chain distribution p from the split sampler's block lists,
+/// then spec_prob.hpp's rule - accept the row's draft d with min(1, p(d)/q(d)) (q from the drafter's list for rows
+/// < n_q, a point mass otherwise), and write out[t] = d on an accept, the residual sample on a reject (never d), the
+/// plain sample on the window's last row.  The host's `while (window[a+1] == out[a]) ++a` is unchanged.  Rows are
+/// independent: each draws its own uniforms from its position (p.counter + t).  `dtok` holds the T-1 drafts.
+template <bool Augmented>
+/*
+DPCT1110: The total declared local variable size in device function
+spec_verify_merge_kernel exceeds 128 bytes and may cause high register pressure.
+Consult with your hardware vendor to find the total register size available and
+adjust the code, or use smaller sub-group size to avoid high register pressure.
+*/
+__dpct_inline__ void spec_verify_merge_kernel(
+    const sycl::int2 *__restrict__ cand, int n_blocks, int n_vocab,
+    const SamplerParams p, int k, int T, const int32_t *__restrict__ dtok,
+    const int32_t *__restrict__ qbuf, int n_q, int *__restrict__ out) {
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    const int t = item_ct1.get_group(2);
+    const int lane = (int)item_ct1.get_local_id(2);
+    auto &lists = *sycl::ext::oneapi::group_local_memory_for_overwrite<
+        sycl::int2[kSplitMaxBlocks * kSelMax]>(
+        sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    auto &sel_ids =
+        *sycl::ext::oneapi::group_local_memory_for_overwrite<int[kSelMax]>(
+            sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    auto &sel_logit =
+        *sycl::ext::oneapi::group_local_memory_for_overwrite<float[kSelMax]>(
+            sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    auto &ex =
+        *sycl::ext::oneapi::group_local_memory_for_overwrite<strata::samp_acc_t[kSelMax]>(
+            sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    auto &rw =
+        *sycl::ext::oneapi::group_local_memory_for_overwrite<strata::samp_acc_t[kSelMax]>(
+            sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    const sycl::int2 *src = cand + (size_t)t * n_blocks * k;
+#pragma unroll
+    for (int e = lane; e < n_blocks * k; e += 32) lists[e] = src[e];
+    sycl::group_barrier(sycl::ext::oneapi::this_work_item::get_sub_group());
+    warp_merge_lists(lists, n_blocks, k, k, n_vocab, [&](int i, float v, int id) {
+        if (lane == 0) { sel_ids[i] = id < n_vocab ? id : 0; sel_logit[i] = v; }
+    });
+    sycl::group_barrier(sycl::ext::oneapi::this_work_item::get_sub_group());
+    const int n_keep = sampled_probs_warp(sel_logit, k, p, ex);
+    const uint64_t pos = p.counter + (uint64_t) t;
+    const int d = t < T - 1 ? dtok[t] : -1;
+    const bool has_q = t < n_q;
+    const int32_t* qid = has_q ? qbuf + (size_t) t * strata::core::kSpecQStride : nullptr;
+    const float* qpr = has_q ? (const float*) (qid + strata::core::kSpecQEntries) : nullptr;
+    const auto kind = strata::core::proposal::rowkind(t, T, n_q);
+    // lane 0: p(d), q(d) and the accept decision.  dec: 0 plain sample, 1 accept, 2 reject; point: no usable q(d)
+    int dec = 0, point = 1;
+    if (lane == 0 && d >= 0) {
+        strata::samp_acc_t pd = 0.0;
+#pragma unroll
+        for (int i = 0; i < n_keep; ++i)
+            if (sel_ids[i] == d) { pd = ex[i]; break; }
+        strata::samp_acc_t qd = -1.0;
+        if (has_q)
+#pragma unroll
+            for (int i = 0; i < strata::core::kSpecQEntries && qid[i] >= 0; ++i)
+                if (qid[i] == d) { qd = (strata::samp_acc_t) qpr[i]; break; }
+        point = qd > 0.0 ? 0 : 1;
+        const float u = philox_uniform(p.seed, pos | strata::core::kSpecCtrAccept);
+        dec = (pd > 0.0 && (point ? (strata::samp_acc_t) u < pd : (strata::samp_acc_t) u * qd < pd)) ? 1 : 2;
+        if constexpr (Augmented) {
+            // An explicit mu candidate cannot silently become a point proposal.
+            if (has_q && (!(qd > 0.0) || !sycl::isfinite(qd))) dec = 3;
+        }
+    }
+    if constexpr (Augmented) {
+        if (lane == 0 && kind == strata::core::proposal::RowKind::MuOffer && (d < 0 || d >= n_vocab)) dec = 3;
+        if (lane == 0 && kind == strata::core::proposal::RowKind::NullTail) {
+            // Last row (including T=1) has d=-1, no dtok read or acceptance draw.
+            dec = 2; point = 0;
+        }
+    }
+    /*
+    DPCT1108: '__shfl_sync' was migrated with the experimental feature
+    masked sub_group function which may not be supported by all compilers or
+    runtimes. You may need to adjust the code.
+    */
+    dec = dpct::experimental::select_from_sub_group(
+        kFullMask, sycl::ext::oneapi::this_work_item::get_sub_group(), dec, 0);
+    /*
+    DPCT1108: '__shfl_sync' was migrated with the experimental feature
+    masked sub_group function which may not be supported by all compilers or
+    runtimes. You may need to adjust the code.
+    */
+    point = dpct::experimental::select_from_sub_group(
+        kFullMask, sycl::ext::oneapi::this_work_item::get_sub_group(), point,
+        0);
+    if (dec == 2) {   // the residual weights over p's support: max(0, p - q), or p without d for a point mass
+        for (int i = lane; i < n_keep; i += 32) {
+            strata::samp_acc_t wi;
+            if (point) {
+                wi = sel_ids[i] == d ? 0.0 : ex[i];
+            } else {
+                strata::samp_acc_t qi = 0.0;
+#pragma unroll
+                for (int j = 0; j < strata::core::kSpecQEntries && qid[j] >= 0;
+                     ++j)
+                    if (qid[j] == sel_ids[i]) { qi = (strata::samp_acc_t) qpr[j]; break; }
+                wi = ex[i] - qi;
+                if (wi < 0.0) wi = 0.0;
+            }
+            rw[i] = wi;
+        }
+        sycl::group_barrier(sycl::ext::oneapi::this_work_item::get_sub_group());
+    }
+    if (lane == 0) {
+        int tok;
+        if (dec == 3) {
+            tok = strata::core::proposal::kProposalSamplerErrorToken;
+        } else if (dec == 0) {   // no draft on this row: the plain sample, the exact-match sampler's own draw
+            const float u = philox_uniform(p.seed, pos);
+            strata::samp_acc_t cum = 0.0;
+            tok = sel_ids[n_keep > 0 ? n_keep - 1 : 0];
+#pragma unroll
+            for (int i = 0; i < n_keep; ++i) {
+                cum += ex[i];
+                if ((strata::samp_acc_t) u < cum) { tok = sel_ids[i]; break; }
+            }
+        } else if (dec == 1) {
+            tok = d;
+        } else {
+            strata::samp_acc_t sum = 0.0;
+#pragma unroll
+            for (int i = 0; i < n_keep; ++i) sum += rw[i];
+            if (!(sum > 0.0)) {
+                if constexpr (Augmented) {
+                    tok = kind == strata::core::proposal::RowKind::NullTail
+                        ? strata::core::proposal::kProposalSamplerErrorToken : d;
+                } else {
+                    tok = d;   // preserve the legacy non-NULL rounding behavior
+                }
+            } else {
+                const float u = philox_uniform(p.seed, pos | strata::core::kSpecCtrResid);
+                strata::samp_acc_t cum = 0.0;
+                int last = -1;
+                tok = sel_ids[0];
+                bool done = false;
+#pragma unroll
+                for (int i = 0; i < n_keep; ++i) {
+                    if (!(rw[i] > 0.0)) continue;
+                    last = i;
+                    cum += rw[i] / sum;
+                    if ((strata::samp_acc_t) u < cum) { tok = sel_ids[i]; done = true; break; }
+                }
+                if (!done && last >= 0) tok = sel_ids[last];
+            }
+        }
+        out[t] = tok;
+    }
+}
+
 // Which sampled path runs, read once: `STRATA_OLD_SAMPLER=1` is `sampler_kernel` (engine 0.1.20),
 // `STRATA_SAMPLER_ONE_BLOCK=1` the one-block kernel; by default the split top_k wherever it applies.
 enum class SampledPath { Split, OneBlock, Old };
@@ -1293,6 +1683,11 @@ enum class SampledPath { Split, OneBlock, Old };
 bool env_flag(const char* name) {
     const char* e = std::getenv(name);
     return e != nullptr && *e != '\0' && std::strcmp(e, "0") != 0;
+}
+
+bool gumbel_env() {
+    static const bool on = env_flag("STRATA_SPEC_GUMBEL");
+    return on;
 }
 
 SampledPath sampled_path() {
@@ -1469,7 +1864,9 @@ catch (sycl::exception const &exc) {
 }
 
 void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* history, int history_len,
-                   const SamplerParams& p, int* out, void* stream) {
+                   const SamplerParams& p_in, int* out, void* stream) {
+    SamplerParams p = p_in;
+    p.gumbel = p_in.gumbel || gumbel_env();            // the target's pick; greedy rows never read it
     if (n_tokens <= 0 || n_vocab <= 0) return;
     if (p.penalty_last_n > 0 && (history == nullptr || history_len <= 0)) {
         std::fprintf(stderr, "sample_tokens: penalty_last_n %d needs a history (got %p, len %d)\n",
@@ -1495,7 +1892,7 @@ void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* hi
         }();
         // One block per token, 1,024 threads over the vocabulary.  See `sampler_greedy_kernel`.
         const int gthreads = 1024;
-        if (!(multi && shmem == 0 && sample_greedy_cluster(logits, n_tokens, n_vocab, out, stream)))
+        if (!(multi && shmem == 0 && !p.logit_bias && sample_greedy_cluster(logits, n_tokens, n_vocab, out, stream)))
             /*
             DPCT1049: The work-group size passed to the SYCL kernel may
             exceed the limit. To get the device limit, query
@@ -1679,13 +2076,18 @@ void coupled_draft_stage(const SamplerParams* mapped_params, const int32_t* mapp
         auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         strata::q_of(stream)
-            ->parallel_for<dpct_kernel_name<class coupled_stage_kernel_113245>>(
-                sycl::nd_range<3>(sycl::range(1, 1, 256),
-                                  sycl::range(1, 1, 256)),
-                exp_props, [=](sycl::nd_item<3> item_ct1) {
-                    coupled_stage_kernel(mapped_params, mapped_hist, params,
-                                         ring, cap);
-                });
+            ->submit([&](sycl::handler &cgh) {
+                auto gumbel_env_ct5 = gumbel_env() ? 1 : 0;
+
+                cgh.parallel_for<
+                    dpct_kernel_name<class coupled_stage_kernel_113245>>(
+                    sycl::nd_range<3>(sycl::range(1, 1, 256),
+                                      sycl::range(1, 1, 256)),
+                    exp_props, [=](sycl::nd_item<3> item_ct1) {
+                        coupled_stage_kernel(mapped_params, mapped_hist, params,
+                                             ring, cap, gumbel_env_ct5);
+                    });
+            });
     }
     coupled_check("coupled_draft_stage");
 }
@@ -1765,10 +2167,184 @@ void coupled_draft_sample(float* logits, int nv, const int32_t* sub_to_id, const
     coupled_check("coupled_draft merge");
 }
 
-// No ordinary-p fallback for an explicit gated measure.
-bool sample_tokens_proposal(const float*, int, int, const int*, int,
-                            const SamplerParams&, const int32_t*, const int32_t*, int, int*, void*) {
-    return false;
+template <bool Augmented>
+static bool sample_tokens_spec_impl(const float *logits, int n_tokens,
+                                    int n_vocab, const int *history,
+                                    int history_len, const SamplerParams &p,
+                                    const int32_t *dtok, const int32_t *qbuf,
+                                    int n_q, int *out, void *stream) try {
+    if constexpr (Augmented) {
+        if (n_tokens < 1 || n_q < 0 || n_q > n_tokens || (n_q > 0 && qbuf == nullptr) ||
+            (n_tokens > 1 && dtok == nullptr)) return false;
+    }
+    if (n_tokens <= 0 || n_vocab <= 0 || p.greedy || p.temperature <= 0.0f) return false;
+    if (p.penalty_last_n > 0 && (history == nullptr || history_len <= 0)) return false;
+    const int k = sampled_k(p.top_k, n_vocab);
+    const int n_blocks = (n_vocab + kSplitBlockSpan - 1) / kSplitBlockSpan;
+    if (sampled_path() != SampledPath::Split || n_blocks > kSplitMaxBlocks || n_tokens > kSplitMaxRows ||
+        stream_capturing(stream))
+        return false;
+    sycl::int2 *scratch = split_scratch(
+        stream, (size_t)(n_tokens > 16 ? n_tokens : 16) * n_blocks * kSelMax);
+    if (scratch == nullptr) return false;
+    {
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
+
+        strata::q_of(stream)
+            ->parallel_for<
+                dpct_kernel_name<class sampler_split_part_kernel_b8f77f,
+                                 dpct_kernel_scalar<Augmented>>>(
+                sycl::nd_range<3>(
+                    sycl::range(1, (unsigned)n_tokens, (unsigned)n_blocks) *
+                        sycl::range(1, 1, kSplitWarps * 32),
+                    sycl::range(1, 1, kSplitWarps * 32)),
+                exp_props,
+                [=](sycl::nd_item<3> item_ct1)
+                    [[sycl::reqd_sub_group_size(32)]] {
+                        sampler_split_part_kernel(logits, n_vocab, history,
+                                                  history_len, p, k, n_blocks,
+                                                  scratch);
+                    });
+    }
+    {
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
+        sampler_require_fp64(strata::q_of(stream)->get_device());
+
+        strata::q_of(stream)
+            ->parallel_for<
+                dpct_kernel_name<class spec_verify_merge_kernel_df067b,
+                                 dpct_kernel_scalar<Augmented>>>(
+                sycl::nd_range<3>(sycl::range(1, 1, (unsigned)n_tokens) *
+                                      sycl::range(1, 1, 32),
+                                  sycl::range(1, 1, 32)),
+                exp_props,
+                [=](sycl::nd_item<3> item_ct1)
+                    [[sycl::reqd_sub_group_size(32)]] {
+                        spec_verify_merge_kernel<Augmented>(
+                            scratch, n_blocks, n_vocab, p, k, n_tokens, dtok,
+                            qbuf, n_q, out);
+                    });
+    }
+    /*
+    DPCT1010: SYCL uses exceptions to report errors and does not use the
+    error codes. The cudaGetLastError function call was replaced with 0. You
+    need to rewrite this code.
+    */
+    const dpct::err0 e = 0;
+
+    if (stream == nullptr) {
+        const dpct::err0 sync = DPCT_CHECK_ERROR(
+            dpct::get_current_device().queues_wait_and_throw());
+        /*
+        DPCT1001: The statement could not be removed.
+        */
+        /*
+        DPCT1000: Error handling if-stmt was detected but could not be
+        rewritten.
+        */
+        if constexpr (Augmented) { if (sync != 0) return false; }
+    }
+    return true;
+}
+catch (sycl::exception const &exc) {
+  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
+            << ", line:" << __LINE__ << std::endl;
+  std::exit(1);
+}
+
+bool sample_tokens_spec(const float* logits, int n_tokens, int n_vocab, const int* history, int history_len,
+                        const SamplerParams& p, const int32_t* dtok, const int32_t* qbuf, int n_q, int* out,
+                        void* stream) {
+    return sample_tokens_spec_impl<false>(logits, n_tokens, n_vocab, history, history_len, p, dtok, qbuf, n_q, out, stream);
+}
+
+bool sample_tokens_proposal(const float* logits, int n_tokens, int n_vocab, const int* history, int history_len,
+                        const SamplerParams& p, const int32_t* dtok, const int32_t* qbuf, int n_q, int* out,
+                        void* stream) {
+    return sample_tokens_spec_impl<true>(logits, n_tokens, n_vocab, history, history_len, p, dtok, qbuf, n_q, out, stream);
+}
+
+void spec_draft_sample(float* logits, int nv, const int32_t* sub_to_id, const int32_t* id_to_sub, int id_vocab,
+                       const SamplerParams* params, int32_t* ring, int cap, int j, const int32_t* step_rec,
+                       void* scratch, int32_t* out_id, float* out_prob, int32_t* qrows, int gate_pick, float tscale, void* stream) {
+    const dpct::queue_ptr s = strata::q_of(stream);
+    const int n_blocks = coupled_blocks(nv), kpart = coupled_kpart(nv);
+    if (nv <= 0 || n_blocks > kSplitMaxBlocks || scratch == nullptr) {
+        std::fprintf(stderr, "spec_draft_sample: %d logits need scratch and at most %d blocks\n", nv, kSplitMaxBlocks);
+        std::exit(1);
+    }
+    /*
+    DPCT1049: The work-group size passed to the SYCL kernel may exceed the
+    limit. To get the device limit, query info::device::max_work_group_size.
+    Adjust the work-group size if needed.
+    */
+    {
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
+
+        s->submit([&](sycl::handler &cgh) {
+            /*
+            DPCT1083: The size of local memory in the migrated code may be
+            different from the original code. Check that the allocated memory
+            size in the migrated code is correct.
+            */
+            sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
+                sycl::range((unsigned)((nv + 31) / 32) * sizeof(unsigned)),
+                cgh);
+
+            cgh.parallel_for<
+                dpct_kernel_name<class spec_penalize_kernel_6ca8a3>>(
+                sycl::nd_range<3>(sycl::range(1, 1, 1024),
+                                  sycl::range(1, 1, 1024)),
+                exp_props, [=](sycl::nd_item<3> item_ct1) {
+                    coupled_penalize_kernel(
+                        logits, nv, id_to_sub, id_vocab, params, ring, cap, j,
+                        dpct_local_acc_ct1
+                            .get_multi_ptr<sycl::access::decorated::no>()
+                            .get());
+                });
+        });
+    }
+    coupled_check("spec_penalize");
+    {
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
+
+        s->parallel_for<
+            dpct_kernel_name<class sampler_split_part_kernel_b56ef5>>(
+            sycl::nd_range<3>(sycl::range(1, 1u, (unsigned)n_blocks) *
+                                  sycl::range(1, 1, kSplitWarps * 32),
+                              sycl::range(1, 1, kSplitWarps * 32)),
+            exp_props,
+            [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
+                sampler_split_part_kernel(logits, nv, nullptr, 0,
+                                          SamplerParams{}, kpart, n_blocks,
+                                          (sycl::int2 *)scratch);
+            });
+    }
+    coupled_check("spec_draft split part");
+    {
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
+        sampler_require_fp64(s->get_device());
+
+        s->submit([&](sycl::handler &cgh) {
+            auto qrows_size_t_j_strata_core_kSpecQStride_ct12 =
+                qrows + (size_t)j * strata::core::kSpecQStride;
+
+            cgh.parallel_for<
+                dpct_kernel_name<class spec_draft_merge_kernel_c17336>>(
+                sycl::nd_range<3>(sycl::range(1, 1, 32), sycl::range(1, 1, 32)),
+                exp_props,
+                [=](sycl::nd_item<3> item_ct1)
+                    [[sycl::reqd_sub_group_size(32)]] {
+                        spec_draft_merge_kernel(
+                            (const sycl::int2 *)scratch, n_blocks, nv, kpart,
+                            params, step_rec, sub_to_id, ring, cap, j, out_id,
+                            out_prob,
+                            qrows_size_t_j_strata_core_kSpecQStride_ct12,
+                            gate_pick, tscale);
+                    });
+        });
+    }
+    coupled_check("spec_draft merge");
 }
 
 }  // namespace strata::kernels

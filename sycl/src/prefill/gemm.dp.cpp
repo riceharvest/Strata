@@ -41,11 +41,32 @@
 
 #if defined(__HIPCC__) && defined(STRATA_HIPBLASLT_AVAILABLE)
 #include "hipblaslt_tuning.hpp"
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#else
+#include <unistd.h>
+#endif
 #include <hip/hip_runtime_api.h>
 #include <hipblaslt/hipblaslt.h>
 #include <hipblaslt/hipblaslt-ext.hpp>
 #include <map>
 #include <set>
+#include <tuple>
+#endif
+#if defined(__HIPCC__) && defined(STRATA_ROCBLAS_AVAILABLE)
+#include "rocblas_tuning.hpp"
+#include <hip/hip_runtime_api.h>
+#include <rocblas/rocblas.h>
+#include <filesystem>
+#include <map>
+#include <string>
+#include <system_error>
 #include <tuple>
 #endif
 
@@ -56,6 +77,18 @@
 namespace strata::prefill {
 namespace {
 #if defined(__HIPCC__)
+// STRATA_F16_RANGE (gemm_set_f16_range): the largest |value| and the count beyond 65504 / non-finite, for the BF16
+// weights converted to FP16 (slot 0, bf16_to_f16_rows) and the FP16 GEMM outputs widened (slot 1, widen_rows_f16 -
+// an output rocBLAS wrote as FP16 is Inf there, not saturated).  As the activation counter in kernels.cu.
+__device__ int g_f16_range_on_g = 0;
+__device__ unsigned g_f16_range_max_g[2] = {0, 0};
+__device__ unsigned long long g_f16_range_over_g[2] = {0, 0};
+__device__ __forceinline__ void f16_range_note_g(int k, float f) {
+    const float a = fabsf(f);
+    const unsigned bits = sycl::bit_cast<uint32_t>(a);
+    if (bits > g_f16_range_max_g[k]) atomicMax(&g_f16_range_max_g[k], bits);
+    if (a > 65504.0f || isnan(f)) atomicAdd(&g_f16_range_over_g[k], 1ull);
+}
 // Y's rows, written by an FP16-out GEMM as FP16 at the start of each FP32 row (ldc = 2 ldy halves), widened in place.
 // Float c overwrites halves 2c and 2c+1, so a row is walked from its end in blocks: a block's halves are read into
 // registers, the block syncs, then writes its floats - which only cover halves of blocks already read.
@@ -69,6 +102,7 @@ __global__ void widen_rows_f16(float* __restrict__ Y, int64_t n, int64_t ldy, in
         const int64_t c = b * blockDim.x + threadIdx.x;
         const float v = c < n ? __half2float(h[c]) : 0.0f;
         if (count_nonfinite && c < n && !isfinite(v)) atomicAdd(&g_f16_nonfinite, 1ull);
+        if (c < n && g_f16_range_on_g) f16_range_note_g(1, v);
         __syncthreads();
         if (c < n) y[c] = v;
         __syncthreads();
@@ -78,10 +112,42 @@ __global__ void widen_rows_f16(float* __restrict__ Y, int64_t n, int64_t ldy, in
 __global__ void bf16_to_f16_rows(const uint16_t* __restrict__ s, __half* __restrict__ d, int64_t n) {
     for (int64_t i = blockIdx.x * (int64_t) blockDim.x + threadIdx.x; i < n; i += (int64_t) gridDim.x * blockDim.x) {
         const float f = __uint_as_float((uint32_t) s[i] << 16);
+        if (g_f16_range_on_g) f16_range_note_g(0, f);
         d[i] = __float2half(isnan(f) ? f : fminf(fmaxf(f, -65504.0f), 65504.0f));   // as hf_sat: a NaN stays NaN
     }
 }
 #endif
+}  // namespace
+
+void gemm_set_f16_range(bool on) {
+#if defined(__HIPCC__)
+    const int v = on ? 1 : 0;
+    if (cudaMemcpyToSymbol(g_f16_range_on_g, &v, sizeof v) != cudaSuccess) {
+        std::fprintf(stderr, "prefill gemm: setting the FP16 range check failed: %s\n", cudaGetErrorString(cudaGetLastError()));
+        std::exit(1);
+    }
+#else
+    (void) on;
+#endif
+}
+bool gemm_f16_range_read(float max_abs[2], unsigned long long over[2], bool reset) {
+#if defined(__HIPCC__)
+    unsigned bits[2] = {0, 0}; unsigned long long o[2] = {0, 0};
+    if (cudaMemcpyFromSymbol(bits, g_f16_range_max_g, sizeof bits) != cudaSuccess ||
+        cudaMemcpyFromSymbol(o, g_f16_range_over_g, sizeof o) != cudaSuccess) { cudaGetLastError(); return false; }
+    for (int k = 0; k < 2; ++k) { union { unsigned u; float f; } c; c.u = bits[k]; max_abs[k] = c.f; over[k] = o[k]; }
+    if (reset) {
+        const unsigned z[2] = {0, 0}; const unsigned long long zz[2] = {0, 0};
+        cudaMemcpyToSymbol(g_f16_range_max_g, z, sizeof z); cudaMemcpyToSymbol(g_f16_range_over_g, zz, sizeof zz);
+    }
+    return true;
+#else
+    (void) max_abs; (void) over; (void) reset;
+    return false;
+#endif
+}
+
+namespace {
 
 void ck(int s, const char *what) {
     if (s != 0) {
@@ -190,9 +256,34 @@ struct HipLtDescriptors {
     }
 };
 
+// The engine package's own tuning folder (<engine folder>/tuning), for a start that did not come through the launcher (a hand-made
+// config, a CLI run): without a table the prompt GEMMs fall back to plain hipBLAS and a Strix Halo reads prompts at half speed
+// (340 against 690 tok/s, IQ3_S 4K).  The launcher sets STRATA_HIPBLASLT_TUNING itself; this is the same table found by the engine.
+std::string own_tuning_dir() {
+#if defined(_WIN32)
+    char p[4096] = {};
+    const DWORD n = GetModuleFileNameA(nullptr, p, (DWORD) sizeof(p));
+    std::string s(p, n);
+    const size_t k = s.find_last_of("\\/");
+    return k == std::string::npos ? std::string() : s.substr(0, k + 1) + "tuning/";
+#else
+    char p[4096] = {};
+    const ssize_t n = readlink("/proc/self/exe", p, sizeof(p) - 1);
+    std::string s(p, n > 0 ? (size_t) n : 0);
+    const size_t k = s.find_last_of('/');
+    return k == std::string::npos ? std::string() : s.substr(0, k + 1) + "tuning/";
+#endif
+}
+
 std::unique_ptr<HipLtState> create_hipblaslt_state(void* workspace, size_t workspace_bytes) {
+    std::string path_own;
     const char* path = std::getenv("STRATA_HIPBLASLT_TUNING");
-    if (!path || !*path) return nullptr;
+    bool from_package = false;
+    if (!path || !*path) {
+        const char* sw = std::getenv("STRATA_HIPBLASLT_TABLE");     // the launcher's switch: off / 0 / false = never the packaged table
+        if (sw != nullptr && (std::strcmp(sw, "off") == 0 || std::strcmp(sw, "0") == 0 || std::strcmp(sw, "false") == 0)) return nullptr;
+        from_package = true;                                          // the file is found below, once the card and the version are known
+    }
 
     auto state = std::make_unique<HipLtState>();
     state->workspace = workspace;
@@ -217,6 +308,15 @@ std::unique_ptr<HipLtState> create_hipblaslt_state(void* workspace, size_t works
     const auto suffix = arch.find(':');
     if (suffix != std::string::npos) arch.resize(suffix);
 
+    if (from_package) {
+        const std::string dir = own_tuning_dir();
+        if (dir.empty()) return nullptr;
+        path_own = dir + arch + "-hipblaslt-" + std::to_string(version) + ".txt";
+        std::FILE* f = std::fopen(path_own.c_str(), "rb");
+        if (f == nullptr) return nullptr;       // no table for this card and hipBLASLt version beside the engine: plain hipBLAS as before
+        std::fclose(f);
+        path = path_own.c_str();
+    }
     std::string error;
     if (!state->table.load(path, arch, version, error)) {
         std::fprintf(stderr, "prefill gemm: %s; using hipBLASEx\n", error.c_str());
@@ -352,6 +452,137 @@ bool try_hipblaslt(void* opaque_state, strata::prefill::hipblaslt::InputType typ
 }
 #endif
 
+#if defined(__HIPCC__) && defined(STRATA_ROCBLAS_AVAILABLE)
+// The rocBLAS solution table of f16_inplace (STRATA_ROCBLAS_TUNING: a table file, or a directory holding
+// <arch>-rocblas-<version>.txt for this card and rocBLAS build; src/prefill/rocblas_tuning.hpp).  rocBLAS's own
+// pick for some shapes is up to 6x slower than the best kernel it holds for them (gfx1030: tools/hip/tune_rocblas.cpp).
+struct RocBlasState {
+    rocblas_handle handle = nullptr;
+    strata::prefill::rocblas_tuning::Table table;
+    struct Pick { bool tuned = false; int solution = 0; int refusals = 0; };
+    std::map<std::tuple<int, int, int, int>, Pick> cache;   // (T, N, K, ldy) -> the solution to run, or the default
+    uint64_t tuned_launches = 0;
+    uint64_t fallbacks = 0;
+
+    ~RocBlasState() {
+        if (std::getenv("STRATA_ROCBLAS_VERBOSE")) {
+            std::fprintf(stderr, "prefill gemm: rocBLAS tuning summary tuned_launches=%llu fallbacks=%llu\n",
+                         (unsigned long long) tuned_launches, (unsigned long long) fallbacks);
+        }
+        if (handle) rocblas_destroy_handle(handle);
+    }
+};
+
+std::unique_ptr<RocBlasState> create_rocblas_state(void* stream) {
+    const char* path = std::getenv("STRATA_ROCBLAS_TUNING");
+    if (!path || !*path) return nullptr;
+    auto state = std::make_unique<RocBlasState>();
+    if (rocblas_create_handle(&state->handle) != rocblas_status_success) {
+        std::fprintf(stderr, "prefill gemm: rocBLAS handle creation failed; its default kernels run\n");
+        return nullptr;
+    }
+    rocblas_set_stream(state->handle, (hipStream_t) stream);
+    char version[128] = {0};
+    if (rocblas_get_version_string(version, sizeof version) != rocblas_status_success) {
+        std::fprintf(stderr, "prefill gemm: rocBLAS version query failed; its default kernels run\n");
+        return nullptr;
+    }
+    int device = 0;
+    hipDeviceProp_t properties{};
+    if (hipGetDevice(&device) != hipSuccess || hipGetDeviceProperties(&properties, device) != hipSuccess) {
+        std::fprintf(stderr, "prefill gemm: HIP device query failed; rocBLAS's default kernels run\n");
+        return nullptr;
+    }
+    std::string arch(properties.gcnArchName);
+    if (const auto suffix = arch.find(':'); suffix != std::string::npos) arch.resize(suffix);
+    std::filesystem::path file(path);
+    std::error_code ec;
+    if (std::filesystem::is_directory(file, ec)) {
+        // the table of this card and this rocBLAS build (its version string, trailing dots dropped)
+        std::string tag(version);
+        while (!tag.empty() && tag.back() == '.') tag.pop_back();
+        file /= arch + "-rocblas-" + tag + ".txt";
+    }
+    std::string error;
+    if (!state->table.load(file.string(), arch, version, error)) {
+        std::fprintf(stderr, "prefill gemm: %s (%s); rocBLAS's default kernels run\n", error.c_str(),
+                     file.string().c_str());
+        return nullptr;
+    }
+    // rocBLAS loads its kernel library on the first product through a handle; a solution-index call before that
+    // fails (rocblas_status_internal_error) although the index is valid.  One tiny default product opens it.
+    {
+        uint16_t* tiny = nullptr;
+        if (hipMalloc(&tiny, 4 * 64 * 64 * 2) == hipSuccess) {
+            const float one = 1.0f, zero = 0.0f;
+            (void) rocblas_gemm_ex(state->handle, rocblas_operation_transpose, rocblas_operation_none, 64, 64, 64, &one,
+                                   tiny, rocblas_datatype_f16_r, 64, tiny + 64 * 64, rocblas_datatype_f16_r, 64, &zero,
+                                   tiny + 2 * 64 * 64, rocblas_datatype_f16_r, 128, tiny + 2 * 64 * 64,
+                                   rocblas_datatype_f16_r, 128, rocblas_datatype_f32_r, rocblas_gemm_algo_standard, 0, 0);
+            (void) hipStreamSynchronize((hipStream_t) stream);
+            (void) hipFree(tiny);
+        }
+    }
+    size_t tuned_rows = 0;
+    for (const auto& row : state->table.rows()) tuned_rows += row.tuned ? 1 : 0;
+    std::fprintf(stderr, "prefill gemm: rocBLAS tuning enabled (%zu rows, %zu with a solution, %s, rocBLAS %s)\n",
+                 state->table.rows().size(), tuned_rows, arch.c_str(), version);
+    return state;
+}
+
+// Gemm::f16_inplace's product through the table's solution for its shape.  False when the shape has no row, or the
+// launch was refused (then the default kernel runs, and for that shape from now on).
+bool try_rocblas_f16o(void* opaque_state, const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N,
+                      int64_t K, int64_t ldy) {
+    auto* state = static_cast<RocBlasState*>(opaque_state);
+    if (!state || T <= 0 || N <= 0 || K <= 0 || T > INT_MAX || N > INT_MAX || K > INT_MAX || ldy > INT_MAX / 2) return false;
+    const auto key = std::make_tuple((int) T, (int) N, (int) K, (int) ldy);
+    auto it = state->cache.find(key);
+    if (it == state->cache.end()) {
+        RocBlasState::Pick pick;
+        if (const auto* row = state->table.closest((int) N, (int) K, (int) ldy, (int) T); row && row->tuned) {
+            pick.tuned = true;
+            pick.solution = row->solution;
+        }
+        if (std::getenv("STRATA_ROCBLAS_VERBOSE")) {
+            if (pick.tuned)
+                std::fprintf(stderr, "prefill gemm: rocBLAS solution %d for T=%lld N=%lld K=%lld ldy=%lld\n",
+                             pick.solution, (long long) T, (long long) N, (long long) K, (long long) ldy);
+            else
+                std::fprintf(stderr, "prefill gemm: rocBLAS default kernel; no row for T=%lld N=%lld K=%lld ldy=%lld\n",
+                             (long long) T, (long long) N, (long long) K, (long long) ldy);
+        }
+        it = state->cache.emplace(key, pick).first;
+    }
+    if (!it->second.tuned) return false;
+    const float one = 1.0f, zero = 0.0f;
+    const rocblas_status status = rocblas_gemm_ex(
+        state->handle, rocblas_operation_transpose, rocblas_operation_none, (int) N, (int) T, (int) K, &one, W,
+        rocblas_datatype_f16_r, (int) K, X, rocblas_datatype_f16_r, (int) K, &zero, Y, rocblas_datatype_f16_r,
+        (int) (2 * ldy), Y, rocblas_datatype_f16_r, (int) (2 * ldy), rocblas_datatype_f32_r,
+        rocblas_gemm_algo_solution_index, it->second.solution, 0);
+    if (status == rocblas_status_success) {
+        ++state->tuned_launches;
+        return true;
+    }
+    // A refusal writes nothing (the default kernel runs now).  The first one can be rocBLAS still setting up for the
+    // kernel (its device workspace: seen as invalid_value once, success after); a solution refused three times is
+    // dropped for this shape.
+    ++state->fallbacks;
+    if (++it->second.refusals >= 3) {
+        std::fprintf(stderr, "prefill gemm: rocBLAS solution %d refused (status %d) for T=%lld N=%lld K=%lld ldy=%lld "
+                             "three times; the default kernel runs for this shape\n", it->second.solution, (int) status,
+                     (long long) T, (long long) N, (long long) K, (long long) ldy);
+        it->second.tuned = false;
+    } else if (std::getenv("STRATA_ROCBLAS_VERBOSE")) {
+        std::fprintf(stderr, "prefill gemm: rocBLAS solution %d refused (status %d) for T=%lld N=%lld K=%lld ldy=%lld; "
+                             "the default kernel this time\n", it->second.solution, (int) status, (long long) T,
+                     (long long) N, (long long) K, (long long) ldy);
+    }
+    return false;
+}
+#endif
+
 }  // namespace
 
 bool prompt_f16() {
@@ -381,7 +612,75 @@ bool prompt_f16() {
 #endif
 }
 
+// A padded X (ldx > K) no kernel took: its rows copied to a contiguous FP16 buffer of stride K.  Grown, never shrunk
+// (one buffer per Gemm; a padded X only arrives from STRATA_PF_PAD's producers).  One 2-D copy: the same values, and
+// the ordinary paths below then read them exactly as if the producer had written them unpadded.
+const uint16_t *Gemm::unpad_x(const uint16_t *X, int64_t T, int64_t K,
+                              int64_t ldx) try {
+    if (X == nullptr || T <= 0 || K <= 0 || ldx <= K) return nullptr;
+    const int64_t need = T * K;
+    if (need > unpadded_x_elems_) {
+        if (unpadded_x_ != nullptr) {
+            sycl::free(unpadded_x_, dpct::get_in_order_queue());
+            unpadded_x_ = nullptr;
+            unpadded_x_elems_ = 0;
+        }
+        void* p = nullptr;
+        /*
+        DPCT1026: The call to cudaGetLastError was removed because this
+        functionality is redundant in SYCL.
+        */
+        if (DPCT_CHECK_ERROR(p = (void *)sycl::malloc_device(
+                                 (size_t)need * sizeof(uint16_t),
+                                 dpct::get_in_order_queue())) != 0) {
+            ; return nullptr;
+        }
+        unpadded_x_ = (uint16_t*) p;
+        unpadded_x_elems_ = need;
+    }
+    /*
+    DPCT1124: cudaMemcpy2DAsync is migrated to asynchronous memcpy API.
+    While the origin API might be synchronous, it depends on the type of operand
+    memory, so you may need to call wait() on event return by memcpy API to
+    ensure synchronization behavior.
+    */
+    if (DPCT_CHECK_ERROR(dpct::async_dpct_memcpy(
+            unpadded_x_, (size_t)K * sizeof(uint16_t), X,
+            (size_t)ldx * sizeof(uint16_t), (size_t)K * sizeof(uint16_t),
+            (size_t)T, dpct::device_to_device, *strata::q_of(stream_))) !=
+        0) {
+        /*
+        DPCT1026: The call to cudaGetLastError was removed because this
+        functionality is redundant in SYCL.
+        */
+        return nullptr;
+    }
+    return unpadded_x_;
+}
+catch (sycl::exception const &exc) {
+  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
+            << ", line:" << __LINE__ << std::endl;
+  std::exit(1);
+}
+
+bool gemm_dequant_side() {
+#if defined(__HIPCC__)
+    return false;
+#else
+    static const bool on = [] { const char* v = std::getenv("STRATA_DEQUANT_SIDE"); return v && v[0] == '1'; }();
+    return on;
+#endif
+}
+
 Gemm::~Gemm() {
+    for (void* e : side_ready_)
+        if (e)(void) DPCT_CHECK_ERROR(dpct::destroy_event((dpct::event_ptr)e));
+    for (void* e : side_free_)
+        if (e)(void) DPCT_CHECK_ERROR(dpct::destroy_event((dpct::event_ptr)e));
+    if (side_stream_) {
+        dpct::queue_ptr sq = (dpct::queue_ptr) side_stream_;
+        (void) DPCT_CHECK_ERROR(dpct::get_current_device().destroy_queue(sq));
+    }
 #if defined(STRATA_PREFILL_MMQ) && defined(__HIPCC__)
     delete static_cast<strata::prefill::mmq::Context*>(mmq_ctx_);
     if (mmq_buf_) cudaFree(mmq_buf_);
@@ -389,9 +688,13 @@ Gemm::~Gemm() {
 #if defined(__HIPCC__) && defined(STRATA_HIPBLASLT_AVAILABLE)
     delete static_cast<HipLtState*>(hipblaslt_state_);
 #endif
+#if defined(__HIPCC__) && defined(STRATA_ROCBLAS_AVAILABLE)
+    delete static_cast<RocBlasState*>(rocblas_state_);
+#endif
     if (handle_) delete ((dpct::blas::descriptor_ptr)handle_);
     if (tc_w_) sycl::free(tc_w_, dpct::get_in_order_queue());
     if (tc_x_) sycl::free(tc_x_, dpct::get_in_order_queue());
+    if (unpadded_x_) sycl::free(unpadded_x_, dpct::get_in_order_queue());
     if (!external_) {
         if (scratch_) sycl::free(scratch_, dpct::get_in_order_queue());
         if (workspace_) sycl::free(workspace_, dpct::get_in_order_queue());
@@ -425,6 +728,9 @@ bool Gemm::init_external(void *stream, uint16_t *scratch, int64_t scratch_elems,
 #if defined(__HIPCC__) && defined(STRATA_HIPBLASLT_AVAILABLE)
     hipblaslt_state_ = create_hipblaslt_state(workspace_, ws_bytes).release();
 #endif
+#if defined(__HIPCC__) && defined(STRATA_ROCBLAS_AVAILABLE)
+    rocblas_state_ = create_rocblas_state(stream).release();
+#endif
     return true;
 }
 catch (sycl::exception const &exc) {
@@ -448,6 +754,69 @@ void Gemm::rebind(uint16_t* scratch, int64_t scratch_elems, void* workspace, siz
         state->workspace_bytes = ws_bytes;
     }
 #endif
+}
+
+bool Gemm::set_dequant_side(uint16_t *scratch2, std::string &err) try {
+    side_scratch_ = scratch2;
+    side_cur_ = 0;
+    if (scratch2 == nullptr) return true;
+    if (side_stream_ == nullptr) {   // once: the stream and the four events outlive every rebind
+        dpct::queue_ptr s = &dpct::get_in_order_queue();
+        /*
+        DPCT1000: Error handling if-stmt was detected but could not be
+        rewritten.
+        */
+        /*
+        DPCT1025: The SYCL queue is created ignoring the flag and priority
+        options.
+        */
+        if (const dpct::err0 e = DPCT_CHECK_ERROR(
+                s = dpct::get_current_device().create_queue(true));
+            e != 0) {
+            /*
+            DPCT1009: SYCL reports errors using exceptions and does not use
+            error codes. Please replace the "get_error_string_dummy(...)" with a
+            real error-handling function.
+            */
+            /*
+            DPCT1001: The statement could not be removed.
+            */
+            err = std::string("prefill gemm: dequant side stream: ") +
+                  dpct::get_error_string_dummy(e);
+            side_scratch_ = nullptr;
+            return false;
+        }
+        side_stream_ = s;
+        for (int i = 0; i < 2; ++i) {
+            dpct::event_ptr r = nullptr, f = nullptr;
+            const bool made = DPCT_CHECK_ERROR(r = new sycl::event()) == 0 &&
+                              DPCT_CHECK_ERROR(f = new sycl::event()) == 0;
+            side_ready_[i] = r;   // kept even on a failure: the destructor frees what was made
+            side_free_[i] = f;
+            if (!made) {
+                err = "prefill gemm: dequant side events";
+                side_scratch_ = nullptr;
+                return false;
+            }
+        }
+    }
+    // both scratches are free once what the compute stream holds now is done (a rebind follows a stream sync, so
+    // this is belt and braces; a wait on an event never recorded would pass anyway)
+    for (int i = 0; i < 2; ++i)
+        /*
+        DPCT1024: The original code returned the error code that was
+        further consumed by the program logic. This original code was replaced
+        with 0. You may need to rewrite the program logic consuming the error
+        code.
+        */
+        (void)DPCT_CHECK_ERROR(dpct::sync_barrier(
+            (dpct::event_ptr)side_free_[i], strata::q_of(stream_)));
+    return true;
+}
+catch (sycl::exception const &exc) {
+  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
+            << ", line:" << __LINE__ << std::endl;
+  std::exit(1);
 }
 
 bool Gemm::init(void *stream, int64_t scratch_elems, std::string &err) try {
@@ -493,6 +862,9 @@ bool Gemm::init(void *stream, int64_t scratch_elems, std::string &err) try {
          "cublasSetMathMode");
 #if defined(__HIPCC__) && defined(STRATA_HIPBLASLT_AVAILABLE)
     hipblaslt_state_ = create_hipblaslt_state(workspace_, ws).release();
+#endif
+#if defined(__HIPCC__) && defined(STRATA_ROCBLAS_AVAILABLE)
+    rocblas_state_ = create_rocblas_state(stream).release();
 #endif
     if (scratch_elems > 0) {
         /*
@@ -656,7 +1028,60 @@ catch (sycl::exception const &exc) {
   std::exit(1);
 }
 constexpr int64_t kXSliceElems = 16ll << 20;   // 32 MiB of FP16 activations per slice (64 MiB as fp32)
+
+#if defined(STRATA_EXPERIMENTAL_SM60)
+// ---- Pascal, opt-in (STRATA_DENSE_F32=1): the dense projections' FP16-operand GEMMs as cublasSgemm ----------------
+// Measured on a Tesla P40 (sm_61) with cuBLAS 12.4.5.8 (bench/results/2026-10-12-p40-sm61-kernels).  For FP16
+// operands with FP32 sums cuBLAS has two Maxwell kernels there, maxwell_sgemm_fp16_64x64 and _32x128, and picks the
+// slow one for most chunk sizes: the 10240 x 2560 qkv projection runs at 7.6 TFLOPS for T 7030-7040 and at 4.3 from
+// T 7041 (49 -> 85 ms), and at 4.3-4.6 for two thirds of the T between 256 and 8192; the 12288-row query projection
+// likewise.  A 7K-token prompt reads in 16.3 or 19.5 s by its token count.  cublasSgemm on FP32 copies
+// (maxwell_sgemm_128x64) runs at 8.4-9.8 TFLOPS for every T from 512 (6.7+ from 256).  The copies are exact
+// (FP16 -> FP32), and for the shapes and sizes taken here the two kernels add every output's products in the same
+// order: the result is bitwise the cuBLAS FP16 call's (gemm_f32_parity: 5,201 chunk sizes on a P40 with cuBLAS 12.4, a
+// measurement of this library, not a guarantee of cuBLAS's; below the sizes taken here - T under
+// ~144 at 6144+ rows, under ~408 at 2560 rows - cuBLAS switches one of them to another kernel family and the bits
+// differ, so those keep the FP16 call).  The weight goes through the BF16 path's conversion buffer (126 MiB for the
+// largest, 21 MiB more than that path's own), the activations through its slices.
+// Opt-in, and on Pascal (compute capability 6.x) only: the equality belongs to the cuBLAS build, so run
+// gemm_f32_parity with yours before turning it on; newer cards have tensor cores for the FP16 call.
+__global__ void f16_to_f32_kernel(const uint16_t* __restrict__ in, float* __restrict__ out, int64_t n) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = __half2float(__ushort_as_half(in[i]));
+}
+void f16_to_f32(const uint16_t* in, float* out, int64_t n, cudaStream_t st) {
+    if (n <= 0) return;
+    f16_to_f32_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, st>>>(in, out, n);
+}
+int g_dense_f32 = -1;   // gemm_set_dense_f32 (the parity test: 0 / 1 on any card); -1 = STRATA_DENSE_F32
+bool dense_f32_on() {
+    static const bool env = [] {
+        const char* v = std::getenv("STRATA_DENSE_F32");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
+    if (g_dense_f32 >= 0) return g_dense_f32 != 0;
+    if (!env) return false;
+    const int cc = current_cc();
+    return cc >= 60 && cc < 70;
+}
+// The smallest T taken for a weight of N rows and K columns (0: never): the measured shapes only - the 2560-column
+// qkv (10240 rows), query (12288) and gate (6144) projections and the 2560-row output projections (6144 and 4096
+// columns), each from a T where the FP32 route (its conversions included) is the faster one or within ~7% of the FP16
+// call (the gate projection below ~1300 tokens, the 4096-column output projection near 4096) and well above the T
+// where the two stop agreeing bitwise.  Every other shape (a row slice of a weight too) keeps the FP16 call.
+int64_t dense_f32_min_t(int64_t N, int64_t K) {
+    if (K == 2560 && (N == 10240 || N == 12288)) return 256;
+    if (K == 2560 && N == 6144) return 512;
+    if (N == 2560 && (K == 6144 || K == 4096)) return 4096;
+    return 0;
+}
+#endif
 }  // namespace
+#endif
+#if !defined(__HIPCC__) && defined(STRATA_EXPERIMENTAL_SM60)
+void gemm_set_dense_f32(int mode) { g_dense_f32 = mode; }
+#else
+void gemm_set_dense_f32(int) {}
 #endif
 bool Gemm::bf16_hcd_exact(const uint16_t* X, int64_t ldx, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K) {
 #if defined(__HIPCC__) && defined(STRATA_HIPBLASLT_AVAILABLE)
@@ -782,40 +1207,70 @@ void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64
         return;
     }
 #endif
-#if !defined(__HIPCC__)
-    if (const int path = K > 0 ? bf16_path() : 0; path == 1 && N > 1 && beta == 0.0f) {
-        // a single output row stays cuBLAS's GEMV, faster than the conversions; beta = 1: see above
-        const int64_t x_rows = std::max<int64_t>(1, std::min<int64_t>(T, kXSliceElems / K));
-        if (grow(tc_w_, tc_w_elems_, N * K) && grow(tc_x_, tc_x_elems_, x_rows * K)) {
-            bf16_to_f16(W, tc_w_, N * K, strata::q_of(stream_));
-            for (int64_t t0 = 0; t0 < T; t0 += x_rows) {
-                const int64_t n = std::min<int64_t>(x_rows, T - t0);
-                bf16_to_f16(X + t0 * K, tc_x_, n * K, strata::q_of(stream_));
-                f16(tc_x_, tc_w_, Y + t0 * ldy, n, N, K, ldy, beta);
-            }
-            return;
-        }
-    }
-#if defined(STRATA_EXPERIMENTAL_SM60)
-    else if (path == 2) {
-        // Pascal: fp32 copies (2 elements of the 2-byte buffers each).  Every tile is a disjoint block of Y, so each
-        // gets the caller's beta.
-        const int64_t x_rows = std::max<int64_t>(1, std::min<int64_t>(T, kXSliceElems / K));
-        if (grow(tc_w_, tc_w_elems_, 2 * N * K) && grow(tc_x_, tc_x_elems_, 2 * x_rows * K)) {
-            float* const wf = reinterpret_cast<float*>(tc_w_);
-            float* const xf = reinterpret_cast<float*>(tc_x_);
-            bf16_to_f32(W, wf, N * K, (cudaStream_t) stream_);
-            for (int64_t t0 = 0; t0 < T; t0 += x_rows) {
-                const int64_t n = std::min<int64_t>(x_rows, T - t0);
-                bf16_to_f32(X + t0 * K, xf, n * K, (cudaStream_t) stream_);
-                ck(cublasSgemm((cublasHandle_t) handle_, CUBLAS_OP_T, CUBLAS_OP_N, (int) N, (int) n, (int) K, &alpha,
-                               wf, (int) K, xf, (int) K, &beta, Y + t0 * ldy, (int) ldy),
-                   "cublasSgemm (bf16 on Pascal)");
-            }
-            return;
-        }
-    }
+#if defined(__HIPCC__)
+    // a padded X (STRATA_PF_PAD, ldx > K) keeps the native call: the widening copies contiguous rows
+    if (ldx == 0 && rdna2_sgemm(X, W, Y, T, N, K, ldy, beta, true)) return;
 #endif
+#if !defined(__HIPCC__)
+#if defined(STRATA_EXPERIMENTAL_SM60)
+    constexpr bool kPascalPath = true;
+#else
+    constexpr bool kPascalPath = false;
+#endif
+    if (const int path = K > 0 ? bf16_path() : 0; (path == 1 && N > 1 && beta == 0.0f) || (path == 2 && kPascalPath)) {
+        // FP16 (path 1) or FP32 (path 2, Pascal) copies of the weight and of X, converted in tiles.  Issue #1757: when
+        // the buffers did not fit in the VRAM that was left (a stage of a layer split keeps ~100 MiB), this fell through
+        // to the raw BF16 cuBLAS call, which a Pascal card answers with CUBLAS_STATUS_INTERNAL_ERROR (14).  Now the
+        // weight is converted in tiles of N rows (the whole weight when it fits, as before) and X in slices; a card with
+        // no room even for a tile says so.  A single output row stays cuBLAS's GEMV for path 1 (faster than the
+        // conversions).  Every tile is a disjoint block of Y, so each gets the caller's beta.
+        const int mult = path == 2 ? 2 : 1;   // 2-byte elements per converted value
+        int64_t w_rows = N;
+        int64_t x_rows = std::max<int64_t>(1, std::min<int64_t>(T, kXSliceElems / K));
+        bool fit = false;
+        for (;;) {
+            if (grow(tc_w_, tc_w_elems_, mult * w_rows * K) && grow(tc_x_, tc_x_elems_, mult * x_rows * K)) { fit = true; break; }
+            if (w_rows <= 64 && x_rows <= 64) break;
+            w_rows = std::max<int64_t>(std::min<int64_t>(w_rows, 64), w_rows / 2);
+            x_rows = std::max<int64_t>(std::min<int64_t>(x_rows, 64), x_rows / 2);
+        }
+        if (!fit && path == 2) {   // Pascal has no BF16 cuBLAS call to fall back to; Volta keeps its raw one below
+            std::fprintf(stderr, "prefill gemm: no GPU memory left for the %s conversion buffers of a %lld x %lld BF16 weight "
+                                 "(Pascal cards run the BF16 products through them); free VRAM on this card: raise "
+                                 "--vram-reserve-mib, lower --max-context or --kv-resident, or give it fewer layers\n",
+                         "FP32", (long long) N, (long long) K);
+            std::exit(1);
+        }
+        if (fit) {
+            for (int64_t n0 = 0; n0 < N; n0 += w_rows) {
+                const int64_t nn = std::min<int64_t>(w_rows, N - n0);
+                if (path == 2) {
+#if defined(STRATA_EXPERIMENTAL_SM60)
+                    float* const wf = reinterpret_cast<float*>(tc_w_);
+                    float* const xf = reinterpret_cast<float*>(tc_x_);
+                    bf16_to_f32(W + n0 * K, wf, nn * K, (cudaStream_t) stream_);
+                    for (int64_t t0 = 0; t0 < T; t0 += x_rows) {
+                        const int64_t n = std::min<int64_t>(x_rows, T - t0);
+                        bf16_to_f32(X + t0 * K, xf, n * K, (cudaStream_t) stream_);
+                        ck(cublasSgemm((cublasHandle_t) handle_, CUBLAS_OP_T, CUBLAS_OP_N, (int) nn, (int) n, (int) K, &alpha,
+                                       wf, (int) K, xf, (int) K, &beta, Y + t0 * ldy + n0, (int) ldy),
+                           "cublasSgemm (bf16 on Pascal)");
+                    }
+#endif
+                } else {
+                    bf16_to_f16(W + n0 * K, tc_w_, nn * K,
+                                strata::q_of(stream_));
+                    for (int64_t t0 = 0; t0 < T; t0 += x_rows) {
+                        const int64_t n = std::min<int64_t>(x_rows, T - t0);
+                        bf16_to_f16(X + t0 * K, tc_x_, n * K,
+                                    strata::q_of(stream_));
+                        f16(tc_x_, tc_w_, Y + t0 * ldy + n0, n, nn, K, ldy, beta);
+                    }
+                }
+            }
+            return;
+        }
+    }
 #endif
     if (staged_gemm(*strata::q_of(stream_), handle_, W, (int) K, X, (int) (ldx ? ldx : K), dpct::library_data_t::real_bfloat16, N, T, K,
                     alpha, beta, Y, ldy))
@@ -832,8 +1287,8 @@ void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64
     STRATA_ABSORB_HIPBLAS_STICKY("cublasGemmEx");
 }
 
-void Gemm::f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
-               float beta) {
+void Gemm::f16(const uint16_t *X, const uint16_t *W, float *Y, int64_t T,
+               int64_t N, int64_t K, int64_t ldy, float beta) try {
     if (T <= 0 || N <= 0) return;
     if (ldy <= 0) ldy = N;
 #ifdef STRATA_USE_HIP
@@ -869,6 +1324,11 @@ void Gemm::f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_
            dpct::compute_type::f32)),
        "cublasGemmEx f16");
     STRATA_ABSORB_HIPBLAS_STICKY("cublasGemmEx f16");
+}
+catch (sycl::exception const &exc) {
+  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
+            << ", line:" << __LINE__ << std::endl;
+  std::exit(1);
 }
 
 #if defined(STRATA_PREFILL_MMQ) && defined(__HIPCC__)
@@ -940,10 +1400,16 @@ bool Gemm::native_mmq(const uint16_t* X, int type, const void* W, float* Y, int6
 void Gemm::f16_inplace(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy) {
 #if defined(__HIPCC__)
     const float one = 1.0f, zero = 0.0f;
-    ck(cublasGemmEx((cublasHandle_t) handle_, CUBLAS_OP_T, CUBLAS_OP_N, (int) N, (int) T, (int) K, &one, W, CUDA_R_16F,
-                    (int) K, X, CUDA_R_16F, (int) K, &zero, Y, CUDA_R_16F, (int) (2 * ldy), CUBLAS_COMPUTE_32F,
-                    CUBLAS_GEMM_DEFAULT),
-       "cublasGemmEx f16 out");
+    bool done = false;
+#if defined(STRATA_ROCBLAS_AVAILABLE)
+    done = try_rocblas_f16o(rocblas_state_, X, W, Y, T, N, K, ldy);   // the table's kernel for this shape, if any
+#endif
+    if (!done) {
+        ck(cublasGemmEx((cublasHandle_t) handle_, CUBLAS_OP_T, CUBLAS_OP_N, (int) N, (int) T, (int) K, &one, W,
+                        CUDA_R_16F, (int) K, X, CUDA_R_16F, (int) K, &zero, Y, CUDA_R_16F, (int) (2 * ldy),
+                        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT),
+           "cublasGemmEx f16 out");
+    }
     static const bool dbg_nan = std::getenv("STRATA_DBG_NAN") != nullptr;
     widen_rows_f16<<<(unsigned) T, 256, 0, (cudaStream_t) stream_>>>(Y, N, ldy, dbg_nan ? 1 : 0);
     if (dbg_nan) {   // debug only: a sync per GEMM
@@ -969,7 +1435,10 @@ void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float*
     static const bool pad_on = [] { const char* v = std::getenv("STRATA_PF_PAD"); return v && v[0] == '1'; }();
     static const bool pf_on = [] { const char* v = std::getenv("STRATA_PF_GEMM"); return v && v[0] == '1'; }();
     static const int64_t pf_min_t = [] { const char* v = std::getenv("STRATA_PF_SWITCH_MIN_T"); return v ? (int64_t) std::atoll(v) : (int64_t) 0; }();
-    if (pad_on && pf_on && T >= pf_min_t && T >= 64 && N >= 512 && K % 32 == 0 && N * (K + 64) <= scratch_elems_) {
+    // (strata_pf_padded_gemm_available(): the CURRENT device runs the padded gfx11 product.  On a gfx1151 + gfx1201 split the process-wide switch
+    // is on for both stages; the gfx12 stage would dequantize the weight padded, find no product, and do it again unpadded below.)
+    if (pad_on && pf_on && T >= pf_min_t && T >= 64 && N >= 512 && K % 32 == 0 && N * (K + 64) <= scratch_elems_ &&
+        strata_pf_padded_gemm_available()) {
         const int64_t ldw = K + 64;
         if (strata::kernels::dequant_f16_ld(ggml_type, W_blocks, 0, N, K, ldw, scratch_, stream_) &&
             strata_pf_gemm_f16_ld(X, ldx > 0 ? ldx : K, scratch_, ldw, Y, T, N, K, ldy, beta, stream_)) {
@@ -982,7 +1451,7 @@ void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float*
         // X arrived padded but the weight cannot be (an i-quant without a strided dequant, or the scratch is too
         // small for N x (K + 64)): the weight unpadded, X read at its stride - the same products, the same bits
         const int64_t rows = scratch_elems_ / K;
-        bool ok = rows > 0;
+        bool ok = rows > 0 && strata_pf_padded_gemm_available();
         if (ldy <= 0) ldy = N;
         for (int64_t r0 = 0; ok && r0 < N; r0 += rows) {
             const int64_t n = (N - r0 < rows) ? N - r0 : rows;
@@ -991,8 +1460,17 @@ void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float*
         }
         if (ok) return;
 #endif
-        std::fprintf(stderr, "prefill gemm: a padded X (ldx %lld, K %lld) needs STRATA_PF_PAD's path\n",
-                     (long long) ldx, (long long) K);
+        // Nothing took a padded X: the padded product is the gfx11 matrix cores' (STRATA_PF_PAD asks
+        // strata_pf_padded_gemm_available() before padding now, so this is a stale producer or another card's
+        // activation).  Copy the rows unpadded and run the ordinary paths - the same products, the same bits - rather
+        // than ending the engine.
+        const uint16_t* Xu = unpad_x(X, T, K, ldx);
+        if (Xu != nullptr) {
+            native(Xu, ggml_type, W_blocks, Y, T, N, K, ldy, beta, 0);
+            return;
+        }
+        std::fprintf(stderr, "prefill gemm: a padded X (ldx %lld, K %lld) has no path on this card and could not be "
+                             "copied unpadded (no device memory)\n", (long long) ldx, (long long) K);
         std::exit(1);
     }
 #if defined(STRATA_PREFILL_MMQ) && defined(__HIPCC__)
@@ -1008,6 +1486,51 @@ void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float*
             strata::kernels::dequant_f16(ggml_type, W_blocks, r0, n, K, scratch_, stream_);
             f16(X, scratch_, Y + r0, T, n, K, ldy, beta);
         }
+        // the side stream's next dequant into scratch_ waits for these slices' reads and writes of it
+        /*
+        DPCT1024: The original code returned the error code that was
+        further consumed by the program logic. This original code was replaced
+        with 0. You may need to rewrite the program logic consuming the error
+        code.
+        */
+        if (side_scratch_)(void) DPCT_CHECK_ERROR(dpct::sync_barrier(
+            (dpct::event_ptr)side_free_[0], strata::q_of(stream_)));
+        return;
+    }
+    if (side_scratch_) {
+        // STRATA_DEQUANT_SIDE: the dequant on the side stream, into the scratch the compute stream read last but one.
+        // free[cur] -> dequant -> ready[cur] -> GEMM -> free[cur] orders the dequant after the GEMM that last read
+        // this scratch and the GEMM after the dequant that filled it, so every read and write of a scratch is where
+        // the serial form had it - the same kernels, the same bits - and the dequant runs while the kernels queued
+        // ahead of this GEMM do.
+        uint16_t* const s = side_cur_ == 0 ? scratch_ : side_scratch_;
+        (void)DPCT_CHECK_ERROR(strata::q_of(side_stream_)
+                                   ->ext_oneapi_submit_barrier({*(
+                                       dpct::event_ptr)side_free_[side_cur_]}));
+        strata::kernels::dequant_f16(ggml_type, W_blocks, 0, N, K, s, side_stream_);
+        /*
+        DPCT1024: The original code returned the error code that was
+        further consumed by the program logic. This original code was replaced
+        with 0. You may need to rewrite the program logic consuming the error
+        code.
+        */
+        (void)DPCT_CHECK_ERROR(
+            dpct::sync_barrier((dpct::event_ptr)side_ready_[side_cur_],
+                               strata::q_of(side_stream_)));
+        (void)DPCT_CHECK_ERROR(
+            strata::q_of(stream_)
+                ->ext_oneapi_submit_barrier(
+                    {*(dpct::event_ptr)side_ready_[side_cur_]}));
+        f16(X, s, Y, T, N, K, ldy, beta);
+        /*
+        DPCT1024: The original code returned the error code that was
+        further consumed by the program logic. This original code was replaced
+        with 0. You may need to rewrite the program logic consuming the error
+        code.
+        */
+        (void)DPCT_CHECK_ERROR(dpct::sync_barrier(
+            (dpct::event_ptr)side_free_[side_cur_], strata::q_of(stream_)));
+        side_cur_ ^= 1;
         return;
     }
     strata::kernels::dequant_f16(ggml_type, W_blocks, 0, N, K, scratch_, stream_);

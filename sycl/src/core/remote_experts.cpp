@@ -1,15 +1,18 @@
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
 #include "strata/core/remote_experts.hpp"
+#include "strata/core/device.hpp"   // primary_device() (STRATA_PRIMARY_DEVICE)
 
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/cpu/hadamard.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/quantize_act.hpp"
 #include "strata/kernels/s2_expert_grouped.hpp"
+#include "strata/kernels/window_limits.hpp"
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 
@@ -17,7 +20,7 @@ namespace strata::core {
 namespace {
 constexpr int64_t H = strata::kernels::cpu::H;
 constexpr int64_t FF = strata::kernels::cpu::FF;
-constexpr int64_t CAP = strata::kernels::cpu::MAXT * 10;
+constexpr int64_t CAP = strata::kernels::kWindowMaxT * 10;   // a window's rows x top-10
 
 // Small enough to copy as one pinned buffer per layer. The kernels read the
 // individual arrays through pointers into the same device allocation.
@@ -92,8 +95,13 @@ bool RemoteExperts::preflight(int device, double &free_gib,
     int count = 0;
     if (!check(DPCT_CHECK_ERROR(count = dpct::device_count()),
                "cudaGetDeviceCount", err, device)) return false;
-    if (device < 1 || device >= count) {
+    if (device < 0 || device >= count) {
         err = "CUDA" + std::to_string(device) + " experts: CUDA device is not visible";
+        return false;
+    }
+    if (device == primary_device()) {   // the primary may be any visible ordinal; the helper cannot be it
+        err = "CUDA" + std::to_string(device) + " experts: the helper cannot be the primary device "
+                                                 "(STRATA_PRIMARY_DEVICE)";
         return false;
     }
     // The layer waits for this GPU on the CPU pool's critical path: spin instead of sleeping, whose wake-up
@@ -133,6 +141,7 @@ void RemoteExperts::close() {
     DeviceScope scope(device_);
     if (scope.ok) {
         if (stream_) stream_->wait();
+        if (read_stream_ && read_stream_ != stream_) read_stream_->wait();
         cache_.close();
         if (d_x_) sycl::free(d_x_, dpct::get_in_order_queue());
         if (d_out_) sycl::free(d_out_, dpct::get_in_order_queue());
@@ -144,13 +153,17 @@ void RemoteExperts::close() {
         if (h_out_) sycl::free(h_out_, dpct::get_in_order_queue());
         if (h_meta_) sycl::free(h_meta_, dpct::get_in_order_queue());
         if (stream_) dpct::get_current_device().destroy_queue(stream_);
+        if (read_stream_ && read_stream_ != &dpct::get_in_order_queue()) dpct::get_current_device().destroy_queue(read_stream_);
     }
     device_ = -1;
     stream_ = &dpct::get_in_order_queue();
+    read_stream_ = &dpct::get_in_order_queue();
     h_x_ = h_out_ = d_x_ = d_out_ = nullptr;
     h_meta_ = d_meta_ = nullptr;
     d_q8_ = nullptr;
     d_scales_ = nullptr;
+    d_xr_ = nullptr;
+    d_sx_ = d_sh_ = nullptr;
     d_scratch_ = nullptr;
     d_start_ = d_dst_ = d_tok_ = d_count_ = nullptr;
     d_ptr_ = nullptr;
@@ -170,8 +183,9 @@ bool RemoteExperts::open(int device, int slots, int64_t layers, int64_t experts,
     int count = 0;
     if (!check(DPCT_CHECK_ERROR(count = dpct::device_count()),
                "cudaGetDeviceCount", err, device)) return false;
-    if (device < 1 || device >= count || slots <= 0 || ranked.empty() ||
-        layers <= 0 || experts <= 0 || claimed.size() != (size_t) layers * (size_t) experts) {
+    if (device < 0 || device >= count || slots <= 0 || ranked.empty() ||
+        layers <= 0 || experts <= 0 || claimed.size() != (size_t) layers * (size_t) experts ||
+        device == primary_device()) {   // the helper cannot be the primary device (any visible ordinal)
         err = "CUDA" + std::to_string(device) + " experts: need the device, ranked experts and positive slot count";
         return false;
     }
@@ -309,6 +323,13 @@ bool RemoteExperts::open(int device, int slots, int64_t layers, int64_t experts,
                       sizeof(RemoteMeta), dpct::get_in_order_queue())),
               "group metadata", err, device);
     if (!allocated) { close(); return false; }
+    /*
+    DPCT1025: The SYCL queue is created ignoring the flag and priority options.
+    */
+    if (!check(DPCT_CHECK_ERROR(read_stream_ = dpct::get_current_device().create_queue(true)), "cache read stream", err, device)) {
+        close();
+        return false;
+    }
     // Zero-copy: the helper reads its input from, and writes its compact rows into, the pinned host buffers
     // directly - two copies fewer per layer, each of which is a PCIe round trip.  STRATA_REMOTE_ZEROCOPY=0 copies.
     const char* zc = std::getenv("STRATA_REMOTE_ZEROCOPY");
@@ -356,7 +377,7 @@ bool RemoteExperts::begin(int64_t layer, const float *x, const int32_t *ids,
     struct Timer { double& acc; std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
         ~Timer() { acc += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(); } } timer{ms_begin_};
     const int64_t n = n_tok * k;
-    if (n <= 0 || n > CAP || n_tok > strata::kernels::cpu::MAXT || k != 10 || layer < 0 ||
+    if (n <= 0 || n > CAP || n_tok > strata::kernels::kWindowMaxT || k != 10 || layer < 0 ||
         (size_t) layer >= layers_present_.size() || device_ < 0) {
         err = "CUDA" + std::to_string(device_) + " experts: invalid layer, routing width or window size";
         return false;
@@ -430,15 +451,17 @@ bool RemoteExperts::begin(int64_t layer, const float *x, const int32_t *ids,
     if (!staged) return false;
     const auto& lay = strata::kernels::cpu::expert_layout();
     if (lay.native) {
-        strata::kernels::quantize_q8_1_rows(zero_copy_ ? z_x_ : d_x_, n_tok, H, d_q8_, s);
         const auto& fmt = lay.fmt[(size_t) layer];
+        const float* xe = zero_copy_ ? z_x_ : d_x_;   // (APR Hadamard experts are refused in open() on SYCL)
+        strata::kernels::quantize_q8_1_rows(xe, n_tok, H, d_q8_, s);
         auto L = strata::kernels::native_expert_layout(fmt.gu_type, fmt.d_type, fmt.n_embd, fmt.n_ff);
         strata::kernels::native_expert_grouped(L, d_ptr_, d_start_, d_count_, d_dst_, d_tok_,
                                                groups_, (int64_t) dst_.size(), d_q8_, d_scratch_, zero_copy_ ? z_out_ : d_out_, s);
     } else {
         strata::kernels::quantize_q8_0_scaled(zero_copy_ ? z_x_ : d_x_, d_q8_, d_scales_, n_tok * H, s);
-        strata::kernels::moe_grouped_s2(d_ptr_, d_start_, d_count_, d_dst_, d_tok_,
-                                        groups_, (int64_t) dst_.size(), d_q8_, d_scales_, d_scratch_, zero_copy_ ? z_out_ : d_out_, s);
+        strata::kernels::moe_grouped_s2_window(d_ptr_, d_start_, d_count_, d_dst_, d_tok_,
+                                               groups_, (int64_t) dst_.size(), d_q8_, d_scales_, d_scratch_, zero_copy_ ? z_out_ : d_out_, s,
+                                               (int) n_tok);
     }
     const uint64_t compact_bytes = (uint64_t) dst_.size() * H * sizeof(float);
     /*
@@ -479,4 +502,111 @@ catch (sycl::exception const &exc) {
   std::exit(1);
 }
 
+bool RemoteExperts::copy_cached_blobs(const int32_t* layers, const int32_t* experts, uint8_t* const* dst,
+                                      size_t n, uint8_t* hit, std::string& err) {
+    std::fill(hit, hit + n, 0);
+    if (device_ < 0 || read_stream_ == nullptr || n == 0) return true;
+    const auto& lay = strata::kernels::cpu::expert_layout();
+    DeviceScope scope(device_);
+    if (!scope.ok) { err = scope.error(device_); return false; }
+    std::lock_guard<std::mutex> lock(read_mu_);
+    bool queued = false;
+    for (size_t i = 0; i < n; ++i) {
+        if (dst[i] == nullptr) continue;
+        const int32_t slot = cache_.slot_of(layers[i], experts[i]);
+        if (slot < 0) continue;
+        const size_t bytes = (size_t) lay.blob_bytes(layers[i]);
+        if (!check(DPCT_CHECK_ERROR(read_stream_->memcpy(dst[i], cache_.device_slot(slot), bytes)),
+                   "cache read", err, device_)) {
+            // Nothing may still be writing a caller's buffer when this returns.  If the drain succeeds, the
+            // hits queued before the failure are complete and the caller may keep them; if it does not,
+            // forget every hit and let the caller refill all of them from its fallback.
+            if (DPCT_CHECK_ERROR(read_stream_->wait()) != 0) std::fill(hit, hit + n, 0);
+            return false;
+        }
+        hit[i] = 1;
+        queued = true;
+    }
+    if (queued && !check(DPCT_CHECK_ERROR(read_stream_->wait()), "cache read wait", err, device_)) {
+        std::fill(hit, hit + n, 0);   // a failed wait means no copied buffer may be trusted
+        return false;
+    }
+    return true;
+}
+
+bool RemotePrefillSource::copy_blob(int64_t layer, int64_t expert, uint8_t* dst) {
+    if (dst != nullptr && from_helper(layer, expert)) {
+        const int32_t l = (int32_t) layer, e = (int32_t) expert;
+        uint8_t* d = dst;
+        std::string err;
+        for (RemoteExperts* h : helpers_) {
+            uint8_t got = 0;
+            const bool ok = h->copy_cached_blobs(&l, &e, &d, 1, &got, err);
+            if (got) {
+                helper_blobs_.fetch_add(1, std::memory_order_relaxed);
+                helper_bytes_.fetch_add(strata::kernels::cpu::expert_layout().blob_bytes(layer),
+                                        std::memory_order_relaxed);
+                return true;
+            }
+            if (!ok) break;
+        }
+        warn(err);
+    }
+    return fallback_.copy_blob(layer, expert, dst);
+}
+
+bool RemotePrefillSource::copy_blobs(const int32_t* layers, const int32_t* experts, uint8_t* const* dst, size_t n) {
+    if (helpers_.empty() || n == 0) return fallback_.copy_blobs(layers, experts, dst, n);
+    thread_local std::vector<int32_t> hl, he;
+    thread_local std::vector<uint8_t*> hd;
+    thread_local std::vector<size_t> idx;
+    thread_local std::vector<uint8_t> got;
+    thread_local std::vector<uint8_t> served;
+    thread_local std::vector<int32_t> ml, me;
+    thread_local std::vector<uint8_t*> md;
+    thread_local std::vector<int> which;
+    which.assign(n, -1);
+    served.assign(n, 0);
+    for (size_t i = 0; i < n; ++i) {
+        if (dst[i] == nullptr) continue;
+        for (size_t k = 0; k < helpers_.size(); ++k)
+            if (helpers_[k]->holds(layers[i], experts[i])) { which[i] = (int) k; break; }
+    }
+    // One stream batch per helper, so several hits pay one wait; the misses go to the file source in one
+    // call, which keeps its own batched-read merging for them.
+    uint64_t blobs = 0, bytes = 0;
+    const auto& lay = strata::kernels::cpu::expert_layout();
+    for (size_t k = 0; k < helpers_.size(); ++k) {
+        hl.clear(); he.clear(); hd.clear(); idx.clear();
+        for (size_t i = 0; i < n; ++i)
+            if (which[i] == (int) k) {
+                hl.push_back(layers[i]); he.push_back(experts[i]); hd.push_back(dst[i]); idx.push_back(i);
+            }
+        if (hl.empty()) continue;
+        got.assign(hl.size(), 0);
+        std::string err;
+        if (!helpers_[k]->copy_cached_blobs(hl.data(), he.data(), hd.data(), hl.size(), got.data(), err)) warn(err);
+        for (size_t j = 0; j < got.size(); ++j)
+            if (got[j]) {
+                served[idx[j]] = 1;
+                ++blobs;
+                bytes += lay.blob_bytes(hl[j]);
+            }
+    }
+    if (blobs != 0) {
+        helper_blobs_.fetch_add(blobs, std::memory_order_relaxed);
+        helper_bytes_.fetch_add(bytes, std::memory_order_relaxed);
+    }
+    ml.clear(); me.clear(); md.clear();
+    for (size_t i = 0; i < n; ++i)
+        if (!served[i]) { ml.push_back(layers[i]); me.push_back(experts[i]); md.push_back(dst[i]); }
+    if (ml.empty()) return true;
+    return fallback_.copy_blobs(ml.data(), me.data(), md.data(), ml.size());
+}
+
+void RemotePrefillSource::warn(const std::string& err) {
+    if (err.empty() || warned_.exchange(true)) return;
+    std::fprintf(stderr, "prefill: a helper cache read failed (%s); the file source fills that blob instead\n",
+                 err.c_str());
+}
 } // namespace strata::core

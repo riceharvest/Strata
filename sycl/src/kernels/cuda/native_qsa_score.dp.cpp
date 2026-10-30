@@ -24,6 +24,7 @@
 #include <dpct/dpct.hpp>
 #include "strata/sycl_queue.hpp"
 #include "strata/kernels/native_qsa_score.hpp"
+#include "strata/core/geometry.hpp"
 #include <atomic>
 #include <cstddef>
 #include <cstdint>

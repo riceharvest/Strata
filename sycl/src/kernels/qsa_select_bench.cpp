@@ -1,12 +1,13 @@
+#define DPCT_PROFILING_ENABLED
+#include <sycl/sycl.hpp>
+#include <dpct/dpct.hpp>
+#include <cstring>
 // src/kernels/qsa_select_bench.cpp - the prompt path's QSA selection (qsa_select.hpp) timed per stage, block scores
 // (the warp kernel and the tensor-core one) and top-k, for a batch of consecutive queries at a given context, and
 // the two scorers compared: score difference and how many selections differ (GPU, synthetic, no model).
 // Usage: qsa_select_bench [context=131072] [queries=256] [reps=10] [capacity_cells]
 // capacity_cells (the engine's --max-context): the score buffers and the top-k dispatch follow the CAPACITY
 // (max_blocks = capacity / 4 + 2), the work follows the context. Default: capacity = context (max_blocks = ctx / 4 + 1).
-#define DPCT_PROFILING_ENABLED
-#include <sycl/sycl.hpp>
-#include <dpct/dpct.hpp>
 #include "strata/kernels/qsa.hpp"
 #include "strata/kernels/qsa_select.hpp"
 
@@ -14,6 +15,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <random>
 #include <vector>
 
@@ -34,9 +36,9 @@ template <typename T> T* up(const std::vector<T>& h) {
                                         dpct::get_in_order_queue())),
        "malloc");
     /*
-    DPCT1114: cudaMemcpy is migrated to asynchronization memcpy, assuming in
-    the original code the source host memory is pageable memory. If the memory
-    is not pageable, call wait() on event return by memcpy API to ensure
+    DPCT1114: cudaMemcpy is migrated to asynchronization memcpy, assuming
+    in the original code the source host memory is pageable memory. If the
+    memory is not pageable, call wait() on event return by memcpy API to ensure
     synchronization behavior.
     */
     ck(DPCT_CHECK_ERROR(dpct::get_in_order_queue().memcpy(
@@ -97,6 +99,36 @@ int main(int argc, char** argv) {
                (size_t)(nq * cap) * 4, dpct::get_in_order_queue())),
        "malloc");
     const int64_t active = steps[(size_t) ((nq - 1) * k::kStepCount + k::kStepNBid)] + 1;
+    if (std::getenv("QSA_BENCH_DECODE")) {   // a decode window's call: no block count (block_scores_multi_kernel)
+        auto run_dec = [&] { k::qsa_block_scores(d_pooled, d_dead, d_q, d_steps, nq, max_blocks, s, sc_old, nullptr, -1); };
+        run_dec();
+        ck(DPCT_CHECK_ERROR(dpct::get_current_device().queues_wait_and_throw()),
+           "sync");
+        dpct::event_ptr a0, a1;
+        a0 = new sycl::event(); a1 = new sycl::event();
+        dpct::sync_barrier(a0);
+        for (int r = 0; r < reps; ++r) run_dec();
+        dpct::sync_barrier(a1); a1->wait_and_throw();
+        float ms = 0; ms = (a1->get_profiling_info<
+                                sycl::info::event_profiling::command_end>() -
+                            a0->get_profiling_info<
+                                sycl::info::event_profiling::command_start>()) /
+                           1000000.0f;
+        std::vector<float> h((size_t) (nq * max_blocks));
+        ck(DPCT_CHECK_ERROR(dpct::get_in_order_queue()
+                                .memcpy(h.data(), sc_old, h.size() * 4)
+                                .wait()),
+           "down");
+        unsigned long long x = 1469598103934665603ull;
+        for (int64_t i = 0; i < nq; ++i) {
+            const int64_t nbid = steps[(size_t) (i * k::kStepCount + k::kStepNBid)];
+            for (int64_t j = 0; j <= nbid; ++j) { uint32_t u; std::memcpy(&u, &h[(size_t) (i * max_blocks + j)], 4); x = (x ^ u) * 1099511628211ull; }
+        }
+        const double gb = (double) active * 512.0 / 1e9;
+        std::printf("decode scores ctx %lld, %lld queries: %.1f us (%.0f GB/s of pooled keys), hash %016llx\n", (long long) ctx,
+                    (long long) nq, 1e3 * ms / reps, gb / (ms / reps / 1e3), x);
+        return 0;
+    }
     auto run_old = [&] { k::qsa_block_scores(d_pooled, d_dead, d_q, d_steps, nq, max_blocks, s, sc_old, nullptr, active); };
     // a device without the tensor-core scorer (HIP other than gfx12): time the warp scorer and the top-k only
     const bool have_tc = k::qsa_block_scores_tc(d_pooled, d_dead, d_q, d_steps, 1, max_blocks, s, sc_new, nullptr, active);
@@ -132,6 +164,18 @@ int main(int argc, char** argv) {
                             .memcpy(b.data(), sc_new, b.size() * 4)
                             .wait()),
        "down");
+    if (std::getenv("QSA_BENCH_HASH")) {   // the fast scorer's bytes (compare STRATA_SELECT_SIMT=1 and =2)
+        unsigned long long h = 1469598103934665603ull;
+        for (int64_t i = 0; i < nq; ++i) {
+            const int64_t nbid = steps[(size_t) (i * k::kStepCount + k::kStepNBid)];
+            for (int64_t j = 0; j < nbid; ++j) {
+                uint32_t u;
+                std::memcpy(&u, &b[(size_t) (i * max_blocks + j)], 4);
+                h = (h ^ u) * 1099511628211ull;
+            }
+        }
+        std::printf("fast scores hash %016llx\n", h);
+    }
     ck(DPCT_CHECK_ERROR(dpct::get_in_order_queue()
                             .memcpy(ia.data(), ids_old, ia.size() * 4)
                             .wait()),
@@ -171,7 +215,10 @@ int main(int argc, char** argv) {
     }
     // accuracy against an FP64 host reference on a sample (blocks below n_bid; the tail block is the warp kernel's own
     // arithmetic in both scorers). Gate, as the prompt-attention harness's: the scorer under test is no worse than 4x
-    // the warp kernel's error, floored at 1e-5 of the score scale.
+    // the warp kernel's error, floored at 1e-5 of the score scale.  The floor is the fast scorer's own: measured against the FP64
+    // reference it sits at 1.0e-6 of the scale (RTX 5070 sm_120, ctx 32K: 0.99e-6, which a 1e-6 floor failed by rounding; 131K: 0.97e-6)
+    // against the warp kernel's 7e-8, i.e. FP32-accumulated TF32-split products; 1e-5 keeps ten times that margin and is still
+    // two orders below a plain single-TF32 product (~1e-3), which is the error this gate exists to catch.
     double err_old = 0, err_new = 0, scale = 0;
     {
         std::mt19937 srng(11);

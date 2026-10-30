@@ -34,6 +34,7 @@ void check(dpct::err0 e, const char *what) {
 // A NaN pattern, not zero.  Zeros read from uninitialised memory are indistinguishable from real zeros in a
 // dequantized weight or a masked attention score, which is exactly the kind of wrong-but-plausible value the
 // Phase 1 harnesses kept catching.
+#if !defined(STRATA_GPU_METAL)
 __dpct_inline__ void poison_kernel(float *p, uint64_t n_floats) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
     const uint64_t i =
@@ -41,6 +42,7 @@ __dpct_inline__ void poison_kernel(float *p, uint64_t n_floats) {
         item_ct1.get_local_id(2);
     if (i < n_floats) p[i] = sycl::bit_cast<float>(0x7fc00000);
 }
+#endif
 
 #if defined(STRATA_USE_HIP)
 #if !defined(STRATA_HIP_ARCHS)
@@ -108,6 +110,13 @@ catch (sycl::exception const &exc) {
             << ", line:" << __LINE__ << std::endl;
   std::exit(1);
 }
+
+// STRATA_PRIMARY_DEVICE: see the declaration in device.hpp.  0 = upstream's behavior (the runtime's first
+// visible device).  Set once, before any context exists, by generate.cpp's STRATA_PRIMARY_DEVICE handling.
+static int g_primary_device = 0;
+
+void set_primary_device(int ordinal) { g_primary_device = ordinal; }
+int primary_device() { return g_primary_device; }
 
 bool device_summary(int ordinal, std::string &name, std::string &detail) try {
     dpct::device_info p{};
@@ -273,7 +282,7 @@ std::string gpu_arch_problem(int ordinal) {
 }
 
 std::string device_code_error() try {
-#if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906)
+#if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906) || defined(STRATA_GPU_METAL)
     return "";   // gpu_arch_problem() checks the HIP architectures against STRATA_HIP_ARCHS, before this point
 #else
     // every .cu of the engine is compiled for the same CMAKE_CUDA_ARCHITECTURES, so this kernel stands for all
@@ -415,6 +424,12 @@ DeviceArena::DeviceArena(uint64_t bytes, int ordinal, bool poison)
     check(DPCT_CHECK_ERROR(base_ = (void *)strata::malloc_device_guarded(
                                (size_t)bytes, dpct::get_in_order_queue())),
           "cudaMalloc");
+#if defined(STRATA_GPU_METAL)   // unified memory: the CPU writes the pattern through the allocation's CPU view
+    if (poison_) {
+        uint32_t* h = (uint32_t*) strata::gpu::host_view(base_);
+        for (uint64_t i = 0; i < bytes / sizeof(float); ++i) h[i] = 0x7fc00000u;
+    }
+#else
     if (poison_) {
         const int threads = 256;
         const uint64_t n = bytes / sizeof(float);
@@ -454,6 +469,7 @@ DeviceArena::DeviceArena(uint64_t bytes, int ordinal, bool poison)
                   dpct::get_current_device().queues_wait_and_throw()),
               "poison sync");
     }
+#endif
 }
 
 DeviceArena::~DeviceArena() {

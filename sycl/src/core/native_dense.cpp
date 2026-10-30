@@ -6,6 +6,8 @@
 #include <cstdlib>
 #include "strata/core/weights.hpp"
 #include "strata/artifact/gguf_reader.hpp"
+#include "strata/kernels/fused_gr.hpp"
+#include "strata/kernels/gfx_arch.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/fused_gr_q8.hpp"
 #include "strata/core/geometry.hpp"
@@ -21,10 +23,24 @@
 #include <set>
 #include <cmath>
 #include <cstring>
+#include <map>
+#include <mutex>
+#include <thread>
 #include <vector>
 
 namespace strata::core {
 namespace {
+// `load` makes one cudaMalloc per projection matrix, and the driver backs each call with 2 MiB granules
+// (measured on the RTX 5060: 300 buffers of 6.73 MiB asked 2019 MiB and cost 2400).  So a stage's real
+// footprint is the granule-rounded sum, not the payload sum.  This rule - a granule for every matrix of a
+// MiB or more, the payload for the rest - prices the iq3_s pack's 300 matrices at 2255 MiB where they
+// really take 2238 (+0.8%).  It over-prices, which is the safe side.  (Pricing every matrix at a granule is
+// far worse, 2378 MiB: the driver packs the sub-MiB matrices into the slack of the rounded ones.)
+constexpr uint64_t kAllocGranule = 2ull << 20;
+constexpr uint64_t kSmallAlloc = 1ull << 20;
+uint64_t alloc_bytes(uint64_t bytes) {
+    return bytes < kSmallAlloc ? bytes : (bytes + kAllocGranule - 1) / kAllocGranule * kAllocGranule;
+}
 int g_layer_lb = -1, g_layer_le = -1;   // set_layer_range; -1: every layer
 bool in_range(const std::string& name) {
     if (g_layer_lb < 0 || name.rfind("blk.", 0) != 0) return true;
@@ -80,6 +96,31 @@ std::vector<uint8_t> q8_0_of(const float* x, uint64_t n) {
     }
     return out;
 }
+// A bf16 matrix (the pack file's values) as Q8_0, ggml's reference rounding; the blocks are independent, so a few threads
+std::vector<uint8_t> q8_0_of_bf16(const uint16_t* x, uint64_t n) {
+    std::vector<uint8_t> out((size_t) (n / 32 * 34));
+    const uint64_t nb = n / 32;
+    auto work = [&](uint64_t b0, uint64_t b1) {
+        for (uint64_t b = b0; b < b1; ++b) {
+            float v[32], amax = 0.0f;
+            for (int j = 0; j < 32; ++j) {
+                const uint32_t u = (uint32_t) x[b * 32 + j] << 16;
+                std::memcpy(&v[j], &u, 4);
+                amax = (std::max)(amax, std::fabs(v[j]));
+            }
+            const float d = amax / 127.0f, id = d != 0.0f ? 1.0f / d : 0.0f;
+            uint8_t* o = out.data() + b * 34;
+            const uint16_t hb = half_bits(d);
+            std::memcpy(o, &hb, 2);
+            for (int j = 0; j < 32; ++j) o[2 + j] = (uint8_t) (int8_t) std::lround(v[j] * id);
+        }
+    };
+    const unsigned nt = (std::min)(8u, (std::max)(1u, std::thread::hardware_concurrency()));
+    std::vector<std::thread> pool;
+    for (unsigned i = 0; i < nt; ++i) pool.emplace_back(work, nb * i / nt, nb * (i + 1) / nt);
+    for (auto& th : pool) th.join();
+    return out;
+}
 bool eligible(const strata::TensorInfo& tensor, bool include_ple_key) {
     const auto& name = tensor.name;
     if (name.rfind("blk.", 0) != 0) return false;
@@ -130,6 +171,49 @@ bool NativeDense::served_names(const std::vector<std::string>& shards, bool incl
 }
 
 void NativeDense::set_layer_range(int lb, int le) { g_layer_lb = lb; g_layer_le = le; }
+// The byte walk `load` does for the layers [lb, le), without the allocations: the same filters in the same order,
+// reading the GGUF headers and the canonical table only, so it needs no device.  A later stage's projections are not
+// on the card when the split search prices that stage, and `load` runs one cudaMalloc per matrix (#1238).  The two
+// have to stay in step.  A repeated name is skipped rather than refused (`load` refuses it).
+bool NativeDense::weight_bytes_for(const std::vector<std::string>& shards, WeightTable& table, bool include_ple_key,
+                                   int64_t lb, int64_t le, uint64_t& out, std::string& err) {
+    out = 0;
+    try {
+        std::set<std::string> seen;
+        uint64_t total = 0;
+        for (const auto& path : shards) {
+            strata::GgufFile gguf(path);
+            for (const auto& tensor : gguf.tensors()) {
+                if (!eligible(tensor, include_ple_key)) continue;
+                if (tensor.name.rfind("blk.", 0) == 0) {
+                    const long l = std::strtol(tensor.name.c_str() + 4, nullptr, 10);
+                    if (l < lb || l >= le) continue;
+                }
+                if (!seen.insert(tensor.name).second) continue;
+                auto found = table.table_.find(tensor.name);
+                if (found == table.table_.end()) {
+                    err = "native dense: tensor absent from canonical table: " + tensor.name;
+                    return false;
+                }
+                const auto& ref = found->second;
+                if (!strata::kernels::native_mmvq_supported(tensor.type)) continue;
+                if (tensor.name == "blk.1.ple_key.weight" && !ref.quantized()) continue;
+                if (!ref.quantized() || tensor.shape.size() != 2 ||
+                    ref.ne0 <= 0 || ref.ne0 > INT_MAX || ref.ne1 <= 0 || ref.ne1 > INT_MAX ||
+                    tensor.shape[0] != (uint64_t) ref.ne0 || tensor.shape[1] != (uint64_t) ref.ne1) {
+                    err = "native dense: incompatible matrix " + tensor.name;
+                    return false;
+                }
+                total += alloc_bytes(strata::kernels::native_mmvq_weight_bytes(tensor.type, (int) ref.ne0, (int) ref.ne1));
+            }
+        }
+        out = total;
+        return true;
+    } catch (const std::exception& error) {
+        err = std::string("native dense: ") + error.what();
+        return false;
+    }
+}
 bool NativeDense::keep_unquantized_ple_key(const std::string& pack_dir, std::set<std::string>& skip,
                                            std::string& err) {
     const std::string key = "blk.1.ple_key.weight";
@@ -140,7 +224,18 @@ bool NativeDense::keep_unquantized_ple_key(const std::string& pack_dir, std::set
     return true;
 }
 
+// STRATA_HC_Q8 without a bf16 copy: the two dequantization scratches (one bf16 matrix each) of `hc_bf16_view`, per device,
+// allocated by `load` - never on first use, so a graph capture cannot meet the allocation
+static void* g_hc_scratch[64][2][2] = {};     // [device][class][slot]
+static dpct::event_ptr g_hc_ev[64][2] =
+    {}; // [device][slot]: the prompt path's last reader of the slot
+static bool g_hc_ev_set[64][2] = {};
+
 NativeDense::~NativeDense() {
+    for (auto& dev : g_hc_scratch)
+        for (auto& cl : dev)
+            for (void*& b : cl)
+                if (b != nullptr && std::find(weights_.begin(), weights_.end(), b) != weights_.end()) b = nullptr;
     for (const void* p : packed_keys_) strata::kernels::native_q8_0_packed_unregister(p);
     if (scratch_) sycl::free(scratch_, dpct::get_in_order_queue());
     for (void *p : weights_)
@@ -162,7 +257,7 @@ bool NativeDense::load(const std::vector<std::string> &shards,
         std::vector<Pending> pending;
         std::set<std::string> seen;
         int max_in = 0;
-        uint64_t total = 0, hc_q8_bytes = 0;
+        uint64_t total = 0, hc_q8_bytes = 0, allocated = 0;
         uint64_t split_count = 0, split_tensors = 0;
         std::set<uint64_t> split_numbers;
         bool have_architecture = false;
@@ -171,7 +266,8 @@ bool NativeDense::load(const std::vector<std::string> &shards,
             const auto* count = gguf.get("split.count");
             const auto* number = gguf.get("split.no");
             const auto* tensors = gguf.get("split.tensors.count");
-            if (gguf.get("general.architecture")) {
+            if (gguf.get("general.architecture") && (!number || number->u == 0)) {
+                // splitter may copy general.architecture into every shard (Huihui abliterated re-split)
                 err = strata::check_engine_architecture(gguf);
                 if (!err.empty()) return false;
                 have_architecture = true;
@@ -279,6 +375,7 @@ bool NativeDense::load(const std::vector<std::string> &shards,
                 }
                 max_in = (std::max)(max_in, (int) ref.ne0);
                 total += bytes;
+                allocated += alloc_bytes(bytes);
                 // STRATA_Q8_PACKED=1: a second, packed copy of an eligible Q8_0 matrix for the decode MMVQ (the GGUF
                 // copy stays: the prompt path's GEMMs read it).
                 DevicePtr packed;
@@ -366,6 +463,92 @@ bool NativeDense::load(const std::vector<std::string> &shards,
                     hc_q8_bytes += bytes;
                 }
         }
+        if (hc_q8_env()) {
+            // a bf16 pack stores no Q8_0 copy: quantize the layers' down / up projections. A row the arena kept
+            // (--keep-canonical, a layer split) is quantized on the GPU from the arena's bf16; a skipped row (the
+            // single-GPU default: add_hc_skip) from the pack file on the host, and has no bf16 copy at all. The
+            // inject rows stay bf16 (82 KB), the final mixer stays bf16 (it runs once a window).
+            uint64_t made = 0;
+            for (auto& [name, ref] : table.table_) {
+                if (ref.hc_q8 != nullptr || name.rfind("blk.", 0) != 0 || !in_range(name) ||
+                    !hc_q8_name(name) || !(name.ends_with("_down.weight") || name.ends_with("_up.weight"))) continue;
+                const bool skipped = ref.data == nullptr;
+                if (skipped && ref.resident) continue;
+                if (ref.ne0 % 32 != 0 || ref.elements != ref.ne0 * ref.ne1 || (!skipped && ref.bytes != (uint64_t) ref.elements * 2)) {
+                    err = "native dense (STRATA_HC_Q8): " + name + " is not a bf16 matrix"; return false;
+                }
+                const uint64_t nb = (uint64_t) ref.elements / 32, bytes = nb * 34;
+                void* p = nullptr;
+                if (DPCT_CHECK_ERROR(p = (void *)sycl::malloc_device(
+                                         bytes, dpct::get_in_order_queue())) !=
+                    0) {
+                    err = "native dense (STRATA_HC_Q8) alloc " + name;
+                    return false;
+                }
+                weights_.push_back(p);
+                if (skipped) {
+                    std::vector<uint16_t> host;
+                    if (!table.read_bf16_host(name, host, err)) return false;
+                    const std::vector<uint8_t> q8 = q8_0_of_bf16(host.data(), (uint64_t) host.size());
+                    /*
+                    DPCT1114: cudaMemcpy is migrated to asynchronization
+                    memcpy, assuming in the original code the source host memory
+                    is pageable memory. If the memory is not pageable, call
+                    wait() on event return by memcpy API to ensure
+                    synchronization behavior.
+                    */
+                    if (DPCT_CHECK_ERROR(dpct::get_in_order_queue().memcpy(
+                            p, q8.data(), bytes).wait()) != 0) {
+                        err = "native dense (STRATA_HC_Q8) upload " + name; return false;
+                    }
+                } else {
+                    strata::kernels::fused_gr_quantize_q8_0((const uint16_t*) ref.data, (uint8_t*) p, (int64_t) nb, nullptr);
+                }
+                ref.hc_q8 = p;
+                hc_q8_bytes += bytes;
+                allocated += alloc_bytes(bytes);
+                ++made;
+            }
+            /*
+            DPCT1010: SYCL uses exceptions to report errors and does not
+            use the error codes. The cudaGetLastError function call was replaced
+            with 0. You need to rewrite this code.
+            */
+            if (made && (0 != 0 ||
+                         DPCT_CHECK_ERROR(dpct::get_current_device()
+                                              .queues_wait_and_throw()) != 0)) {
+                err = "native dense (STRATA_HC_Q8): quantizing the projections failed"; return false;
+            }
+        }
+        if (hc_q8_env()) {   // the scratches of hc_bf16_view (rows without a bf16 copy), here and not on first use
+            uint64_t elems = 0;
+            for (const auto& [name, ref] : table.table_)
+                if (ref.hc_q8 != nullptr && ref.data == nullptr) elems = (std::max)(elems, (uint64_t) ref.elements);
+            int dev = 0;
+            if (elems != 0 &&
+                DPCT_CHECK_ERROR(dev = dpct::get_current_device_id()) == 0 &&
+                dev >= 0 && dev < 64 && g_hc_scratch[dev][0][0] == nullptr) {
+                for (int c = 0; c < 2; ++c)
+                    for (int i = 0; i < 2; ++i) {
+                        void* b = nullptr;
+                        if (DPCT_CHECK_ERROR(b = (void *)sycl::malloc_device(
+                                                 (size_t)elems * 2,
+                                                 dpct::get_in_order_queue())) !=
+                            0) {
+                            err = "native dense (STRATA_HC_Q8): scratch alloc";
+                            return false;
+                        }
+                        weights_.push_back(b);
+                        g_hc_scratch[dev][c][i] = b;
+                    }
+                for (int i = 0; i < 2; ++i)
+                    if (g_hc_ev[dev][i] == nullptr &&
+                        DPCT_CHECK_ERROR(g_hc_ev[dev][i] = new sycl::event()) !=
+                            0) {
+                        err = "native dense (STRATA_HC_Q8): scratch event"; return false;
+                    }
+            }
+        }
         if (pending.empty()) { err = "native dense: no supported GDN/QSA matrices in supplied shards"; return false; }
         void* allocation = nullptr;
         const auto status =
@@ -413,7 +596,8 @@ bool NativeDense::load(const std::vector<std::string> &shards,
                          packed_count, packed_bytes / 1048576.0);
         scratch_ = scratch.release();
         bytes_ = total + hc_q8_bytes;
-        if (hc_q8_requested())
+        allocated_ = allocated;
+        if (hc_q8_env())
             std::fprintf(stderr, "strata: STRATA_HC_Q8=1: %.2f GiB of Q8_0 hyper-connection projections for the verify read\n",
                          (double) hc_q8_bytes / 1073741824.0);
         return true;
@@ -421,6 +605,56 @@ bool NativeDense::load(const std::vector<std::string> &shards,
         err = std::string("native dense: ") + error.what();
         return false;
     }
+}
+catch (sycl::exception const &exc) {
+  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
+            << ", line:" << __LINE__ << std::endl;
+  std::exit(1);
+}
+
+bool NativeDense::add_hc_skip(const std::string& pack_dir, std::set<std::string>& skip) {
+    std::FILE* f = std::fopen((pack_dir + "/index.txt").c_str(), "rb");
+    if (!f) return false;
+    char line[1024], name[256];
+    while (std::fgets(line, sizeof line, f)) {
+        if (line[0] == '#' || std::sscanf(line, "%255s", name) != 1) continue;
+        const std::string n = name;
+        if (n.rfind("blk.", 0) == 0 && hc_q8_name(n) && (n.ends_with("_down.weight") || n.ends_with("_up.weight"))) skip.insert(n);
+    }
+    std::fclose(f);
+    return true;
+}
+
+const uint16_t *NativeDense::hc_bf16_view(const WeightRef &w, void *stream,
+                                          int slot, int cls) try {
+    if (w.data != nullptr) return (const uint16_t*) w.data;
+    if (w.hc_q8 == nullptr) return nullptr;
+    // the device's scratch (allocated at load, one pair per device): the prompt path and the single-token read run one
+    // after the other on a device, and each use is stream-ordered after the previous GEMM that read the slot
+    int dev = 0;
+    if (DPCT_CHECK_ERROR(dev = dpct::get_current_device_id()) != 0 || dev < 0 ||
+        dev >= 64 || slot < 0 || slot > 1 || cls < 0 || cls > 1) return nullptr;
+    void* buf = g_hc_scratch[dev][cls][slot];
+    if (buf == nullptr) return nullptr;
+    // the prompt path: the scratch may still be read by a GEMM another stream enqueued (batch serving: several slots' prompts)
+    if (cls == 0 && g_hc_ev_set[dev][slot])strata::q_of(stream)
+        ->ext_oneapi_submit_barrier({*g_hc_ev[dev][slot]});
+    strata::kernels::fused_gr_dequant_q8_0((const uint8_t*) w.hc_q8, (uint16_t*) buf, w.elements / 32, stream);
+    return (const uint16_t*) buf;
+}
+catch (sycl::exception const &exc) {
+  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
+            << ", line:" << __LINE__ << std::endl;
+  std::exit(1);
+}
+
+void NativeDense::hc_bf16_release(void *stream, int slot, int cls) try {
+    int dev = 0;
+    if (cls != 0 || slot < 0 || slot > 1 ||
+        DPCT_CHECK_ERROR(dev = dpct::get_current_device_id()) != 0 || dev < 0 ||
+        dev >= 64 || g_hc_ev[dev][slot] == nullptr) return;
+    dpct::sync_barrier(g_hc_ev[dev][slot], strata::q_of(stream));
+    g_hc_ev_set[dev][slot] = true;
 }
 catch (sycl::exception const &exc) {
   std::cerr << exc.what() << "Exception caught at file:" << __FILE__

@@ -22,6 +22,8 @@
 #include <dpct/dpct.hpp>
 #include "strata/sycl_queue.hpp"
 #include "strata/prefill/moe_fused.hpp"
+#include "strata/kernels/gfx_arch.hpp"
+#include "strata/core/emulate.hpp"
 
 #include <algorithm>
 #include <cstdio>
@@ -356,6 +358,26 @@ __dpct_inline__ void mma_s8(int (&d)[4], const uint32_t (&a)[4], uint32_t b0,
             }
 #endif
 }
+#elif defined(DPCT_COMPATIBILITY_TEMP) && DPCT_COMPATIBILITY_TEMP >= 750
+// Turing (STRATA_PF_FUSED_SM75): no cp.async - the stages are filled by plain copies (the same bytes; the barriers
+// around them stay) - and no m16n8k32 with s8 operands: it is four m8n8k16, rows g / g + 8 by k 0-15 / 16-31 (the
+// m16n8k32 fragments: a[0] / a[1] rows g / g + 8 at k 4 tig.., a[2] / a[3] the same at k 16 + 4 tig.., b0 / b1 the
+// two k halves).  The int32 sums are exact in any order: the same d as the sm_80 instruction.
+__device__ __forceinline__ void cp16(void* dst, const void* src) { *(uint4*) dst = __ldg((const uint4*) src); }
+__device__ __forceinline__ void cp4(void* dst, const void* src) { *(uint32_t*) dst = __ldg((const uint32_t*) src); }
+__device__ __forceinline__ void cp_commit() {}
+template <int N> __device__ __forceinline__ void cp_wait() {}
+__device__ __forceinline__ void mma8_s8(int& c0, int& c1, uint32_t a, uint32_t b) {
+    asm("mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%0,%1}, {%2}, {%3}, {%0,%1};\n"
+        : "+r"(c0), "+r"(c1) : "r"(a), "r"(b));
+}
+__device__ __forceinline__ void mma_s8(int (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
+    d[0] = d[1] = d[2] = d[3] = 0;
+    mma8_s8(d[0], d[1], a[0], b0);
+    mma8_s8(d[0], d[1], a[2], b1);
+    mma8_s8(d[2], d[3], a[1], b0);
+    mma8_s8(d[2], d[3], a[3], b1);
+}
 #endif
 
 // One work item = (tile of up to 64 routed rows of expert e, a block of 256 weight rows); a persistent grid walks
@@ -375,7 +397,7 @@ __dpct_inline__ void expert_kernel(
     const Batch b, const Tables tb, const uint8_t *__restrict__ act,
     const int32_t *__restrict__ src, uint8_t *__restrict__ out,
     float *__restrict__ dm, uint8_t *dpct_local) {
-#if defined(DPCT_COMPATIBILITY_TEMP) && DPCT_COMPATIBILITY_TEMP >= 800
+#if defined(DPCT_COMPATIBILITY_TEMP) && DPCT_COMPATIBILITY_TEMP >= 750
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
     constexpr int NKB = GU ? 40 : 10; // 64-weight blocks along K
     constexpr int NFB = GU ? 5 : 10;                  // weight-row blocks per tile
@@ -625,7 +647,7 @@ __dpct_inline__ void expert_kernel(
 // No LDS staging: a wave reads its weight rows (16 B per row and 64-weight block) and its tile rows' activation
 // blocks (80 B) straight from global memory (L2: an expert's rows are read by every tile, a token's by every weight
 // block), one block ahead in registers; the work item's weight scales go to LDS once.
-#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1150__) || defined(__gfx1151__)
+#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__) || defined(__gfx1150__) || defined(__gfx1151__)
 #define STRATA_FUSED_W11 1
 #else
 #define STRATA_FUSED_W11 0
@@ -846,7 +868,7 @@ static int wgp_blocks(int occ) {
     return env > 0 ? env : 2 * std::max(occ, 1);
 }
 #endif
-const DevInfo &dev_info() try {
+const DevInfo& dev_info() {
     int dev = 0;
     dev = dpct::get_current_device_id();
     std::lock_guard<std::mutex> lk(g_mu);
@@ -862,7 +884,7 @@ const DevInfo &dev_info() try {
         cudaDeviceProp prop;
         cudaDeviceGetAttribute(&d.sms, cudaDevAttrMultiProcessorCount, dev);
         hipFuncAttributes fa{};
-        if (cudaGetDeviceProperties(&prop, dev) != cudaSuccess || std::strncmp(prop.gcnArchName, "gfx11", 5) != 0 ||
+        if (cudaGetDeviceProperties(&prop, dev) != cudaSuccess || !strata::kernels::gfx_arch_is_gfx11_wmma(prop.gcnArchName) ||
             hipFuncGetAttributes(&fa, reinterpret_cast<const void*>(expert_w11_kernel<true>)) != hipSuccess) {
             cudaGetLastError();
             return d;
@@ -879,13 +901,15 @@ const DevInfo &dev_info() try {
     major = dpct::get_device(dev).get_major_version();
     minor = dpct::get_device(dev).get_minor_version();
     d.sms = dpct::get_device(dev).get_max_compute_units();
-    d.cc = 10 * major + minor;
-    if (d.cc < 80) return d;
-    // the device code of this card's arch must have the kernels (a build without an sm_80+ target has an empty body)
+    d.cc = 10 * strata::cc_major_of(major) + strata::cc_minor_of(minor);   // STRATA_EMULATE_CC counts (tests)
+    // Turing (sm_75): the same kernels with plain copies and m8n8k16 MMAs, opt-in (STRATA_PF_FUSED_SM75=1)
+    static const bool sm75 = [] { const char* v = std::getenv("STRATA_PF_FUSED_SM75"); return v != nullptr && v[0] == '1'; }();
+    if (d.cc < 75 || (d.cc < 80 && !sm75)) { d.cc = d.cc < 80 ? 0 : d.cc; return d; }
+    // the device code of this card's arch must have the kernels (a build without an sm_75+ target has an empty body)
     dpct::kernel_function_info fa{};
     if (DPCT_CHECK_ERROR(dpct::get_kernel_function_info(
             &fa, (const void *)expert_kernel<true>)) != 0 ||
-        fa.ptxVersion < 80) {
+        fa.ptxVersion < (d.cc >= 80 ? 80 : 75)) {
         /*
         DPCT1026: The call to cudaGetLastError was removed because this
         functionality is redundant in SYCL.
@@ -929,16 +953,11 @@ const DevInfo &dev_info() try {
 #endif
     return d;
 }
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
-}
 
 }  // namespace
 
 bool built() { return true; }
-bool available() { return dev_info().cc >= 80; }
+bool available() { return dev_info().cc >= 75; }
 // 0.1.36: on by default for the Q2_0 pack (+13-23% prompts on an RTX 5070; teacher-forced against the FP16 path as
 // close as MMQ at 8K and closer at 32K: phaseA-tests s18-tf); STRATA_PF_FUSED=0 keeps MMQ.  The native packs' kernels
 // (moe_fused_iq) stay opt-in: STRATA_PF_FUSED=1 (requested()).

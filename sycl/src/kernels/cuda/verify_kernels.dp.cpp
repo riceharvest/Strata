@@ -1,7 +1,10 @@
-// src/kernels/cuda/verify_kernels.cu - see include/strata/kernels/verify_kernels.hpp.
+#define DPCT_COMPAT_RT_VERSION 12080
+// src/kernels/cuda/verify_kernels.cu - see
+// include/strata/kernels/verify_kernels.hpp.
 //
-// The per-token arithmetic of every kernel here is transcribed from its single-token original (fused_gdn.cu,
-// elementwise.cu) with the same operation order, so a verify window reproduces plain decode bit for bit.
+// The per-token arithmetic of every kernel here is transcribed from its
+// single-token original (fused_gdn.cu, elementwise.cu) with the same operation
+// order, so a verify window reproduces plain decode bit for bit.
 #define DPCT_PROFILING_ENABLED
 #include <sycl/sycl.hpp>
 #include "strata/core/geometry.hpp"
@@ -10,11 +13,21 @@
 #include "strata/sycl_doorbell.hpp"
 #include "strata/kernels/verify_kernels.hpp"
 #include "strata/kernels/resident_plan_mirror.hpp"
+#include "strata/core/emulate.hpp"
+// (#3948: STRATA_Q81_FASTMATH_DIV is the CUDA fast-math division; SYCL compiles -fp-model=precise, as native_mmvq does, so a / b)
+#include "strata/kernels/q8_1_finite.hpp"   // #606: q8_1_ds
+#include "strata/kernels/window_start.hpp"  // KVA: the draft layer's window floor
 #include "strata/kernels/dp4a.hpp"
+#include "strata/kernels/pdl.hpp"
 
 #include <algorithm>
+#include <atomic>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <mutex>
+#include <utility>
+#include <vector>
 #include <cmath>
 #include <atomic>
 #include <chrono>
@@ -50,18 +63,23 @@ void check(const char* what) {
 }
 
 // `commit` (one token): the history then keeps it - [hist1, hist2, x_0], each thread its channel's, after reading them
-__dpct_inline__ void gdn_conv_l2_multi_kernel(float *hist,
-                                              const float *__restrict__ qkv,
-                                              const float *__restrict__ w,
-                                              float *__restrict__ h, int C,
-                                              int qk_heads, float eps,
-                                              int t_begin, bool commit) {
+__dpct_inline__ void gdn_conv_l2_body(const int bx, const int by, float *hist,
+                                      const float *__restrict__ qkv,
+                                      const float *__restrict__ w,
+                                      float *__restrict__ h, int C,
+                                      int qk_heads, float eps, int t_begin,
+                                      bool commit) {
+    /*
+    DPCT1115: The sycl::ext::oneapi::group_local_memory_for_overwrite is
+    used to allocate group-local memory at the none kernel functor scope of a
+    work-group data parallel kernel. You may need to adjust the code.
+    */
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
 auto &part =
     *sycl::ext::oneapi::group_local_memory_for_overwrite<float[S / 32]>(
         sycl::ext::oneapi::this_work_item::get_work_group<3>());
-    const int t = t_begin + item_ct1.get_group(1);
-    const int c = item_ct1.get_group(2) * S + item_ct1.get_local_id(2);
+    const int t = t_begin + by;
+    const int c = bx * S + item_ct1.get_local_id(2);
     // the window of token t: [hist0, hist1, hist2, x_0, ..., x_t], its last four entries
     float win[3];
 #pragma unroll
@@ -77,7 +95,7 @@ auto &part =
     }
     float sum = v0 * w[c * 4] + v1 * w[c * 4 + 1] + v2 * w[c * 4 + 2] + x * w[c * 4 + 3];
     float y = sum / (1.0f + sycl::native::exp(-sum));
-    if ((int)item_ct1.get_group(2) < qk_heads) {
+    if ((int) bx < qk_heads) {
         float sq = y * y;
         /*
 DPCT1108: '__shfl_xor_sync' was migrated with the experimental feature
@@ -107,6 +125,17 @@ runtimes. You may need to adjust the code.
     h[(size_t) t * C + c] = y;
 }
 
+__dpct_inline__ void gdn_conv_l2_multi_kernel(float *hist,
+                                              const float *__restrict__ qkv,
+                                              const float *__restrict__ w,
+                                              float *__restrict__ h, int C,
+                                              int qk_heads, float eps,
+                                              int t_begin, bool commit) {
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    gdn_conv_l2_body(item_ct1.get_group(2), item_ct1.get_group(1), hist, qkv, w,
+                     h, C, qk_heads, eps, t_begin, commit);
+}
+
 __dpct_inline__ void
 gdn_conv_commit_kernel(float *__restrict__ hist, const float *__restrict__ qkv,
                        int C, const int32_t *__restrict__ n_keep) {
@@ -127,20 +156,21 @@ gdn_conv_commit_kernel(float *__restrict__ hist, const float *__restrict__ qkv,
     hist[c * 3 + 2] = seq[2];
 }
 
-template <int MAX_T = kVerifyMaxT, bool EXACT_T = false>
+template <int MAX_T = kVerifyNarrowT, bool EXACT_T = false>
 /*
 DPCT1110: The total declared local variable size in device function
-gdn_ab_multi_kernel exceeds 128 bytes and may cause high register pressure.
-Consult with your hardware vendor to find the total register size available and
-adjust the code, or use smaller sub-group size to avoid high register pressure.
+gdn_ab_body exceeds 128 bytes and may cause high register pressure. Consult with
+your hardware vendor to find the total register size available and adjust the
+code, or use smaller sub-group size to avoid high register pressure.
 */
-__dpct_inline__ void gdn_ab_multi_kernel(
-    const float *__restrict__ x, const uint16_t *__restrict__ wa,
-    const uint16_t *__restrict__ wb, const float *__restrict__ dt,
-    const float *__restrict__ ssm_a, float *__restrict__ gate,
-    float *__restrict__ beta, int n, int h_v, int T) {
+__dpct_inline__ void
+gdn_ab_body(const int bx, const float *__restrict__ x,
+            const uint16_t *__restrict__ wa, const uint16_t *__restrict__ wb,
+            const float *__restrict__ dt, const float *__restrict__ ssm_a,
+            float *__restrict__ gate, float *__restrict__ beta, int n, int h_v,
+            int T) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
-    const int row = item_ct1.get_group(2) * 2 + (item_ct1.get_local_id(2) >> 5),
+    const int row = bx * 2 + (item_ct1.get_local_id(2) >> 5),
               lane = item_ct1.get_local_id(2) & 31;
     if (row >= 2 * h_v) return;
     const bool is_beta = row >= h_v;
@@ -220,8 +250,54 @@ __dpct_inline__ void gdn_ab_multi_kernel(
     }
 }
 
+template <int MAX_T = kVerifyNarrowT, bool EXACT_T = false>
+__dpct_inline__ void gdn_ab_multi_kernel(
+    const float *__restrict__ x, const uint16_t *__restrict__ wa,
+    const uint16_t *__restrict__ wb, const float *__restrict__ dt,
+    const float *__restrict__ ssm_a, float *__restrict__ gate,
+    float *__restrict__ beta, int n, int h_v, int T) {
+    gdn_ab_body<MAX_T, EXACT_T>(
+        sycl::ext::oneapi::this_work_item::get_nd_item<3>().get_group(2), x, wa,
+        wb, dt, ssm_a, gate, beta, n, h_v, T);
+}
+
+// 143-amdk (STRATA_FUSE_CONVAB): the conv + L2 norm and the a/b projections in ONE launch.  They read different inputs (the qkv
+// projection and the layer input) and write different outputs, so they only share a node: blocks [0, conv) run the conv body,
+// the following blocks (token row 0 only) the a/b body, each exactly as its own kernel.
+template <int MAX_T, bool EXACT_T>
+__dpct_inline__ void gdn_conv_ab_kernel(
+    int conv_blocks, float *hist, const float *__restrict__ qkv,
+    const float *__restrict__ w, float *__restrict__ h, int C, int qk_heads,
+    float eps, int t_begin, bool commit, const float *__restrict__ x,
+    const uint16_t *__restrict__ wa, const uint16_t *__restrict__ wb,
+    const float *__restrict__ dt, const float *__restrict__ ssm_a,
+    float *__restrict__ gate, float *__restrict__ beta, int n, int h_v, int T) {
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    const int ab_blocks =
+        (2 * h_v + 1) / 2; // the a/b blocks first: their dot chain is the
+                           // longer one, so it starts with the first wave
+    if ((int)item_ct1.get_group(2) >= ab_blocks) {
+        /*
+        DPCT1118: SYCL group functions and algorithms must be encountered in
+        converged control flow. You may need to adjust the code.
+        */
+        gdn_conv_l2_body((int)item_ct1.get_group(2) - ab_blocks,
+                         (int)item_ct1.get_group(1), hist, qkv, w, h, C,
+                         qk_heads, eps, t_begin, commit);
+    } else if (item_ct1.get_group(1) == 0 && item_ct1.get_local_id(2) < 64) {
+        gdn_ab_body<MAX_T, EXACT_T>((int)item_ct1.get_group(2), x, wa, wb, dt,
+                                    ssm_a, gate, beta, n, h_v, T);
+    }
+}
+
 // State-only commit kernel: each head's 128 independent state columns are split across 4 blocks of 32 columns
 // (48 * 4 = 192 blocks of 128 threads across all SMs, vs 48 blocks of 512 threads), with no sq/o/norm/z/y work.
+__dpct_inline__ void gdn_step_commit_body(float *__restrict__ state,
+                                          const float *__restrict__ hbuf, int C,
+                                          const float *__restrict__ gate,
+                                          const float *__restrict__ beta,
+                                          int h_k, int h_v, int n);
+
 /*
 DPCT1110: The total declared local variable size in device function
 gdn_step_commit_kernel exceeds 128 bytes and may cause high register pressure.
@@ -235,8 +311,73 @@ __dpct_inline__ void gdn_step_commit_kernel(
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
     const int n = *n_keep;
     if (n <= 0) return;
-    auto &sk = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[S]>(
-        sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    gdn_step_commit_body(state, hbuf, C, gate, beta, h_k, h_v, n);
+}
+
+// engine-latency: gdn_step_commit_kernel for every GDN layer of the commit in one launch (blockIdx.z = the layer); each
+// layer's blocks run gdn_step_commit_body on that layer's state and rows, exactly as its own launch did
+__dpct_inline__ void gdn_step_commit_layers_kernel(
+    float *__restrict__ state, long long state_stride,
+    const float *__restrict__ hbuf, long long h_stride, int C,
+    const float *__restrict__ gate, const float *__restrict__ beta,
+    long long gb_stride, int h_k, int h_v, const int32_t *__restrict__ n_keep) {
+    const int n = *n_keep;
+    if (n <= 0) return;
+    const long long z =
+        sycl::ext::oneapi::this_work_item::get_nd_item<3>().get_group(0);
+    gdn_step_commit_body(state + z * state_stride, hbuf + z * h_stride, C, gate + z * gb_stride, beta + z * gb_stride, h_k,
+                         h_v, n);
+}
+
+// engine-latency: gdn_conv_commit_kernel for every GDN layer in one launch (blockIdx.y = the layer)
+__dpct_inline__ void
+gdn_conv_commit_layers_kernel(float *__restrict__ hist0, long long hist_stride,
+                              const float *__restrict__ qkv0,
+                              long long qkv_stride, int C,
+                              const int32_t *__restrict__ n_keep) {
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    const int c = item_ct1.get_group(2) * item_ct1.get_local_range(2) +
+                  item_ct1.get_local_id(2);
+    if (c >= C) return;
+    const int n = *n_keep;
+    if (n <= 0) return;
+    float *hist = hist0 + (long long)item_ct1.get_group(1) * hist_stride;
+    const float *qkv = qkv0 + (long long)item_ct1.get_group(1) * qkv_stride;
+    float seq[3];
+#pragma unroll
+    for (int j = 0; j < 3; ++j) {
+        const int src = n + j;          // the last three of [hist(3) | x_0..x_{n-1}]
+        seq[j] = src < 3 ? hist[c * 3 + src] : qkv[(size_t) (src - 3) * C + c];
+    }
+    hist[c * 3] = seq[0];
+    hist[c * 3 + 1] = seq[1];
+    hist[c * 3 + 2] = seq[2];
+}
+
+/*
+DPCT1110: The total declared local variable size in device function
+gdn_step_commit_body exceeds 128 bytes and may cause high register pressure.
+Consult with your hardware vendor to find the total register size available and
+adjust the code, or use smaller sub-group size to avoid high register pressure.
+*/
+__dpct_inline__ void gdn_step_commit_body(float *__restrict__ state,
+                                          const float *__restrict__ hbuf, int C,
+                                          const float *__restrict__ gate,
+                                          const float *__restrict__ beta,
+                                          int h_k, int h_v, int n) {
+    /*
+    DPCT1115: The sycl::ext::oneapi::group_local_memory_for_overwrite is
+    used to allocate group-local memory at the none kernel functor scope of a
+    work-group data parallel kernel. You may need to adjust the code.
+    */
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+auto &sk = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[S]>(
+    sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    /*
+    DPCT1115: The sycl::ext::oneapi::group_local_memory_for_overwrite is
+    used to allocate group-local memory at the none kernel functor scope of a
+    work-group data parallel kernel. You may need to adjust the code.
+    */
     auto &red =
         *sycl::ext::oneapi::group_local_memory_for_overwrite<float[RG][32]>(
             sycl::ext::oneapi::this_work_item::get_work_group<3>());
@@ -330,10 +471,10 @@ __dpct_inline__ void gdn_q8_1_store(GdnQ81 *__restrict__ xq, size_t idx,
         dpct::experimental::permute_sub_group_by_xor(
             0xffffffffu, sycl::ext::oneapi::this_work_item::get_sub_group(),
             sum, o);
-    const float d = amax / 127.0f;
-    const int8_t q = amax == 0.0f ? 0 : sycl::round(xi / d);
+    const float d = q8_1_finite(q81_div(amax, 127.0f));   // #606: as native_quantize_q8_1_kernel - finite blocks bit for bit (#3948: and its division)
+    const int8_t q = q8_1_quant(xi, d, amax);
     xq[idx / 32].qs[idx % 32] = q;
-    if (idx % 32 == 0) xq[idx / 32].ds = sycl::half2(d, sum);
+    if (idx % 32 == 0) xq[idx / 32].ds = q8_1_ds(d, sum);   // #606: clamped (the QFUSE path bypassed the finite helper)
 }
 
 template <bool ALL_OUT, bool Q>
@@ -350,10 +491,23 @@ __dpct_inline__ void gdn_step_norm_multi_kernel(
     const float *__restrict__ z, const float *__restrict__ gamma, float eps,
     float *__restrict__ y, int h_k, int h_v, int T,
     const int32_t *__restrict__ n_keep, int t_out_begin,
-    GdnQ81 *__restrict__ xq) {
+    GdnQ81 *__restrict__ xq, GdnGroups grp = {}) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
-auto &sk = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[2][S]>(
-    sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    if (grp.n > 0) { // group blockIdx.y - its slot's state and its rows of the
+                     // window's buffers
+        const int gi = item_ct1.get_group(1), f = grp.first[gi];
+        state = grp.state[gi];
+        hbuf += (size_t) f * C;
+        gate += (size_t) f * h_v;
+        beta += (size_t) f * h_v;
+        z += (size_t) f * S * h_v;
+        y += (size_t) f * S * h_v;
+        T = grp.ntok[gi];
+        n_keep = grp.keep[gi];
+    }
+    auto &sk =
+        *sycl::ext::oneapi::group_local_memory_for_overwrite<float[2][S]>(
+            sycl::ext::oneapi::this_work_item::get_work_group<3>());
     auto &sq =
         *sycl::ext::oneapi::group_local_memory_for_overwrite<float[2][S]>(
             sycl::ext::oneapi::this_work_item::get_work_group<3>());
@@ -835,6 +989,43 @@ __dpct_inline__ void broadcast_streams_kernel(const float *__restrict__ x,
     R[(size_t) t * n * hc + i] = x[(size_t) t * n + i % n];
 }
 
+__dpct_inline__ void hc_mean_streams_kernel(const float *__restrict__ R,
+                                            float *__restrict__ out, int64_t n,
+                                            int hc) {
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    const int64_t i =
+        (int64_t)item_ct1.get_group(2) * item_ct1.get_local_range(2) +
+        item_ct1.get_local_id(2);
+    if (i >= n) return;
+    float s = 0.0f;
+#pragma unroll
+    for (int c = 0; c < hc; ++c) s += R[(size_t)c * n + i];
+    out[i] = s / (float) hc;
+}
+
+__dpct_inline__ void
+route_marginal_stats_kernel(const int32_t *__restrict__ ids, int n, int k,
+                            unsigned long long *acc) {
+    const int r =
+        sycl::ext::oneapi::this_work_item::get_nd_item<3>().get_local_id(2);
+    if (r >= n) return;
+    int fresh = 0;
+    for (int j = 0; j < k; ++j) {
+        const int32_t e = ids[r * k + j];
+        bool seen = false;
+#pragma unroll
+        for (int j2 = 0; j2 < j && !seen; ++j2) seen = ids[r * k + j2] == e;
+#pragma unroll
+        for (int r2 = 0; r2 < r && !seen; ++r2)
+#pragma unroll
+            for (int j2 = 0; j2 < k && !seen; ++j2)
+                seen = ids[r2 * k + j2] == e;
+        if (!seen) ++fresh;
+    }
+    dpct::atomic_fetch_add<sycl::access::address_space::generic_space>(
+        acc + r, (unsigned long long)fresh);
+}
+
 __dpct_inline__ void copy_indexed_kernel(float *__restrict__ dst,
                                          const float *__restrict__ src,
                                          int64_t stride,
@@ -866,6 +1057,16 @@ fetch_blobs_kernel(const unsigned long long *__restrict__ src,
         const long long k = i / per, off = i - k * per;
         dst[i] = ((const sycl::uint4 *)src[k])[off];
     }
+}
+
+__dpct_inline__ void res_patch_kernel(int32_t *__restrict__ table,
+                                      const volatile int32_t *pairs, int n) {
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+#pragma unroll
+    for (int k = item_ct1.get_group(2) * item_ct1.get_local_range(2) +
+                 item_ct1.get_local_id(2);
+         k < n; k += item_ct1.get_group_range(2) * item_ct1.get_local_range(2))
+        table[pairs[2 * k]] = pairs[2 * k + 1];
 }
 
 __dpct_inline__ void rebase_ptrs_kernel(unsigned long long *ptr,
@@ -1035,6 +1236,25 @@ void fetch_blobs(const unsigned long long* src, const int32_t* n, uint8_t* dst, 
             });
     }
     check("fetch_blobs");
+}
+
+void res_patch(int32_t* table, const int32_t* pairs, int n, void* stream) {
+    if (n <= 0) return;
+    {
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
+
+        strata::q_of(stream)
+            ->parallel_for<dpct_kernel_name<class res_patch_kernel_dfb8fa>>(
+                sycl::nd_range<3>(
+                    sycl::range(1, 1,
+                                (n + 255) / 256 < 64 ? (n + 255) / 256 : 64) *
+                        sycl::range(1, 1, 256),
+                    sycl::range(1, 1, 256)),
+                exp_props, [=](sycl::nd_item<3> item_ct1) {
+                    res_patch_kernel(table, pairs, n);
+                });
+    }
+    check("res_patch");
 }
 
 void rebase_ptrs(unsigned long long* ptr, const int32_t* n, uint8_t* base, int64_t blob_bytes, void* stream) {
@@ -1556,6 +1776,55 @@ void row_top_prob_split(const float* logits, int n_rows, int n_vocab, const int3
 }
 #endif
 
+namespace {
+// grid (kNonfiniteBlocks, rows): block b of row t scans [b * per_block, +per_block) and writes its own word.  The
+// test is on the bits (exponent all ones), so --use_fast_math cannot fold it away.
+__dpct_inline__ void logits_nonfinite_kernel(const float *__restrict__ logits,
+                                             int n, int per_block,
+                                             uint32_t *flags) {
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    const int row = (int)item_ct1.get_group(1), b = (int)item_ct1.get_group(2);
+    const float* l = logits + (size_t) row * n;
+    const int lo = b * per_block, hi = sycl::min(n, lo + per_block);
+    int bad = 0;
+#pragma unroll
+    for (int v = lo + (int)item_ct1.get_local_id(2); v < hi;
+         v += (int)item_ct1.get_local_range(2))
+        bad |=
+            (sycl::bit_cast<unsigned int>(l[v]) & 0x7f800000u) == 0x7f800000u;
+    /*
+    DPCT1065: Consider replacing sycl::nd_item::barrier() with
+    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
+    performance if there is no access to global memory.
+    */
+    bad = (item_ct1.barrier(),
+           sycl::any_of_group(
+               sycl::ext::oneapi::this_work_item::get_work_group<3>(), bad));
+    if (item_ct1.get_local_id(2) == 0) flags[row * kNonfiniteBlocks + b] =
+        bad ? 1u : 0u;
+}
+}  // namespace
+
+void logits_nonfinite_rows(const float* logits, int n_rows, int n, uint32_t* flags, void* stream) {
+    if (n_rows <= 0 || n <= 0) return;
+    const int per_block = (n + kNonfiniteBlocks - 1) / kNonfiniteBlocks;
+    {
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
+
+        strata::q_of(stream)
+            ->parallel_for<
+                dpct_kernel_name<class logits_nonfinite_kernel_263d09>>(
+                sycl::nd_range<3>(sycl::range(1, (unsigned)n_rows,
+                                              (unsigned)kNonfiniteBlocks) *
+                                      sycl::range(1, 1, 256),
+                                  sycl::range(1, 1, 256)),
+                exp_props, [=](sycl::nd_item<3> item_ct1) {
+                    logits_nonfinite_kernel(logits, n, per_block, flags);
+                });
+    }
+    check("logits_nonfinite_rows");
+}
+
 bool multi_block_head_ops() {
 #if defined(__HIPCC__)
     return false;
@@ -1569,16 +1838,20 @@ bool multi_block_head_ops() {
 }
 
 bool argmax_rows_wanted() try {
-#if defined(__HIPCC__)
-    return false;
+#if defined(__HIPCC__) || defined(SYCL_LANGUAGE_VERSION)
+    return false;   // SYCL port: dpct's major version is not a CUDA compute capability (an Arc must not read as sm_8x)
 #else
-    // sm_80 to sm_89: sample_tokens' greedy pick there is the one-block kernel (sm_90+ has the cluster kernel)
+    // sm_80 to sm_89, and sm_7x with STRATA_ARGMAX_ROWS_SM70=1: sample_tokens' greedy pick there is the one-block kernel (sm_90+ has the cluster kernel)
     static const bool want = [] {
         int dev = 0, major = 0;
         if (DPCT_CHECK_ERROR(dev = dpct::get_current_device_id()) != 0 ||
             DPCT_CHECK_ERROR(
                 major = dpct::get_device(dev).get_major_version()) != 0)
             return false;
+        if (major == 7) {   // STRATA_ARGMAX_ROWS_SM70=1: opt-in on Volta (measured on sm_70 only)
+            const char* e = std::getenv("STRATA_ARGMAX_ROWS_SM70");
+            return e != nullptr && std::atoi(e) != 0;
+        }
         return major == 8;
     }();
     return want && multi_block_head_ops();
@@ -1633,6 +1906,54 @@ void window_ids(int32_t* steps, int n, int window, int32_t* ids, int64_t ids_str
     check("window_ids");
 }
 
+namespace {
+// window_ids with a floor read from (mapped) memory when the kernel RUNS: the captured graph keeps the pointer, the
+// value changes between sessions.  A floor of 0 gives window_ids' selection exactly (strata::kernels::window_start).
+__dpct_inline__ void
+window_ids_floor_kernel(int32_t *steps, int window, int32_t *ids,
+                        long long stride, const volatile int32_t *floor_cell) {
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    const int q = item_ct1.get_group(1);
+    int32_t* st = steps + q * 4;
+    const int n_kv = st[1];
+    const int start = strata::kernels::window_start(n_kv, window, *floor_cell);
+    const int width = n_kv - start;
+#pragma unroll
+    for (int j = item_ct1.get_group(2) * item_ct1.get_local_range(2) +
+                 item_ct1.get_local_id(2);
+         j < width;
+         j += item_ct1.get_group_range(2) * item_ct1.get_local_range(2))
+        ids[q * stride + j] = start + j;
+    /*
+    DPCT1065: Consider replacing sycl::nd_item::barrier() with
+    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
+    performance if there is no access to global memory.
+    */
+    item_ct1.barrier();
+    if (item_ct1.get_group(2) == 0 && item_ct1.get_local_id(2) == 0) st[3] =
+        width;
+}
+}  // namespace
+
+void window_ids_floor(int32_t* steps, int n, int window, int32_t* ids, int64_t ids_stride, const int32_t* floor_cell,
+                      void* stream) {
+    {
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
+
+        strata::q_of(stream)
+            ->parallel_for<
+                dpct_kernel_name<class window_ids_floor_kernel_c54a44>>(
+                sycl::nd_range<3>(sycl::range(1, (unsigned)n, 8) *
+                                      sycl::range(1, 1, 256),
+                                  sycl::range(1, 1, 256)),
+                exp_props, [=](sycl::nd_item<3> item_ct1) {
+                    window_ids_floor_kernel(steps, window, ids,
+                                            (long long)ids_stride, floor_cell);
+                });
+    }
+    check("window_ids_floor");
+}
+
 void dense_steps(const int32_t* cells, int n, int32_t* steps, void* stream) {
     {
         auto exp_props = sycl::ext::oneapi::experimental::properties{};
@@ -1675,6 +1996,152 @@ void gdn_conv_l2_multi(const float* history, const float* qkv, const float* conv
     check("gdn_conv_l2_multi");
 }
 
+void gdn_conv_ab_multi(const float* history, const float* qkv, const float* conv_w, float* h, int channels, int qk_heads,
+                       float eps, int n_tok, int t_begin, bool commit, const float* x, const uint16_t* w_alpha,
+                       const uint16_t* w_beta, const float* dt, const float* ssm_a, float* gate, float* beta, int n_embd,
+                       int h_v, void* stream) {
+    if (!history || !qkv || !conv_w || !h || channels % S != 0 || n_tok < 1 || n_tok > kVerifyMaxT || n_embd % 8 != 0 ||
+        (commit && (n_tok != 1 || t_begin != 0))) {
+        std::fprintf(stderr, "gdn_conv_ab_multi: invalid arguments\n");
+        std::exit(1);
+    }
+    const int conv_blocks = channels / S, ab_blocks = (2 * h_v + 1) / 2;
+    const dpct::dim3 grid((unsigned)(conv_blocks + ab_blocks), (unsigned)n_tok);
+    dpct::queue_ptr st = strata::q_of(stream);
+    float* hist = const_cast<float*>(history);
+    switch (n_tok) {
+    case 1: {
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
+
+        st->parallel_for<
+            dpct_kernel_name<class gdn_conv_ab_kernel_f3b4a3,
+                             dpct_kernel_scalar<1>, dpct_kernel_scalar<true>>>(
+            sycl::nd_range<3>(grid * sycl::range(1, 1, S),
+                              sycl::range(1, 1, S)),
+            exp_props,
+            [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
+                gdn_conv_ab_kernel<1, true>(
+                    conv_blocks, hist, qkv, conv_w, h, channels, qk_heads, eps,
+                    t_begin, commit, x, w_alpha, w_beta, dt, ssm_a, gate, beta,
+                    n_embd, h_v, n_tok);
+            });
+    } break;
+    case 2: {
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
+
+        st->parallel_for<
+            dpct_kernel_name<class gdn_conv_ab_kernel_33d48d,
+                             dpct_kernel_scalar<2>, dpct_kernel_scalar<true>>>(
+            sycl::nd_range<3>(grid * sycl::range(1, 1, S),
+                              sycl::range(1, 1, S)),
+            exp_props,
+            [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
+                gdn_conv_ab_kernel<2, true>(
+                    conv_blocks, hist, qkv, conv_w, h, channels, qk_heads, eps,
+                    t_begin, commit, x, w_alpha, w_beta, dt, ssm_a, gate, beta,
+                    n_embd, h_v, n_tok);
+            });
+    } break;
+    case 3: {
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
+
+        st->parallel_for<
+            dpct_kernel_name<class gdn_conv_ab_kernel_59584e,
+                             dpct_kernel_scalar<3>, dpct_kernel_scalar<true>>>(
+            sycl::nd_range<3>(grid * sycl::range(1, 1, S),
+                              sycl::range(1, 1, S)),
+            exp_props,
+            [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
+                gdn_conv_ab_kernel<3, true>(
+                    conv_blocks, hist, qkv, conv_w, h, channels, qk_heads, eps,
+                    t_begin, commit, x, w_alpha, w_beta, dt, ssm_a, gate, beta,
+                    n_embd, h_v, n_tok);
+            });
+    } break;
+    case 4: {
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
+
+        st->parallel_for<
+            dpct_kernel_name<class gdn_conv_ab_kernel_373e90,
+                             dpct_kernel_scalar<4>, dpct_kernel_scalar<true>>>(
+            sycl::nd_range<3>(grid * sycl::range(1, 1, S),
+                              sycl::range(1, 1, S)),
+            exp_props,
+            [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
+                gdn_conv_ab_kernel<4, true>(
+                    conv_blocks, hist, qkv, conv_w, h, channels, qk_heads, eps,
+                    t_begin, commit, x, w_alpha, w_beta, dt, ssm_a, gate, beta,
+                    n_embd, h_v, n_tok);
+            });
+    } break;
+    case 5: {
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
+
+        st->parallel_for<
+            dpct_kernel_name<class gdn_conv_ab_kernel_c77ac9,
+                             dpct_kernel_scalar<5>, dpct_kernel_scalar<true>>>(
+            sycl::nd_range<3>(grid * sycl::range(1, 1, S),
+                              sycl::range(1, 1, S)),
+            exp_props,
+            [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
+                gdn_conv_ab_kernel<5, true>(
+                    conv_blocks, hist, qkv, conv_w, h, channels, qk_heads, eps,
+                    t_begin, commit, x, w_alpha, w_beta, dt, ssm_a, gate, beta,
+                    n_embd, h_v, n_tok);
+            });
+    } break;
+    case 6: {
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
+
+        st->parallel_for<
+            dpct_kernel_name<class gdn_conv_ab_kernel_e2a528,
+                             dpct_kernel_scalar<6>, dpct_kernel_scalar<true>>>(
+            sycl::nd_range<3>(grid * sycl::range(1, 1, S),
+                              sycl::range(1, 1, S)),
+            exp_props,
+            [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
+                gdn_conv_ab_kernel<6, true>(
+                    conv_blocks, hist, qkv, conv_w, h, channels, qk_heads, eps,
+                    t_begin, commit, x, w_alpha, w_beta, dt, ssm_a, gate, beta,
+                    n_embd, h_v, n_tok);
+            });
+    } break;
+    case 7: case 8: {
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
+
+        st->parallel_for<dpct_kernel_name<class gdn_conv_ab_kernel_af6095,
+                                          dpct_kernel_scalar<kVerifyNarrowT>,
+                                          dpct_kernel_scalar<false>>>(
+            sycl::nd_range<3>(grid * sycl::range(1, 1, S),
+                              sycl::range(1, 1, S)),
+            exp_props,
+            [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
+                gdn_conv_ab_kernel<kVerifyNarrowT, false>(
+                    conv_blocks, hist, qkv, conv_w, h, channels, qk_heads, eps,
+                    t_begin, commit, x, w_alpha, w_beta, dt, ssm_a, gate, beta,
+                    n_embd, h_v, n_tok);
+            });
+    } break;
+    default: {
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
+
+        st->parallel_for<dpct_kernel_name<class gdn_conv_ab_kernel_6cc14f,
+                                          dpct_kernel_scalar<kVerifyMaxT>,
+                                          dpct_kernel_scalar<false>>>(
+            sycl::nd_range<3>(grid * sycl::range(1, 1, S),
+                              sycl::range(1, 1, S)),
+            exp_props,
+            [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
+                gdn_conv_ab_kernel<kVerifyMaxT, false>(
+                    conv_blocks, hist, qkv, conv_w, h, channels, qk_heads, eps,
+                    t_begin, commit, x, w_alpha, w_beta, dt, ssm_a, gate, beta,
+                    n_embd, h_v, n_tok);
+            });
+    } break;
+    }
+    check("gdn_conv_ab_multi");
+}
+
 void gdn_conv_commit(float* history, const float* qkv, int channels, const int32_t* n_keep, void* stream) {
     {
         auto exp_props = sycl::ext::oneapi::experimental::properties{};
@@ -1691,6 +2158,60 @@ void gdn_conv_commit(float* history, const float* qkv, int channels, const int32
                 });
     }
     check("gdn_conv_commit");
+}
+
+bool gdn_commit_layers(float* state, int64_t state_stride, int64_t conv_off, const float* qkv, int64_t qkv_stride,
+                       const float* h, int64_t h_stride, const float* gate, const float* beta, int64_t gb_stride,
+                       int conv_channels, int h_k, int h_v, int n_max, int n_layers, const int32_t* n_keep, void* stream) {
+    // the per-layer commit's kernel choice (gdn_step_norm_multi below): only its state-only kernel is batched here
+    static const bool per_layer = [] {
+        const char* sp = std::getenv("STRATA_GDN_SPLIT");
+        const char* cs = std::getenv("STRATA_GDN_COMMIT_SPLIT");
+        const char* dbg = std::getenv("STRATA_DBG_GDN");
+        return (sp && sp[0] == '1') || (cs && cs[0] == '0') || (dbg && dbg[0] == '1');
+    }();
+    if (per_layer || n_layers <= 0 || n_layers > 65535 || n_max < 1 || n_max > kVerifyMaxT || n_keep == nullptr ||
+        h_v <= 0 || h_k <= 0 || h_v % h_k != 0)
+        return false;
+    dpct::queue_ptr st = strata::q_of(stream);
+    {
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
+
+        st->submit([&](sycl::handler &cgh) {
+            auto state_conv_off_ct0 = state + conv_off;
+
+            cgh.parallel_for<
+                dpct_kernel_name<class gdn_conv_commit_layers_kernel_7c47f1>>(
+                sycl::nd_range<3>(
+                    sycl::range(1, (unsigned)n_layers,
+                                (unsigned)((conv_channels + 255) / 256)) *
+                        sycl::range(1, 1, 256),
+                    sycl::range(1, 1, 256)),
+                exp_props, [=](sycl::nd_item<3> item_ct1) {
+                    gdn_conv_commit_layers_kernel(
+                        state_conv_off_ct0, (long long)state_stride, qkv,
+                        (long long)qkv_stride, conv_channels, n_keep);
+                });
+        });
+    }
+    {
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
+
+        st->parallel_for<
+            dpct_kernel_name<class gdn_step_commit_layers_kernel_153ac8>>(
+            sycl::nd_range<3>(
+                sycl::range((unsigned)n_layers, 4u, (unsigned)h_v) *
+                    sycl::range(1, RG, 32),
+                sycl::range(1, RG, 32)),
+            exp_props, [=](sycl::nd_item<3> item_ct1) {
+                gdn_step_commit_layers_kernel(
+                    state, (long long)state_stride, h, (long long)h_stride,
+                    conv_channels, gate, beta, (long long)gb_stride, h_k, h_v,
+                    n_keep);
+            });
+    }
+    check("gdn_commit_layers");
+    return true;
 }
 
 void gdn_ab_multi(const float* x, const uint16_t* w_alpha, const uint16_t* w_beta, const float* dt, const float* ssm_a,
@@ -1786,10 +2307,25 @@ void gdn_ab_multi(const float* x, const uint16_t* w_alpha, const uint16_t* w_bet
                                              gate, beta, n_embd, h_v, n_tok);
             });
     } break;
-    default: {
+    case 7: case 8: {
         auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         st->parallel_for<dpct_kernel_name<class gdn_ab_multi_kernel_34dcce,
+                                          dpct_kernel_scalar<kVerifyNarrowT>,
+                                          dpct_kernel_scalar<false>>>(
+            sycl::nd_range<3>(sycl::range(1, 1, blocks) * sycl::range(1, 1, 64),
+                              sycl::range(1, 1, 64)),
+            exp_props,
+            [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
+                gdn_ab_multi_kernel<kVerifyNarrowT, false>(
+                    x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v,
+                    n_tok);
+            });
+    } break;
+    default: {
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
+
+        st->parallel_for<dpct_kernel_name<class gdn_ab_multi_kernel_34dccf,
                                           dpct_kernel_scalar<kVerifyMaxT>,
                                           dpct_kernel_scalar<false>>>(
             sycl::nd_range<3>(sycl::range(1, 1, blocks) * sycl::range(1, 1, 64),
@@ -1803,6 +2339,71 @@ void gdn_ab_multi(const float* x, const uint16_t* w_alpha, const uint16_t* w_bet
     } break;
     }
     check("gdn_ab_multi");
+}
+
+void gdn_step_norm_groups(const GdnGroups& groups, const float* h, int conv_channels, const float* gate, const float* beta,
+                          const float* z, const float* gamma, float eps, float* y, int h_k, int h_v, bool commit,
+                          void* stream) {
+    if (groups.n < 1 || groups.n > 8 || !h || !gate || !beta || !z || !gamma || !y || h_k <= 0 || h_v % h_k) {
+        std::fprintf(stderr, "gdn_step_norm_groups: invalid arguments\n");
+        std::exit(1);
+    }
+    for (int i = 0; i < groups.n; ++i)
+        if (!groups.state[i] || groups.ntok[i] < 1 || groups.ntok[i] > kVerifyMaxT || (commit && !groups.keep[i])) {
+            std::fprintf(stderr, "gdn_step_norm_groups: invalid group %d\n", i);
+            std::exit(1);
+        }
+    const dpct::dim3 g1((unsigned)h_v, (unsigned)groups.n), b1(S, RG);
+    // the kernel gdn_step_norm_multi picks for these calls: a window's rows (all outputs, no keep) or a commit of
+    // one-row groups (keep, t_out_begin 0)
+    if (commit)
+        /*
+        DPCT1049: The work-group size passed to the SYCL kernel may exceed
+        the limit. To get the device limit, query
+        info::device::max_work_group_size. Adjust the work-group size if needed.
+        */
+    {
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
+        dpct::has_capability_or_fail(
+            strata::q_of(stream)->get_device(),
+            {sycl::aspect::fp16});
+
+        strata::q_of(stream)
+            ->parallel_for<dpct_kernel_name<
+                class gdn_step_norm_multi_kernel_42ae27,
+                dpct_kernel_scalar<false>, dpct_kernel_scalar<false>>>(
+                sycl::nd_range<3>(g1 * b1, b1), exp_props,
+                [=](sycl::nd_item<3> item_ct1)
+                    [[sycl::reqd_sub_group_size(32)]] {
+                        gdn_step_norm_multi_kernel<false, false>(
+                            nullptr, h, conv_channels, gate, beta, z, gamma,
+                            eps, y, h_k, h_v, 0, nullptr, 0, nullptr, groups);
+                    });
+    } else
+    /*
+    DPCT1049: The work-group size passed to the SYCL kernel may exceed
+    the limit. To get the device limit, query
+    info::device::max_work_group_size. Adjust the work-group size if needed.
+    */
+    {
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
+        dpct::has_capability_or_fail(
+            strata::q_of(stream)->get_device(),
+            {sycl::aspect::fp16});
+
+        strata::q_of(stream)
+            ->parallel_for<dpct_kernel_name<
+                class gdn_step_norm_multi_kernel_42ae27,
+                dpct_kernel_scalar<true>, dpct_kernel_scalar<false>>>(
+                sycl::nd_range<3>(g1 * b1, b1), exp_props,
+                [=](sycl::nd_item<3> item_ct1)
+                    [[sycl::reqd_sub_group_size(32)]] {
+                        gdn_step_norm_multi_kernel<true, false>(
+                            nullptr, h, conv_channels, gate, beta, z, gamma,
+                            eps, y, h_k, h_v, 0, nullptr, 0, nullptr, groups);
+                    });
+    }
+    check("gdn_step_norm_groups");
 }
 
 void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const float* gate, const float* beta,
@@ -1820,24 +2421,47 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
     if (split && (t_out_begin >= n_tok || n_tok - t_out_begin >= 2)) {
         const dpct::dim3 grid((unsigned)h_v, S / GS_COLS), block(GS_COLS, RG);
         if (t_out_begin >= n_tok) {   // no outputs (the commit): the state only
-                                      /*
-                                      DPCT1049: The work-group size passed to the SYCL kernel may
-                                      exceed the limit. To get the device limit, query
-                                      info::device::max_work_group_size. Adjust the work-group size if
-                                      needed.
-                                      */
-            auto exp_props = sycl::ext::oneapi::experimental::properties{};
+            if (n_tok > kVerifyNarrowT)
+                /*
+                DPCT1049: The work-group size passed to the SYCL kernel may
+                exceed the limit. To get the device limit, query
+                info::device::max_work_group_size. Adjust the work-group size if
+                needed.
+                */
+            {
+                auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
-            strata::q_of(stream)
-                ->parallel_for<
-                    dpct_kernel_name<class gdn_state_replay_kernel_e4d4c4,
-                                     dpct_kernel_scalar<kVerifyMaxT>>>(
-                    sycl::nd_range<3>(grid * block, block), exp_props,
-                    [=](sycl::nd_item<3> item_ct1) {
-                        gdn_state_replay_kernel<kVerifyMaxT>(
-                            state, h, conv_channels, gate, beta, h_k, h_v,
-                            n_tok, n_keep);
-                    });
+                strata::q_of(stream)
+                    ->parallel_for<
+                        dpct_kernel_name<class gdn_state_replay_kernel_e4d4c5,
+                                         dpct_kernel_scalar<kVerifyMaxT>>>(
+                        sycl::nd_range<3>(grid * block, block), exp_props,
+                        [=](sycl::nd_item<3> item_ct1) {
+                            gdn_state_replay_kernel<kVerifyMaxT>(
+                                state, h, conv_channels, gate, beta, h_k, h_v,
+                                n_tok, n_keep);
+                        });
+            } else
+            /*
+            DPCT1049: The work-group size passed to the SYCL kernel may
+            exceed the limit. To get the device limit, query
+            info::device::max_work_group_size. Adjust the work-group size if
+            needed.
+            */
+            {
+                auto exp_props = sycl::ext::oneapi::experimental::properties{};
+
+                strata::q_of(stream)
+                    ->parallel_for<
+                        dpct_kernel_name<class gdn_state_replay_kernel_e4d4c4,
+                                         dpct_kernel_scalar<kVerifyNarrowT>>>(
+                        sycl::nd_range<3>(grid * block, block), exp_props,
+                        [=](sycl::nd_item<3> item_ct1) {
+                            gdn_state_replay_kernel<kVerifyNarrowT>(
+                                state, h, conv_channels, gate, beta, h_k, h_v,
+                                n_tok, n_keep);
+                        });
+            }
         } else {
             /*
             DPCT1049: The work-group size passed to the SYCL kernel may
@@ -1868,10 +2492,13 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
             */
             if (xq) {
                 auto exp_props = sycl::ext::oneapi::experimental::properties{};
+                dpct::has_capability_or_fail(
+                    strata::q_of(stream)->get_device(),
+                    {sycl::aspect::fp16});
 
                 strata::q_of(stream)
                     ->parallel_for<
-                        dpct_kernel_name<class gdn_out_norm_kernel_a650eb,
+                        dpct_kernel_name<class gdn_out_norm_kernel_43a701,
                                          dpct_kernel_scalar<true>>>(
                         sycl::nd_range<3>(ng * sycl::range(1, RG, S),
                                           sycl::range(1, RG, S)),
@@ -1891,10 +2518,13 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
             */
             else {
                 auto exp_props = sycl::ext::oneapi::experimental::properties{};
+                dpct::has_capability_or_fail(
+                    strata::q_of(stream)->get_device(),
+                    {sycl::aspect::fp16});
 
                 strata::q_of(stream)
                     ->parallel_for<
-                        dpct_kernel_name<class gdn_out_norm_kernel_f6dfab,
+                        dpct_kernel_name<class gdn_out_norm_kernel_e67d5f,
                                          dpct_kernel_scalar<false>>>(
                         sycl::nd_range<3>(ng * sycl::range(1, RG, S),
                                           sycl::range(1, RG, S)),
@@ -1942,6 +2572,9 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
         */
         if (all_out) {
             auto exp_props = sycl::ext::oneapi::experimental::properties{};
+            dpct::has_capability_or_fail(
+                strata::q_of(stream)->get_device(),
+                {sycl::aspect::fp16});
 
             strata::q_of(stream)
                 ->parallel_for<dpct_kernel_name<
@@ -1952,7 +2585,7 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
                         [[sycl::reqd_sub_group_size(32)]] {
                             gdn_step_norm_multi_kernel<true, true>(
                                 state, h, conv_channels, gate, beta, z, gamma,
-                                eps, y, h_k, h_v, n_tok, nullptr, 0, xq);
+                                eps, y, h_k, h_v, n_tok, nullptr, 0, xq, {});
                         });
         }
         /*
@@ -1962,6 +2595,9 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
         */
         else {
             auto exp_props = sycl::ext::oneapi::experimental::properties{};
+            dpct::has_capability_or_fail(
+                strata::q_of(stream)->get_device(),
+                {sycl::aspect::fp16});
 
             strata::q_of(stream)
                 ->parallel_for<dpct_kernel_name<
@@ -1973,7 +2609,7 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
                             gdn_step_norm_multi_kernel<false, true>(
                                 state, h, conv_channels, gate, beta, z, gamma,
                                 eps, y, h_k, h_v, n_tok, n_keep, t_out_begin,
-                                xq);
+                                xq, {});
                         });
         }
     } else if (all_out) {
@@ -1983,6 +2619,9 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
         info::device::max_work_group_size. Adjust the work-group size if needed.
         */
         auto exp_props = sycl::ext::oneapi::experimental::properties{};
+        dpct::has_capability_or_fail(
+            strata::q_of(stream)->get_device(),
+            {sycl::aspect::fp16});
 
         strata::q_of(stream)
             ->parallel_for<dpct_kernel_name<
@@ -1993,7 +2632,7 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
                     [[sycl::reqd_sub_group_size(32)]] {
                         gdn_step_norm_multi_kernel<true, false>(
                             state, h, conv_channels, gate, beta, z, gamma, eps,
-                            y, h_k, h_v, n_tok, nullptr, 0, nullptr);
+                            y, h_k, h_v, n_tok, nullptr, 0, nullptr, {});
                     });
     } else {
         /*
@@ -2002,6 +2641,9 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
         info::device::max_work_group_size. Adjust the work-group size if needed.
         */
         auto exp_props = sycl::ext::oneapi::experimental::properties{};
+        dpct::has_capability_or_fail(
+            strata::q_of(stream)->get_device(),
+            {sycl::aspect::fp16});
 
         strata::q_of(stream)
             ->parallel_for<dpct_kernel_name<
@@ -2012,7 +2654,8 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
                     [[sycl::reqd_sub_group_size(32)]] {
                         gdn_step_norm_multi_kernel<false, false>(
                             state, h, conv_channels, gate, beta, z, gamma, eps,
-                            y, h_k, h_v, n_tok, n_keep, t_out_begin, nullptr);
+                            y, h_k, h_v, n_tok, n_keep, t_out_begin, nullptr,
+                            {});
                     });
     }
     check("gdn_step_norm_multi");
@@ -2029,16 +2672,177 @@ __dpct_inline__ void wait_flag_ge_kernel(const volatile uint32_t *flag,
     */
     sycl::atomic_fence(sycl::memory_order::acq_rel, sycl::memory_scope::system);
 }
+
+// the GPU's clock in ns (the same sources as gpu_stamp_kernel)
+__dpct_inline__ unsigned long long strata_now_ns() {
+    unsigned long long t;
+#if defined(STRATA_HIP_GFX906)
+    t = wall_clock64() * 40ull;
+#elif defined(__HIPCC__)
+    t = wall_clock64() * 10ull;
+#else
+    /*
+    DPCT1053: Migration of device assembly code is not supported.
+    */
+    t = 0;   // SYCL: no %globaltimer equivalent; the stage profiler is inert on this backend
+#endif
+    return t;
+}
+
+// the overlapped split's hand-off wait, bounded: spin until *flag >= value, or give up after timeout_ns (0: never),
+// marking *err = 1 (mapped) so the host fails the window instead of using a stale hand-off.  The window's later
+// kernels still run (on whatever the hand-off buffer holds) so the graph completes and no stream is left hanging.
+__dpct_inline__ void wait_handoff_kernel(const volatile uint32_t *flag,
+                                         uint32_t value, uint32_t *err,
+                                         unsigned long long timeout_ns) {
+    const unsigned long long t0 = timeout_ns ? strata_now_ns() : 0ull;
+    while (*flag < value) {
+        strata_spin_pause();
+        if (timeout_ns && strata_now_ns() - t0 > timeout_ns) {
+            *(volatile uint32_t*) err = 1u;
+            /*
+            DPCT1078: Consider replacing memory_order::acq_rel with
+            memory_order::seq_cst for correctness if strong memory order
+            restrictions are needed.
+            */
+            sycl::atomic_fence(sycl::memory_order::acq_rel,
+                               sycl::memory_scope::system);
+            return;
+        }
+    }
+    /*
+    DPCT1078: Consider replacing memory_order::acq_rel with
+    memory_order::seq_cst for correctness if strong memory order restrictions
+    are needed.
+    */
+    sycl::atomic_fence(sycl::memory_order::acq_rel, sycl::memory_scope::system);
+}
+
+__dpct_inline__ void
+handoff_publish_kernel(float *dst, const float *__restrict__ a, int64_t na,
+                       const float *__restrict__ b, int64_t nb,
+                       const float *__restrict__ c, int64_t nc,
+                       uint32_t *counter, uint32_t *flag,
+                       const volatile uint32_t *drop) {
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    const int64_t n = na + nb + nc;
+    volatile float* const out = dst;
+#pragma unroll
+    for (int64_t i =
+             (int64_t)item_ct1.get_group(2) * item_ct1.get_local_range(2) +
+             item_ct1.get_local_id(2);
+         i < n; i += (int64_t)item_ct1.get_group_range(2) *
+                     item_ct1.get_local_range(2))
+        out[i] = i < na ? a[i] : i < na + nb ? b[i - na] : c[i - na - nb];
+    /*
+    DPCT1078: Consider replacing memory_order::acq_rel with
+    memory_order::seq_cst for correctness if strong memory order restrictions
+    are needed.
+    */
+    sycl::atomic_fence(
+        sycl::memory_order::acq_rel,
+        sycl::memory_scope::system); // this thread's stores reach host memory
+                                     // before the block counts itself done
+    item_ct1.barrier(sycl::access::fence_space::local_space);
+    if (item_ct1.get_local_id(2) == 0) {
+        const uint32_t prev =
+            dpct::atomic_fetch_add<sycl::access::address_space::generic_space>(
+                counter, 1u);
+        if (prev ==
+            item_ct1.get_group_range(2) - 1) { // every block's payload is out:
+                                               // raise the next stage's flag
+            *(volatile uint32_t*) counter = 0u;
+            /*
+            DPCT1078: Consider replacing memory_order::acq_rel with
+            memory_order::seq_cst for correctness if strong memory order
+            restrictions are needed.
+            */
+            sycl::atomic_fence(sycl::memory_order::acq_rel,
+                               sycl::memory_scope::system);
+            if (drop == nullptr || *drop == 0u) {   // test hook (STRATA_TEST_HANDOFF_DROP): a lost publish
+                *(volatile uint32_t*) flag = 1u;
+                /*
+                DPCT1078: Consider replacing memory_order::acq_rel with
+                memory_order::seq_cst for correctness if strong memory order
+                restrictions are needed.
+                */
+                sycl::atomic_fence(sycl::memory_order::acq_rel,
+                                   sycl::memory_scope::system);
+            }
+        }
+    }
+}
+
+// wait_flag_ge, with the GPU's clock as it arrives (t_in) and as it leaves (t_out), either may be null
+__dpct_inline__ void
+wait_flag_ge_stamped_kernel(const volatile uint32_t *flag, uint32_t value,
+                            volatile unsigned long long *t_in,
+                            volatile unsigned long long *t_out,
+                            uint32_t spin_max) {
+    if (t_in != nullptr) *t_in = strata_now_ns();
+    for (uint32_t spin = 0; spin < spin_max && strata::sys_load(flag) < value; ++spin) strata_spin_pause();
+    /*
+    DPCT1078: Consider replacing memory_order::acq_rel with
+    memory_order::seq_cst for correctness if strong memory order restrictions
+    are needed.
+    */
+    sycl::atomic_fence(sycl::memory_order::acq_rel, sycl::memory_scope::system);
+    if (t_out != nullptr) *t_out = strata_now_ns();
+}
 }  // namespace
 
+void wait_handoff(const uint32_t* flag, uint32_t value, uint32_t* err, unsigned long long timeout_ns, void* stream) {
+    {
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
+
+        strata::q_of(stream)
+            ->parallel_for<dpct_kernel_name<class wait_handoff_kernel_2f7d33>>(
+                sycl::nd_range<3>(sycl::range(1, 1, 1), sycl::range(1, 1, 1)),
+                exp_props, [=](sycl::nd_item<3> item_ct1) {
+                    wait_handoff_kernel(flag, value, err, timeout_ns);
+                });
+    }
+    check("wait_handoff");
+}
+
+void handoff_publish(float* dst, const float* a, int64_t na, const float* b, int64_t nb, const float* c, int64_t nc,
+                     uint32_t* counter, uint32_t* flag, void* stream, const uint32_t* drop) {
+    const int64_t n = na + nb + nc;
+    if (n <= 0 || dst == nullptr || counter == nullptr || flag == nullptr) {
+        std::fprintf(stderr, "handoff_publish: invalid arguments\n");
+        std::exit(1);
+    }
+    const int64_t nb256 = (n + 255) / 256;
+    const int blocks = (int) (nb256 < 64 ? nb256 : 64);
+    {
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
+
+        strata::q_of(stream)
+            ->parallel_for<
+                dpct_kernel_name<class handoff_publish_kernel_d7f4e8>>(
+                sycl::nd_range<3>(sycl::range(1, 1, blocks) *
+                                      sycl::range(1, 1, 256),
+                                  sycl::range(1, 1, 256)),
+                exp_props, [=](sycl::nd_item<3> item_ct1) {
+                    handoff_publish_kernel(dst, a, na, b, nb, c, nc, counter,
+                                           flag, drop);
+                });
+    }
+    check("handoff_publish");
+}
+
 namespace {
-// one thread per window entry: up to kVerifyMaxT tokens x 10 routed experts (80), so 128 (#646 had 64: a window of
-// 7+ tokens lost its last entries)
-constexpr int kResidentPlanMax = 128;
+// one thread per window entry: up to kVerifyNarrowT tokens x 10 routed experts (80), so 128 (#646 had 64: a window of
+// 7+ tokens lost its last entries).  A window of 9..16 rows (up to 160 entries) runs the same kernel on 256 threads;
+// one block size per window class, so a narrow window launches exactly the 128-thread kernel it always did.
+constexpr int kResidentPlanNarrow = 128;
+constexpr int kResidentPlanMax = kVerifyMaxT > kVerifyNarrowT ? 256 : kResidentPlanNarrow;
+static_assert(kVerifyNarrowT * 10 <= kResidentPlanNarrow, "resident_plan: one thread per entry");
 static_assert(kVerifyMaxT * 10 <= kResidentPlanMax, "resident_plan: one thread per entry");
-// the parallel scan keeps one partial sum per warp in s_wsum[4] and packs (entries << 16 | groups) in an int
-static_assert(kResidentPlanMax <= 128 && kResidentPlanMax % 32 == 0, "resident_plan: at most 4 warps");
+// the parallel scan keeps one partial sum per warp in s_wsum[NT / 32] and packs (entries << 16 | groups) in an int
+static_assert(kResidentPlanMax <= 256 && kResidentPlanMax % 32 == 0, "resident_plan: at most 8 warps");
 static_assert(kResidentPlanMax < 32768, "resident_plan: the packed entry count must stay below 2^15");
+template <int NT>
 /*
 DPCT1110: The total declared local variable size in device function
 resident_plan_kernel exceeds 128 bytes and may cause high register pressure.
@@ -2054,14 +2858,15 @@ resident_plan_kernel(const int32_t *__restrict__ ids, int n, int k,
                      uint32_t ring, const unsigned long long *__restrict__ mir,
                      volatile uint32_t *plan_err, int32_t *usage) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
-auto &s_ids = *sycl::ext::oneapi::group_local_memory_for_overwrite<
-    int32_t[kResidentPlanMax]>(
-    sycl::ext::oneapi::this_work_item::get_work_group<3>());
-    auto &s_excl = *sycl::ext::oneapi::group_local_memory_for_overwrite<
-        int32_t[kResidentPlanMax]>(
-        sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    constexpr int NW = NT / 32;
+    auto &s_ids =
+        *sycl::ext::oneapi::group_local_memory_for_overwrite<int32_t[NT]>(
+            sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    auto &s_excl =
+        *sycl::ext::oneapi::group_local_memory_for_overwrite<int32_t[NT]>(
+            sycl::ext::oneapi::this_work_item::get_work_group<3>());
     auto &s_wsum =
-        *sycl::ext::oneapi::group_local_memory_for_overwrite<int32_t[4]>(
+        *sycl::ext::oneapi::group_local_memory_for_overwrite<int32_t[NW]>(
             sycl::ext::oneapi::this_work_item::get_work_group<3>());
     auto &s_bad = *sycl::ext::oneapi::group_local_memory_for_overwrite<int>(
         sycl::ext::oneapi::this_work_item::get_work_group<3>());
@@ -2141,7 +2946,7 @@ auto &s_ids = *sycl::ext::oneapi::group_local_memory_for_overwrite<
     if (is_first) {
         int tot = s_excl[tid];
 #pragma unroll
-        for (int w = 0; w < 4; ++w) {
+        for (int w = 0; w < NW; ++w) {
             if (w < warp) tot += s_wsum[w];
         }
         const int grp_idx = tot & 0xffff;
@@ -2154,7 +2959,7 @@ auto &s_ids = *sycl::ext::oneapi::group_local_memory_for_overwrite<
         const int fj_warp = first_j >> 5;
         int fj_tot = s_excl[first_j];
 #pragma unroll
-        for (int w = 0; w < 4; ++w) {
+        for (int w = 0; w < NW; ++w) {
             if (w < fj_warp) fj_tot += s_wsum[w];
         }
         const int out_idx = (fj_tot >> 16) + rank_in_group;
@@ -2162,7 +2967,14 @@ auto &s_ids = *sycl::ext::oneapi::group_local_memory_for_overwrite<
         tok[out_idx] = tid / k;
     }
     if (tid == 0) {
-        const int groups = (s_wsum[0] + s_wsum[1] + s_wsum[2] + s_wsum[3]) & 0xffff;
+        int groups;
+        if constexpr (NW == 4) groups = (s_wsum[0] + s_wsum[1] + s_wsum[2] + s_wsum[3]) & 0xffff;   // (the 128-thread kernel as it was)
+        else {
+            groups = 0;
+#pragma unroll
+            for (int w = 0; w < NW; ++w) groups += s_wsum[w];
+            groups &= 0xffff;
+        }
         start[groups] = n;
         start2[0] = n;
         counts[0] = groups;
@@ -2337,17 +3149,42 @@ void resident_plan(const int32_t* ids, int n_entries, int k, const int32_t* res_
     int32_t* use = nullptr;                    // the layer's slice of the device routing counts, if on
     if (g_mirror_table != nullptr && in_mirror_table(res_layer)) mir = g_mirror_table + (res_layer - g_mirror_res);
     if (g_usage != nullptr && in_mirror_table(res_layer)) use = g_usage + (res_layer - g_mirror_res);
-    {
+    if (n_entries > kResidentPlanNarrow) {   // a 9..16-row window (kResidentPlanMax == 256 only in a wide build)
+        if (kResidentPlanMax > kResidentPlanNarrow && n_entries <= kResidentPlanMax)
+        {
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};
+
+            strata::q_of(stream)
+                ->parallel_for<
+                    dpct_kernel_name<class resident_plan_kernel_db6b7b,
+                                     dpct_kernel_scalar<kResidentPlanMax>>>(
+                    sycl::nd_range<3>(sycl::range(1, 1, kResidentPlanMax),
+                                      sycl::range(1, 1, kResidentPlanMax)),
+                    exp_props,
+                    [=](sycl::nd_item<3> item_ct1)
+                        [[sycl::reqd_sub_group_size(32)]] {
+                            resident_plan_kernel<kResidentPlanMax>(
+                                ids, n_entries, k, res_layer, n_expert,
+                                cache_base, slot_off, blob, plan, capx, skip,
+                                ring, mir, plan_err, use);
+                        });
+        } else {
+            std::fprintf(stderr, "resident_plan: %d entries, at most %d\n", n_entries, kResidentPlanMax);
+            std::exit(1);
+        }
+    } else {
         auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         strata::q_of(stream)
-            ->parallel_for<dpct_kernel_name<class resident_plan_kernel_db6b7a>>(
-                sycl::nd_range<3>(sycl::range(1, 1, kResidentPlanMax),
-                                  sycl::range(1, 1, kResidentPlanMax)),
+            ->parallel_for<
+                dpct_kernel_name<class resident_plan_kernel_db6b7a,
+                                 dpct_kernel_scalar<kResidentPlanNarrow>>>(
+                sycl::nd_range<3>(sycl::range(1, 1, kResidentPlanNarrow),
+                                  sycl::range(1, 1, kResidentPlanNarrow)),
                 exp_props,
                 [=](sycl::nd_item<3> item_ct1)
                     [[sycl::reqd_sub_group_size(32)]] {
-                        resident_plan_kernel(
+                        resident_plan_kernel<kResidentPlanNarrow>(
                             ids, n_entries, k, res_layer, n_expert, cache_base,
                             slot_off, blob, plan, capx, skip, ring, mir, plan_err, use);
                     });
@@ -2410,6 +3247,46 @@ void copy_or_zero_from_mapped(float* dst, const float* src, long long n, const u
     check("copy_or_zero_from_mapped");
 }
 
+namespace {
+__dpct_inline__ void wait_copy_i32_kernel(const volatile uint32_t *flag,
+                                          uint32_t value,
+                                          int32_t *__restrict__ dst,
+                                          const volatile int32_t *src, int n,
+                                          uint32_t spin_max) {
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    if (item_ct1.get_local_id(2) == 0) {
+        for (uint32_t spin = 0; spin < spin_max && strata::sys_load(flag) < value; ++spin) strata_spin_pause();
+        /*
+        DPCT1078: Consider replacing memory_order::acq_rel with
+        memory_order::seq_cst for correctness if strong memory order
+        restrictions are needed.
+        */
+        sycl::atomic_fence(sycl::memory_order::acq_rel,
+                           sycl::memory_scope::system);
+    }
+    item_ct1.barrier(sycl::access::fence_space::local_space);
+#pragma unroll
+    for (int i = item_ct1.get_local_id(2); i < n;
+         i += item_ct1.get_local_range(2)) dst[i] = src[i];
+}
+}  // namespace
+void wait_copy_i32_from_mapped(const uint32_t* flag, uint32_t value, int32_t* dst, const int32_t* src, int64_t n,
+                               void* stream) {
+    const uint32_t spin_max = strata::spin_max(*strata::q_of(stream));
+    {
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
+
+        strata::q_of(stream)
+            ->parallel_for<dpct_kernel_name<class wait_copy_i32_kernel_6aeabe>>(
+                sycl::nd_range<3>(sycl::range(1, 1, 128),
+                                  sycl::range(1, 1, 128)),
+                exp_props, [=](sycl::nd_item<3> item_ct1) {
+                    wait_copy_i32_kernel(flag, value, dst, src, (int)n, spin_max);
+                });
+    }
+    check("wait_copy_i32_from_mapped");
+}
+
 void wait_flag_ge(const uint32_t* flag, uint32_t value, void* stream) {
     const uint32_t spin_max = strata::spin_max(*strata::q_of(stream));
     {
@@ -2423,6 +3300,23 @@ void wait_flag_ge(const uint32_t* flag, uint32_t value, void* stream) {
                 });
     }
     check("wait_flag_ge");
+}
+
+void wait_flag_ge_stamped(const uint32_t* flag, uint32_t value, unsigned long long* t_in, unsigned long long* t_out,
+                          void* stream) {
+    const uint32_t spin_max = strata::spin_max(*strata::q_of(stream));
+    {
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
+
+        strata::q_of(stream)
+            ->parallel_for<
+                dpct_kernel_name<class wait_flag_ge_stamped_kernel_29374d>>(
+                sycl::nd_range<3>(sycl::range(1, 1, 1), sycl::range(1, 1, 1)),
+                exp_props, [=](sycl::nd_item<3> item_ct1) {
+                    wait_flag_ge_stamped_kernel(flag, value, t_in, t_out, spin_max);
+                });
+    }
+    check("wait_flag_ge_stamped");
 }
 
 void embedding_gather_dev(const uint8_t* codes, const float* scales, const float* offsets, const int32_t* tokens,
@@ -2464,6 +3358,39 @@ void broadcast_streams(const float* x, float* R, int64_t n_embd, int hc, int n_t
                 });
     }
     check("broadcast_streams");
+}
+
+void hc_mean_streams(const float* R, float* out, int64_t n_embd, int hc, void* stream) {
+    {
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
+
+        strata::q_of(stream)
+            ->parallel_for<
+                dpct_kernel_name<class hc_mean_streams_kernel_c4fefa>>(
+                sycl::nd_range<3>(
+                    sycl::range(1, 1, (unsigned)((n_embd + 255) / 256)) *
+                        sycl::range(1, 1, 256),
+                    sycl::range(1, 1, 256)),
+                exp_props, [=](sycl::nd_item<3> item_ct1) {
+                    hc_mean_streams_kernel(R, out, n_embd, hc);
+                });
+    }
+    check("hc_mean_streams");
+}
+
+void route_marginal_stats(const int32_t* ids, int n, int k, unsigned long long* acc, void* stream) {
+    {
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
+
+        strata::q_of(stream)
+            ->parallel_for<
+                dpct_kernel_name<class route_marginal_stats_kernel_7646d6>>(
+                sycl::nd_range<3>(sycl::range(1, 1, 32), sycl::range(1, 1, 32)),
+                exp_props, [=](sycl::nd_item<3> item_ct1) {
+                    route_marginal_stats_kernel(ids, n, k, acc);
+                });
+    }
+    check("route_marginal_stats");
 }
 
 void copy_indexed(float* dst, const float* src, int64_t stride, const int32_t* index, int64_t n, void* stream) {
@@ -2524,6 +3451,18 @@ uint64_t* profile_clock_word(const sycl::queue& q) {
 }
 }
 
+namespace {
+__dpct_inline__ void noop_kernel() {}
+}  // namespace
+void gpu_noop(void *stream) {
+    auto exp_props = sycl::ext::oneapi::experimental::properties{};
+
+  ((sycl::queue*)strata::q_of(stream))->parallel_for<dpct_kernel_name<class noop_kernel_2079ed>>(
+    sycl::nd_range<3>(sycl::range(1, 1, 32), sycl::range(1, 1, 32)), 
+exp_props,     [=](sycl::nd_item<3> item_ct1) {
+        noop_kernel();
+    }); }
+
 void gpu_stamp(unsigned long long* buf, int i, void* stream) {
     auto& q = *strata::q_of(stream);
     uint64_t* word = profile_clock_word(q);
@@ -2532,5 +3471,70 @@ void gpu_stamp(unsigned long long* buf, int i, void* stream) {
         buf[i] = strata::sys_load_mapped(word);
     });
 }
+
+namespace {
+__dpct_inline__ void
+copy_rows_strided_kernel(sycl::float4 *__restrict__ dst,
+                         const sycl::float4 *__restrict__ src, long long rows,
+                         int w4, int src_w4) {
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    const long long total = rows * w4;
+    for (long long i =
+             (long long)item_ct1.get_group(2) * item_ct1.get_local_range(2) +
+             item_ct1.get_local_id(2);
+         i < total; i += (long long)item_ct1.get_group_range(2) *
+                         item_ct1.get_local_range(2)) {
+        const long long r = i / w4, c = i - r * w4;
+        dst[i] = src[r * src_w4 + c];
+    }
+}
+}  // namespace
+void copy_rows_strided(float* dst, const float* src, int64_t rows, int64_t w, int64_t src_w, void* stream) {
+    if (rows <= 0 || w <= 0) return;
+    if ((w & 3) || (src_w & 3) || src_w < w || ((uintptr_t) dst & 15) || ((uintptr_t) src & 15)) {
+        std::fprintf(stderr, "copy_rows_strided: widths must be multiples of 4 floats (src_w >= w), pointers 16-byte "
+                             "aligned\n");
+        std::exit(1);
+    }
+    const long long total = (long long) rows * (w / 4);
+    const unsigned blocks = (unsigned) ((total + 255) / 256 < 256 ? (total + 255) / 256 : 256);
+    {
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
+
+        strata::q_of(stream)
+            ->submit([&](sycl::handler &cgh) {
+                auto w_ct3 = (int)(w / 4);
+                auto src_w_ct4 = (int)(src_w / 4);
+
+                cgh.parallel_for<
+                    dpct_kernel_name<class copy_rows_strided_kernel_ec8c39>>(
+                    sycl::nd_range<3>(sycl::range(1, 1, blocks) *
+                                          sycl::range(1, 1, 256),
+                                      sycl::range(1, 1, 256)),
+                    exp_props, [=](sycl::nd_item<3> item_ct1) {
+                        copy_rows_strided_kernel((sycl::float4 *)dst,
+                                                 (const sycl::float4 *)src,
+                                                 rows, w_ct3, src_w_ct4);
+                    });
+            });
+    }
+    check("copy_rows_strided");
+}
+
+// ---- programmatic dependent launch (pdl.hpp): SYCL has no counterpart (griddepcontrol / the PDL launch attribute are
+// sm_90 CUDA features); the verify window launches every kernel the ordinary way.
+bool& pdl_scope() {
+    static thread_local bool on = false;
+    return on;
+}
+
+bool pdl_supported() { return false; }
+
+#if !defined(__HIPCC__)
+bool pdl_launch_ok(const void *kernel, dpct::queue_ptr stream) {
+    (void) kernel; (void) stream;
+    return false;
+}
+#endif
 
 }  // namespace strata::kernels

@@ -25,6 +25,7 @@
 #include <dpct/dpct.hpp>
 #include "strata/sycl_queue.hpp"
 #include "strata/kernels/native_moe.hpp"
+#include "strata/kernels/verify_kernels.hpp"
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -119,6 +120,85 @@ __dpct_inline__ void combine_k10_vec4(const sycl::float4 *__restrict__ parts4,
     sum.w() += sh.w();
     output4[c4] = sum;
 }
+/*
+DPCT1110: The total declared local variable size in device function
+combine_k10_vec4_hits exceeds 128 bytes and may cause high register pressure.
+Consult with your hardware vendor to find the total register size available and
+adjust the code, or use smaller sub-group size to avoid high register pressure.
+*/
+__dpct_inline__ void combine_k10_vec4_hits(
+    const sycl::float4 *__restrict__ parts4,
+    const sycl::float4 *__restrict__ hits4, const int32_t *__restrict__ dst,
+    const int32_t *__restrict__ count, const float *__restrict__ weights,
+    const sycl::float4 *__restrict__ shared4,
+    sycl::float4 *__restrict__ output4, int64_t n4) {
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    const int64_t tk = item_ct1.get_group(1);
+    auto &hit_mask = *sycl::ext::oneapi::group_local_memory_for_overwrite<int>(
+        sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    if (item_ct1.get_local_id(2) == 0) hit_mask = 0;
+    item_ct1.barrier(sycl::access::fence_space::local_space);
+    const int nh = *count;
+    for (int h = item_ct1.get_local_id(2); h < nh;
+         h += item_ct1.get_local_range(2)) {
+        const int r = dst[h];
+        if (r / 10 == (int)tk)
+            dpct::atomic_fetch_or<sycl::access::address_space::generic_space>(
+                &hit_mask, 1 << (r % 10));
+    }
+    item_ct1.barrier(sycl::access::fence_space::local_space);
+    const int mask = hit_mask;
+    parts4 += tk * 10 * n4;
+    hits4 += tk * 10 * n4;
+    weights += tk * 10;
+    shared4 += tk * n4;
+    output4 += tk * n4;
+    const int64_t c4 =
+        int64_t(item_ct1.get_group(2)) * item_ct1.get_local_range(2) +
+        item_ct1.get_local_id(2);
+    if (c4 >= n4) return;
+    /*
+    DPCT1098: The '*' expression is used instead of the __ldg call. These
+    two expressions do not provide the exact same functionality. Check the
+    generated code for potential precision and/or performance issues.
+    */
+    const float w0 = *(weights + 0);
+    sycl::float4 p0 = parts4[c4];
+    if (mask & 1) {
+        const sycl::float4 hh = hits4[c4]; p0.x() += hh.x(); p0.y() += hh.y();
+        p0.z() += hh.z();
+        p0.w() += hh.w();
+    }
+    sycl::float4 sum =
+        sycl::float4(p0.x() * w0, p0.y() * w0, p0.z() * w0, p0.w() * w0);
+#pragma unroll
+    for (int expert = 1; expert < 10; ++expert) {
+        /*
+        DPCT1098: The '*' expression is used instead of the __ldg call.
+        These two expressions do not provide the exact same functionality. Check
+        the generated code for potential precision and/or performance issues.
+        */
+        const float w = *(weights + expert);
+        sycl::float4 p = parts4[int64_t(expert) * n4 + c4];
+        if ((mask >> expert) & 1) {
+            const sycl::float4 hh = hits4[int64_t(expert) * n4 + c4];
+            p.x() += hh.x();
+            p.y() += hh.y();
+            p.z() += hh.z();
+            p.w() += hh.w();
+        }
+        sum.x() = sycl::fma(p.x(), (float)w, sum.x());
+        sum.y() = sycl::fma(p.y(), (float)w, sum.y());
+        sum.z() = sycl::fma(p.z(), (float)w, sum.z());
+        sum.w() = sycl::fma(p.w(), (float)w, sum.w());
+    }
+    const sycl::float4 sh = shared4[c4];
+    sum.x() += sh.x();
+    sum.y() += sh.y();
+    sum.z() += sh.z();
+    sum.w() += sh.w();
+    output4[c4] = sum;
+}
 bool valid_span(const void* p, size_t bytes) {
     const auto address = reinterpret_cast<uintptr_t>(p);
     return p && address % alignof(float) == 0 && bytes <= UINTPTR_MAX - address;
@@ -181,6 +261,56 @@ deduced. You need to update this code.
                 exp_props, [=](sycl::nd_item<3> item_ct1) {
                     combine(parts, weights, shared, output, n_embd, int(k),
                             nullptr);
+                });
+    }
+    /*
+    DPCT1010: SYCL uses exceptions to report errors and does not use the
+    error codes. The cudaGetLastError function call was replaced with 0. You
+    need to rewrite this code.
+    */
+    const auto error = 0;
+    /*
+    DPCT1009: SYCL reports errors using exceptions and does not use error
+    codes. Please replace the "get_error_string_dummy(...)" with a real
+    error-handling function.
+    */
+    /*
+    DPCT1001: The statement could not be removed.
+    */
+    /*
+    DPCT1000: Error handling if-stmt was detected but could not be
+    rewritten.
+    */
+    if (error !=
+        0) throw std::runtime_error(dpct::get_error_string_dummy(error));
+}
+bool native_moe_combine_hits_supported(const float* parts, const float* shared, const float* output, int64_t n_embd, int64_t k, int n_tok) {
+    return k == 10 && shared != nullptr && n_tok >= 1 && n_tok <= kVerifyMaxT && n_embd > 0 && (n_embd & 3) == 0 &&
+           (((uintptr_t) parts | (uintptr_t) shared | (uintptr_t) output) & 15u) == 0;
+}
+void native_moe_combine_multi_hits_added(const float* parts, const float* hits, const int32_t* dst, const int32_t* count,
+                                         const float* weights, const float* shared, float* output, int64_t n_embd, int64_t k,
+                                         int n_tok, void* stream) {
+    if (!stream || !native_moe_combine_hits_supported(parts, shared, output, n_embd, k, n_tok) || ((uintptr_t) hits & 15u) != 0)
+        throw std::invalid_argument("native MoE combine (hits added) requires k = 10, aligned spans, 1..8 tokens (16 in a wide build)");
+    const int64_t n4 = n_embd >> 2;
+    {
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
+
+        ((sycl::queue *)(strata::q_of(stream)))
+            ->parallel_for<
+                dpct_kernel_name<class combine_k10_vec4_hits_eae779>>(
+                sycl::nd_range<3>(sycl::range(1, (unsigned)n_tok,
+                                              unsigned((n4 + 127) / 128)) *
+                                      sycl::range(1, 1, 128),
+                                  sycl::range(1, 1, 128)),
+                exp_props, [=](sycl::nd_item<3> item_ct1) {
+                    combine_k10_vec4_hits(
+                        reinterpret_cast<const sycl::float4 *>(parts),
+                        reinterpret_cast<const sycl::float4 *>(hits), dst,
+                        count, weights,
+                        reinterpret_cast<const sycl::float4 *>(shared),
+                        reinterpret_cast<sycl::float4 *>(output), n4);
                 });
     }
     /*

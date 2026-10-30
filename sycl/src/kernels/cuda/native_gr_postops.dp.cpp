@@ -78,25 +78,25 @@ pre_gated(const float *__restrict__ xn, float *__restrict__ gate,
         const std::size_t i = std::size_t(c) * n_embd + d;
         const float x = xn[i], w = sigmoid(gate[i]);
         /*
-        DPCT1013: The rounding mode could not be specified and the generated
-        code may have different accuracy than the original code. Verify the
-        correctness. SYCL math built-in function rounding mode is aligned with
-        OpenCL C 1.2 standard.
+        DPCT1013: The rounding mode could not be specified and the
+        generated code may have different accuracy than the original code.
+        Verify the correctness. SYCL math built-in function rounding mode is
+        aligned with OpenCL C 1.2 standard.
         */
         const float product = x * w;
         gate[i] = product;
         /*
-        DPCT1013: The rounding mode could not be specified and the generated
-        code may have different accuracy than the original code. Verify the
-        correctness. SYCL math built-in function rounding mode is aligned with
-        OpenCL C 1.2 standard.
+        DPCT1013: The rounding mode could not be specified and the
+        generated code may have different accuracy than the original code.
+        Verify the correctness. SYCL math built-in function rounding mode is
+        aligned with OpenCL C 1.2 standard.
         */
         if constexpr (Fused) sum = sycl::fma(x, w, sum);
         /*
-        DPCT1013: The rounding mode could not be specified and the generated
-        code may have different accuracy than the original code. Verify the
-        correctness. SYCL math built-in function rounding mode is aligned with
-        OpenCL C 1.2 standard.
+        DPCT1013: The rounding mode could not be specified and the
+        generated code may have different accuracy than the original code.
+        Verify the correctness. SYCL math built-in function rounding mode is
+        aligned with OpenCL C 1.2 standard.
         */
         else sum = c == 0 ? product : sum + product;
     }
@@ -117,6 +117,31 @@ __dpct_inline__ void post(const float *residual,
     block_out += t * std::size_t(n_embd);
     inject += t * std::size_t(hc);
     output += t * std::size_t(n_embd) * hc;
+    const int c = int(i / n_embd), d = int(i % n_embd);
+    const float weight = scale_zero_bias(sigmoid(scale_zero_bias(inject[c], scale)), 2.0f);
+    // Exact residual/output alias is supported; no other thread reads residual[i].
+    /*
+    DPCT1013: The rounding mode could not be specified and the generated
+    code may have different accuracy than the original code. Verify the
+    correctness. SYCL math built-in function rounding mode is aligned with
+    OpenCL C 1.2 standard.
+    */
+    output[i] = sycl::fma(block_out[d], weight, residual[i]);
+}
+// `post` for n tokens (blockIdx.y = token): the same expression per element
+__dpct_inline__ void post_multi(const float *residual,
+                                const float *__restrict__ block_out,
+                                const float *__restrict__ inject, float *output,
+                                int n_embd, int hc, float scale,
+                                long long r_stride, long long b_stride,
+                                long long i_stride) {
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    const std::size_t i =
+        std::size_t(item_ct1.get_group(2)) * item_ct1.get_local_range(2) +
+        item_ct1.get_local_id(2);
+    if (i >= std::size_t(n_embd) * hc) return;
+    const long long t = item_ct1.get_group(1);
+    residual += t * r_stride; output += t * r_stride; block_out += t * b_stride; inject += t * i_stride;
     const int c = int(i / n_embd), d = int(i % n_embd);
     const float weight = scale_zero_bias(sigmoid(scale_zero_bias(inject[c], scale)), 2.0f);
     // Exact residual/output alias is supported; no other thread reads residual[i].
@@ -255,6 +280,35 @@ void native_gr_post_multi(const float* residual, const float* block_out, const f
                     exp_props, [=](sycl::nd_item<3> item_ct1) {
                         post(residual, block_out, inject, output, n_embd, hc,
                              float_hc_ct6);
+                    });
+            });
+    }
+    check_launch();
+}
+void native_gr_post_multi(const float* residual, const float* block_out, const float* inject, float* output,
+                          int n_embd, int hc, int n_tok, long long r_stride, long long b_stride, long long i_stride,
+                          void* stream) {
+    check_shape(n_embd, hc);
+    check_pointer(residual); check_pointer(block_out); check_pointer(inject); check_pointer(output);
+    if (n_tok < 1) return;
+    {
+        auto exp_props = sycl::ext::oneapi::experimental::properties{
+            sycl::ext::oneapi::experimental::use_root_sync};
+
+        ((sycl::queue *)(strata::q_of(stream)))
+            ->submit([&](sycl::handler &cgh) {
+                auto float_hc_ct6 = 1.0f / float(hc);
+
+                cgh.parallel_for<dpct_kernel_name<class post_multi_1622b3>>(
+                    sycl::nd_range<3>(
+                        sycl::range(1, unsigned(n_tok),
+                                    blocks(std::size_t(n_embd) * hc)) *
+                            sycl::range(1, 1, THREADS),
+                        sycl::range(1, 1, THREADS)),
+                    exp_props, [=](sycl::nd_item<3> item_ct1) {
+                        post_multi(residual, block_out, inject, output, n_embd,
+                                   hc, float_hc_ct6, r_stride, b_stride,
+                                   i_stride);
                     });
             });
     }

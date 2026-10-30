@@ -22,11 +22,14 @@
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
 #include "strata/core/layer.hpp"
+#include "strata/core/pinned_ring.hpp"
 #include "strata/core/session.hpp"
 #include "strata/kernels/sampler.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <algorithm>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -47,6 +50,12 @@ public:
               int64_t window = 32768, const MtpDrafter* shared = nullptr);
     /// The prompt's length: prefill() skips the cells the attention window can never reach again.
     void set_prompt_len(int64_t n) { prompt_len_ = n; }
+    /// STRATA_ROUTE_RESIDENT_MTP=1 (EXPERIMENTAL, opt-in, changes the output): the draft layer's router is biased like
+    /// the verifier's STRATA_ROUTE_RESIDENT, with `res_row` (a device residency row of 512 experts: slot or -1) as the
+    /// table.  nullptr switches it off.
+    void set_route_resident(const int32_t* res_row, float margin, int lo, int hi) {
+        rr_res_ = res_row; rr_margin_ = margin; rr_lo_ = lo; rr_hi_ = hi;
+    }
     /// At most this many drafts per round (below max_t - 1): a window longer than the MTP's comes from elsewhere.
     void set_max_drafts(int k) { max_drafts_ = k; }
     /// SYCL port: capture the round, step and prompt graphs at load rather than on first use (see Verifier::warm)
@@ -84,6 +93,7 @@ public:
     /// The main model's embedding and head, and the verify window's final residuals (T rows, hc*n_embd each).
     bool bind(const WeightTable& wt, const NativeHead* head, const float* window_R, std::string& err,
               const MtpDrafter* shared = nullptr);
+    void set_window_R(const float* window_R) { window_R_ = window_R; }
 
     /// Prompt cells [cell0, cell0 + n): residual rows `R_rows` (device, hc*n_embd each) and `next_tokens` (host,
     /// the token at position cell+1).  Runs in batches of up to max_t rows.  `sync` false: returns without waiting
@@ -93,17 +103,30 @@ public:
     /// --pipeline-windows: capture the prefill graphs and size its input records for windows of up to max_t rows now,
     /// so a later prefill(sync = false) of a window neither captures nor allocates (both wait for the device).
     bool prepare_prefill(std::string& err);
+    /// A prompt read beside running batch windows (STRATA_PIPED_CONCURRENT): the prompt pass's graphs captured and its
+    /// input records sized for chunks of up to n rows now, with nothing in flight.  On the read's thread a capture or
+    /// a free waits for the device, whose windows wait for the main thread's doorbell service (#31).
+    bool reserve_prefill(int64_t n, std::string& err);
     dpct::queue_ptr stream() const { return cs_; }
+
+    /// Successful producer result, including a generated row that failed admission.
+    /// budget is the actual producer max_steps; failure/entry resets both fields.
+    /// With result supplied, n_drafts (if supplied too) is also reset on entry.
+    struct DraftResult { int generated = 0; int budget = 0; };
 
     /// One round: catch-up over T cells from `p` (rows = the window's final residuals, `tokens` = the window's
     /// argmaxes: row t pairs R_{p+t} with the token at p+t+1), then the draft chain from row `a` (the last
     /// accepted row) for T-1 drafts at cells p+a+1 ...  `drafts` gets T-1 tokens.
     bool draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* drafts, std::string& err,
-               float* probs = nullptr, float min_p = 0.0f, int* n_drafts = nullptr);
+               float* probs = nullptr, float min_p = 0.0f, int* n_drafts = nullptr, DraftResult* result = nullptr);
 
     /// The first round: one cell (`cell`) from `R_row` (device) and `token` -> T-1 drafts.
+    /// STRATA_SPEC_COST: called after each draft step with (index, probability) instead of the `min_p` test; false ends the chain.
+    /// Also called once for the last step of a chain that reached its length (so the rule sees every draft). Empty: min_p decides.
+    void set_chain_rule(std::function<bool(int, float)> f) { chain_rule_ = std::move(f); }
+
     bool draft_first(int T, const float* R_row, int32_t token, int64_t cell, int32_t* drafts, std::string& err,
-                     float* probs = nullptr, float min_p = 0.0f, int* n_drafts = nullptr);
+                     float* probs = nullptr, float min_p = 0.0f, int* n_drafts = nullptr, DraftResult* result = nullptr);
 
     /// COUPLED DRAFT SAMPLING (core/coupled_draft.hpp; STRATA_SPEC_COUPLED=1, set up by bind()): the request's
     /// sampling.  A sampled request (temperature > 0, not greedy) then drafts by SAMPLING with the target's chain and
@@ -114,7 +137,13 @@ public:
     /// window's commit (`tail`) and the window's pick at its last accepted row (`next`, the next window's row 0).
     void set_draft_history(const int32_t* tail, int64_t n_tail, int32_t next);
     void set_ple_session(SessionState* s) { ple_ss_ = s; }
+    std::function<bool(int, float)> chain_rule_;
     bool coupled() const { return coupled_active_; }
+    /// PROBABILISTIC DRAFT ACCEPTANCE (core/spec_prob.hpp, STRATA_SPEC_PROB=1): this request's drafts are SAMPLED from
+    /// q and each draft j's distribution is in spec_q() + j * kSpecQStride (ids, -1 terminated; then float bits),
+    /// valid on the host once draft() has returned.  False for greedy requests and where the mode is off.
+    bool prob() const { return coupled_active_ && h_q_ != nullptr; }
+    const int32_t* spec_q() const { return h_q_; }
 
     // ---- --pipeline-windows 2: the chain as one asynchronous launch (the round and its steps back to back, no host
     // wait), its first `n_force` steps fed the given tokens instead of their own picks (teacher forcing: the drafts of
@@ -142,6 +171,8 @@ public:
     const float* chain_prob() const { return chain_prob_; }
 
     double ms_draft = 0, ms_prefill = 0;
+    double ms_src = 0;      ///< the host time spent staging the source rows (a cross-card copy when the drafter is on another card)
+    int64_t n_src = 0;
     int64_t rounds = 0;
 
     /// E-9: the prompt path computes this layer's prompt K/V in batches (Prefill::draft_kv): its tensors, its K/V
@@ -150,7 +181,25 @@ public:
     const uint16_t* tensor_bf16(const char* name) const { return bf16(name); }
     const void* tensor_q8(const char* name) const { return q8(name); }
     QsaState& kv_state_rw() { return st_; }
-    int64_t first_needed() const { return (window_ > 0 && prompt_len_ > 0) ? prompt_len_ - window_ - 64 : 0; }
+    /// The first cell whose K/V the draft layer can still read: the window's start for this prompt, and never below
+    /// the KVA floor (cells built from approximated rows are not read, so they are not built either).
+    int64_t first_needed() const {
+        const int64_t w = (window_ > 0 && prompt_len_ > 0) ? prompt_len_ - window_ - 64 : 0;
+        return std::max<int64_t>(w, cell_floor_);
+    }
+    /// The cells the draft layer attends to (0 = every cell), as load() settled it.
+    int64_t window() const { return window_; }
+    /// KVA: call before load().  The draft layer's attention then reads its cell range through a floor, which stays 0
+    /// (the plain window, cell for cell) until set_cell_floor() raises it.  Off (the default): the code is 0.2.6's.
+    void enable_cell_floor(bool on) { floor_on_ = on; }
+    bool cell_floor_enabled() const { return floor_on_ && m_floor_ != nullptr; }
+    /// KVA: the first draft cell that holds a K/V built from a real (not approximated) row.  The attention starts no
+    /// lower; draft_kv / prefill build no cell below it.  Between requests (the drafter idle).  0 = every cell is real.
+    void set_cell_floor(int64_t cell) {
+        cell_floor_ = std::max<int64_t>(0, cell);
+        if (m_floor_ != nullptr) *(volatile int32_t*) h_floor_ = (int32_t) std::min<int64_t>(cell_floor_, 0x7fffffff);
+    }
+    int64_t cell_floor() const { return cell_floor_; }
     int device() const { return device_; }
     bool idle(std::string &err) try {
         if (cs_ && DPCT_CHECK_ERROR(cs_->wait()) != 0) {
@@ -190,6 +239,7 @@ private:
     int coupled_j_ = 0;
     strata::kernels::SamplerParams *h_cparams_ = nullptr, *m_cparams_ = nullptr, *cparams_ = nullptr;
     int32_t *h_chist_ = nullptr, *m_chist_ = nullptr, *cring_ = nullptr, *dinv_ = nullptr;
+    int32_t *h_q_ = nullptr, *m_q_ = nullptr;   ///< STRATA_SPEC_PROB: the drafts' q lists (mapped, max_t_ rows)
     void* cscratch_ = nullptr;
     const float* f32(const char* name) const;
     const uint16_t* bf16(const char* name) const;
@@ -234,6 +284,7 @@ private:
     dpct::queue_ptr cs_ = nullptr;   // load() creates it; not the device's queue, which ~MtpDrafter would destroy
     dpct::experimental::command_graph_exec_ptr prefill_exec_[9] = {};
     dpct::experimental::command_graph_exec_ptr prefill_dev_exec_[9] = {};
+    PinnedRing pf_ring_;          ///< #1996: the records above go up from a pinned slot, not from the pageable vector they are built in
     int32_t* pf_dev_ = nullptr;   ///< E-4: a prompt's rows' token / step / position records, uploaded at once
     int64_t pf_cap_ = 0;          ///< its capacity in ints
     dpct::queue_ptr side_ =
@@ -265,7 +316,13 @@ private:
     int64_t n_dvocab_ = 0;
     std::string rt_dir_;
     int64_t window_ = 0;        // attention over the last window_ cells (0 = every cell)
+    int64_t cell_floor_ = 0;    // KVA: no draft cell below this one is read or built (set_cell_floor)
+    bool floor_on_ = false;     // enable_cell_floor: the attention goes through window_ids_floor
+    int32_t *h_floor_ = nullptr, *m_floor_ = nullptr;   // the floor, mapped: the kernel reads it when it runs
     int64_t prompt_len_ = 0;
+    const int32_t* rr_res_ = nullptr;
+    float rr_margin_ = 0.0f;
+    int rr_lo_ = 6, rr_hi_ = 9;
     float* probs_ = nullptr;
     uint8_t* arg_scratch_ = nullptr;   ///< argmax_rows' and row_top_prob_split's partials and counters
     uint8_t* top_scratch_ = nullptr;
@@ -274,6 +331,9 @@ private:
     float *Rin_ = nullptr, *R_ = nullptr, *emb_ = nullptr, *en_ = nullptr, *e2_ = nullptr, *hn_ = nullptr, *h2_ = nullptr;
     float *mixed_ = nullptr, *inj_ = nullptr, *inj2_ = nullptr, *lo_ = nullptr, *rs_ = nullptr, *bo_ = nullptr;
     float* xn_ = nullptr;
+    /// gr_read's scratch of the drafter's own (not the session's ss.block.gr: the last stage's verifier uses that one,
+    /// and with --pipeline-windows a chain and that stage's window can run on the card at once)
+    strata::kernels::GrWorkspace own_gr_;
     uint8_t* xq_ = nullptr;
     float *qfull_ = nullptr, *qcur_ = nullptr, *kcur_ = nullptr, *vcur_ = nullptr, *attn_ = nullptr, *attn32_ = nullptr;
     float* attn_scratch_ = nullptr;

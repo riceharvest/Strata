@@ -4,6 +4,15 @@
 #include <dpct/dpct.hpp>
 #include "strata/core/pinned.hpp"
 #include "strata/platform/memory.hpp"
+#include "strata/core/pin_budget.hpp"
+
+// SYCL port: pin_register (pin_budget.hpp) never registers host memory with a driver; the CUDA flag values mean nothing here
+#ifndef cudaHostRegisterPortable
+#define cudaHostRegisterPortable 0
+#endif
+#ifndef cudaHostRegisterMapped
+#define cudaHostRegisterMapped 0
+#endif
 
 #include <atomic>
 #include <climits>
@@ -11,7 +20,10 @@
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
+#include <algorithm>
 #include <fstream>
+#include <iterator>
+#include <map>
 #include <mutex>
 #include <thread>
 
@@ -31,6 +43,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <linux/mman.h>
+#include <cmath>
+
 #ifndef MAP_HUGE_2MB
 #define MAP_HUGE_2MB (21 << 26)
 #endif
@@ -53,6 +67,35 @@ struct SharedArenaHeader {
 };
 static_assert(sizeof(SharedArenaHeader) <= kSharedArenaHeaderBytes);
 
+#ifndef _WIN32
+// bytes in free blocks of 2 MiB or more (/proc/buddyinfo, order >= 9): what MADV_HUGEPAGE can get without compaction
+uint64_t free_huge_bytes() {
+    uint64_t total = 0;
+    if (std::FILE* f = std::fopen("/proc/buddyinfo", "r")) {
+        char line[512];
+        while (std::fgets(line, sizeof line, f) != nullptr) {
+            const char* z = std::strstr(line, "zone");
+            if (z == nullptr) continue;
+            const char* q = z + 4;
+            while (*q == ' ') ++q;
+            while (*q != '\0' && *q != ' ') ++q;   // the zone's name
+            unsigned long long c[11] = {0};
+            int n = 0;
+            for (; n < 11; ++n) {
+                char* e = nullptr;
+                const unsigned long long v = std::strtoull(q, &e, 10);
+                if (e == q) break;
+                c[n] = v;
+                q = e;
+            }
+            for (int o = 9; o < n; ++o) total += c[o] * (4096ull << o);
+        }
+        std::fclose(f);
+    }
+    return total;
+}
+#endif
+
 // A 2 MB-aligned reservation.  Large pages first, then the largest alignment the OS will give us for free.
 // A non-empty shared_file instead maps one file whose first 4 KiB identify the pack and whose remaining bytes
 // are the resident arena.  This shared-file layout is intended for tmpfs (/dev/shm); hugetlbfs would need
@@ -61,6 +104,7 @@ void* reserve(uint64_t bytes, PageBacking& got, std::string& note, const std::st
               uint64_t shared_pack_hash, void*& mapping_base, uint64_t& mapping_bytes) {
     mapping_base = nullptr;
     mapping_bytes = 0;
+
 #ifdef _WIN32
     if (!shared_file.empty()) {
         note = "shared-file arena backing is not implemented on Windows";
@@ -262,6 +306,19 @@ void* reserve(uint64_t bytes, PageBacking& got, std::string& note, const std::st
         note += std::getenv("STRATA_NO_ARENA_THP") != nullptr
                     ? "; transparent huge pages skipped (STRATA_NO_ARENA_THP)"
                     : "; transparent huge pages are on for every mapping (THP always): MADV_HUGEPAGE not requested";
+    } else if (std::getenv("STRATA_NO_LARGEPAGES") == nullptr && std::getenv("STRATA_ARENA_THP") == nullptr &&
+               free_huge_bytes() < bytes / 2) {
+        // #2126: THP "madvise" + defrag "madvise" makes every fault of a MADV_HUGEPAGE mapping reclaim and compact
+        // until it finds a 2 MiB block.  When less than half of the arena could be backed by blocks that are free
+        // now (a 62 GB box holding 47 GB of anonymous memory: 148K failed compactions, 100% system time, the load
+        // never ended), that is minutes of kernel work per GiB for a TLB gain.  Said, and STRATA_ARENA_THP=1 asks for it anyway.
+        const std::string four_k = "; using 4 KB pages";
+        if (note.size() >= four_k.size() && note.compare(note.size() - four_k.size(), four_k.size(), four_k) == 0)
+            note.resize(note.size() - four_k.size());
+        note += "; transparent huge pages NOT requested: only " + std::to_string(free_huge_bytes() >> 30) +
+                " GiB of free 2 MiB blocks for a " + std::to_string(bytes >> 30) +
+                " GiB arena, compaction would stall the load (STRATA_ARENA_THP=1 requests them anyway) (#2126)";
+        std::fprintf(stderr, "strata: expert arena: %s\n", note.c_str());   // said now: the load that follows can take minutes
     } else if (std::getenv("STRATA_NO_LARGEPAGES") == nullptr && madvise(p, bytes, MADV_HUGEPAGE) == 0) {
         const std::string four_k = "; using 4 KB pages";
         if (note.size() >= four_k.size() && note.compare(note.size() - four_k.size(), four_k.size(), four_k) == 0)
@@ -302,9 +359,16 @@ rewrite this code.
 bool clear_error() {(void)0; return true; }
 }  // namespace
 
+bool arena_no_register() {
+    const char* e = std::getenv("STRATA_ARENA_PIN_GIB");
+    if (e != nullptr && *e != '\0') return std::string(e) == "none";   // an explicit setting wins over the engine's flag
+    return arena_uma_no_register_flag().load(std::memory_order_relaxed);
+}
+
 int arena_pin_cap_gib() {
     const char* e = std::getenv("STRATA_ARENA_PIN_GIB");
     if (e == nullptr || *e == '\0') return -1;
+    if (std::string(e) == "none") return -1;   // 153-igpu: handled by arena_no_register(); no cap otherwise
     if (std::string(e) == "auto") return -2;   // #243: the Windows shared-memory budget sets the sliced pin's cap
     const int v = std::atoi(e);
     return v < 0 ? -1 : v;
@@ -371,6 +435,22 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t> &bounds,
 
     // Register with CUDA BEFORE any page is touched: cudaHostRegister pins what is resident now, and a region
     // that has already been faulted in page by page is far more expensive to register and may fail outright.
+    if (base && arena_no_register()) {
+        // 153-igpu (UMA mode): nothing is registered; the whole arena stays resident through the working-set lock instead
+        slice_bytes = 1;   // "sliced" with no slice registered: the destructor unlocks from offset registered_bytes (0)
+        const char* env = std::getenv("STRATA_ARENA_LOCK");
+        if (backing == PageBacking::LargePages) {
+            note = "large pages are resident without a lock; " + note;
+        } else if (env == nullptr || std::string(env) != "0") {
+            const strata::platform::LockResult lr = strata::platform::lock_resident((uint8_t*) base, bytes);
+            locked_bytes = lr.locked_bytes;
+            note = lr.note + "; " + note;
+        } else {
+            note = "arena lock disabled (STRATA_ARENA_LOCK=0); " + note;
+        }
+        note = "NOT registered with the GPU driver (integrated GPU, UMA mode; STRATA_ARENA_PIN_GIB=0 registers it); " + note;
+        return;
+    }
     if (base) {
         // #243: STRATA_ARENA_PIN_GIB=N caps the registration from the start where the caller set no cap
         const int env_gib = arena_pin_cap_gib();
@@ -381,15 +461,10 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t> &bounds,
             cap_why = "by STRATA_ARENA_PIN_GIB";
         }
         const bool capped = cap > 0 && cap < bytes && bounds.size() >= 2;
-        const dpct::err0 e =
-            capped ? 0 :
-                   /*
-                   DPCT1027: The call to cudaHostRegister was replaced with
-                   0 because SYCL currently does not support registering of
-                   existing host memory for use by device. Use USM to allocate
-                   memory for use by host and device.
-                   */
-                0;
+        const dpct::err0 e = capped ? dpct::err0(0)
+                                    : pin_register(base, (size_t)bytes,
+                                                   cudaHostRegisterPortable |
+                                                       cudaHostRegisterMapped);
         if (!capped && e == 0) {
             note = "cudaHostRegister PORTABLE ok; " + note;
             registered_bytes = bytes;
@@ -409,13 +484,9 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t> &bounds,
             for (size_t i = 0; i + 1 < bounds.size(); ++i) {
                 const uint64_t off = bounds[i], n = bounds[i + 1] - bounds[i];
                 if (limited && (off > limit || n > limit - off)) break;
-                /*
-                DPCT1027: The call to cudaHostRegister was replaced with 0
-                because SYCL currently does not support registering of existing
-                host memory for use by device. Use USM to allocate memory for
-                use by host and device.
-                */
-                if (0 != 0) {
+                if (pin_register((uint8_t *)base + off, (size_t)n,
+                                 cudaHostRegisterPortable |
+                                     cudaHostRegisterMapped) != 0) {
                     /*
                     DPCT1010: SYCL uses exceptions to report errors and
                     does not use the error codes. The cudaGetLastError function
@@ -510,6 +581,109 @@ catch (sycl::exception const &exc) {
   std::exit(1);
 }
 
+PinnedArena::PinnedArena(
+    uint64_t bytes, ByNeed,
+    const std::vector<std::pair<uint64_t, uint64_t>> &ranges,
+    uint64_t max_pinned_bytes, const std::string &shared_file,
+    uint64_t shared_pack_hash) try
+    : capacity(bytes) {
+    by_need = true;
+    if (bytes == 0) return;
+    base = reserve(bytes, backing, note, shared_file, shared_pack_hash, mapping_base, mapping_bytes);
+    if (base != nullptr && mapping_base == nullptr) {
+        mapping_base = base;
+        mapping_bytes = bytes;
+    }
+    if (base == nullptr) return;
+    // Register BEFORE any page is touched (see the first constructor).  Same caps as there: the engine's
+    // `max_pinned_bytes`, else STRATA_ARENA_PIN_GIB=N (> 0); "auto" (-2) is the sliced pin's and does not apply.
+    const int env_gib = arena_pin_cap_gib();
+    uint64_t cap = max_pinned_bytes;
+    if (cap == 0 && env_gib > 0) cap = (uint64_t) env_gib << 30;
+#ifdef _WIN32
+    // WDDM: the pin must leave margin (the budget is ~RAM/2 and later cudaMallocs need room).  Unset: 29 GiB;
+    // "auto" (-2): the sliced pin's shared-memory-budget limit (29 GiB when it cannot be worked out);
+    // STRATA_ARENA_PIN_GIB=0 ("the whole arena"): no cap, up to the driver's refusal.
+    if (cap == 0 && env_gib != 0) {
+        uint64_t lim = 0;
+        std::string why;
+        cap = env_gib == -2 && sliced_pin_limit(lim, why) && lim > 0 ? lim : (29ull << 30);
+    }
+#endif
+    constexpr uint64_t kPage = 4096;
+    std::map<uint64_t, uint64_t> done;   // registered [start, end), by start: ranges never overlap
+    uint64_t total = 0;
+    int refused = 0;
+    bool capped = false;
+    const bool none = arena_no_register();   // 153-igpu UMA mode: register no range at all; every byte is a locked "hole" below
+    for (const auto& rg : ranges) {
+        if (none) break;
+        if (rg.second == 0 || rg.first >= bytes) continue;
+        // INWARD: a registered page holds no byte of an unpinned neighbour blob (a copy that STARTS in a registered page
+        // and runs past the registration is rejected by CUDA); the boundary pages stay unregistered
+        uint64_t a = (rg.first + kPage - 1) & ~(kPage - 1);
+        uint64_t b = std::min<uint64_t>(rg.first + rg.second, bytes) & ~(kPage - 1);
+        // a page shared with a range registered before (blobs smaller than a page, or odd offsets) is already
+        // registered: registering it twice is an error, so trim to what is left; a range inside one is skipped
+        auto it = done.upper_bound(a);
+        if (it != done.begin()) {
+            auto p = std::prev(it);
+            if (p->second > a) a = p->second;
+        }
+        if (it != done.end() && it->first < b) b = it->first;
+        if (a >= b) continue;
+        if (cap > 0 && total + (b - a) > cap) { capped = true; break; }
+        if (pin_register((uint8_t *)base + a, (size_t)(b - a),
+                         cudaHostRegisterPortable | cudaHostRegisterMapped) !=
+            0) {
+            /*
+            DPCT1010: SYCL uses exceptions to report errors and does not
+            use the error codes. The cudaGetLastError function call was replaced
+            with 0. You need to rewrite this code.
+            */
+            (void)0;
+            refused = 1;
+            break;
+        }
+        done[a] = b;
+        total += b - a;
+    }
+    for (const auto& d : done) pin_ranges.emplace_back(d.first, d.second - d.first);
+    registered_bytes = total;
+    registered_slices = (int) pin_ranges.size();
+    // the holes stay resident through the working-set lock, as the sliced fallback does for its tail
+    std::vector<std::pair<void*, uint64_t>> holes;
+    uint64_t cur = 0, hole_bytes = 0;
+    for (const auto& r : pin_ranges) {
+        if (r.first > cur) { locked_ranges.emplace_back(cur, r.first - cur); hole_bytes += r.first - cur; }
+        cur = r.first + r.second;
+    }
+    if (cur < bytes) { locked_ranges.emplace_back(cur, bytes - cur); hole_bytes += bytes - cur; }
+    note = "pin by need: " + std::to_string(pin_ranges.size()) + " ranges registered (" + std::to_string(total >> 20) +
+           " MiB)" + (refused ? ", the driver refused the next one" : capped ? ", the cap was reached" : "") +
+           "; " + note;
+    const char* env = std::getenv("STRATA_ARENA_LOCK");
+    if (backing == PageBacking::LargePages) {   // #779: large pages cannot be paged out: nothing to lock
+        note = "large pages are resident without a lock; " + note;
+        locked_ranges.clear();
+    } else if (env != nullptr && std::string(env) == "0") {
+        note = "arena lock disabled (STRATA_ARENA_LOCK=0); " + note;
+        locked_ranges.clear();
+    } else {
+        for (const auto& r : locked_ranges) holes.emplace_back((uint8_t*) base + r.first, r.second);
+        const strata::platform::LockResult lr = strata::platform::lock_resident_ranges(holes);
+        locked_bytes = lr.locked_bytes;
+        note = lr.note + " (" + std::to_string(hole_bytes >> 20) + " MiB of holes); " + note;
+        // a partial lock is unlocked region by region in the destructor; what it did not reach was never locked
+        // (VirtualUnlock/munlock of an unlocked page is harmless), so the list is kept whole
+    }
+}
+catch (sycl::exception const &exc) {
+  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
+            << ", line:" << __LINE__ << std::endl;
+  std::exit(1);
+}
+
 PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds, Deferred)
     : capacity(bytes), bounds_(bounds) {
     if (bytes == 0 || bounds.size() < 2) return;
@@ -526,12 +700,9 @@ void PinnedArena::register_slices(std::atomic<int> &ready) try {
     int i = 0;
     for (; base != nullptr && i < n; ++i) {
         const uint64_t off = bounds_[(size_t) i], len = bounds_[(size_t) i + 1] - off;
-        /*
-        DPCT1027: The call to cudaHostRegister was replaced with 0 because
-        SYCL currently does not support registering of existing host memory for
-        use by device. Use USM to allocate memory for use by host and device.
-        */
-        if (0 != 0) {
+        if (pin_register((uint8_t *)base + off, (size_t)len,
+                         cudaHostRegisterPortable | cudaHostRegisterMapped) !=
+            0) {
             /*
             DPCT1010: SYCL uses exceptions to report errors and does not use
             the error codes. The cudaGetLastError function call was replaced
@@ -567,23 +738,21 @@ catch (sycl::exception const &exc) {
 }
 
 PinnedArena::~PinnedArena() {
+    if (base && by_need) {
+        for (const auto& r : locked_ranges) strata::platform::unlock_resident((uint8_t*) base + r.first, r.second);
+        for (const auto& r : pin_ranges) pin_unregister((uint8_t*) base + r.first);
+        release(mapping_base ? mapping_base : base, mapping_bytes ? mapping_bytes : capacity);
+        base = nullptr;
+        mapping_base = nullptr;
+        mapping_bytes = 0;
+        return;
+    }
     if (base) {
         if (locked_bytes) strata::platform::unlock_resident((uint8_t*) base + (slice_bytes ? registered_bytes : 0), locked_bytes);
         if (slice_bytes) {
-            /*
-            DPCT1027: The call to cudaHostUnregister was replaced with 0
-            because SYCL currently does not support registering of existing host
-            memory for use by device. Use USM to allocate memory for use by host
-            and device.
-            */
-            for (uint64_t off : slice_starts) 0;
+            for (uint64_t off : slice_starts) pin_unregister((uint8_t*) base + off);
         } else {
-            /*
-            DPCT1026: The call to cudaHostUnregister was removed because
-            SYCL currently does not support registering of existing host memory
-            for use by device. Use USM to allocate memory for use by host and
-            device.
-            */
+            pin_unregister(base);
         }
         release(mapping_base ? mapping_base : base, mapping_bytes ? mapping_bytes : capacity);
         base = nullptr;
@@ -746,6 +915,12 @@ bool experts_unbuffered(const std::vector<std::string>& files, uint64_t arena_by
 LoadStats load_experts_ranges(const std::string& path, uint8_t* dst, const std::vector<uint64_t>& layer_off,
                               const std::vector<uint64_t>& layer_bytes, int threads, uint64_t chunk,
                               const std::atomic<int>* ready) {
+    return load_experts_ranges(path, dst, layer_off, layer_bytes, threads, chunk, ready, nullptr);
+}
+
+LoadStats load_experts_ranges(const std::string& path, uint8_t* dst, const std::vector<uint64_t>& layer_off,
+                              const std::vector<uint64_t>& layer_bytes, int threads, uint64_t chunk,
+                              const std::atomic<int>* ready, const PadMap* pad) {
     LoadStats st;
     const uint64_t layers = (uint64_t) layer_off.size();
     st.layers = layers;
@@ -814,7 +989,17 @@ LoadStats load_experts_ranges(const std::string& path, uint8_t* dst, const std::
                     return;
                 }
                 const auto t_copy = std::chrono::steady_clock::now();
-                std::memcpy(dst + off + pos, buf.data(), (size_t) n);
+                if (pad == nullptr) {
+                    std::memcpy(dst + off + pos, buf.data(), (size_t) n);
+                } else {   // the padded layout: a chunk may span blobs, each lands at its own page-aligned start
+                    const uint64_t B = pad->blob[(size_t) L], S = pad->stride[(size_t) L];
+                    for (uint64_t q = 0; q < n;) {
+                        const uint64_t p = pos + q, bi = p / B, in = p % B;
+                        const uint64_t m = std::min<uint64_t>(n - q, B - in);
+                        std::memcpy(dst + pad->dst_off[(size_t) L] + bi * S + in, buf.data() + q, (size_t) m);
+                        q += m;
+                    }
+                }
                 h = fnv1a64(buf.data(), n, h);
                 copy_ns += (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
                                std::chrono::steady_clock::now() - t_copy).count();

@@ -418,12 +418,23 @@ code.
 */
 __dpct_inline__ void copy_rows_from_mapped_kernel(
     sycl::float4 *__restrict__ dst, const sycl::float4 *src, int64_t row4,
-    const int32_t *__restrict__ hit_rows, const int32_t *__restrict__ count) {
+    const int32_t *__restrict__ hit_rows, const int32_t *__restrict__ count,
+    const volatile uint32_t *wait_flag = nullptr, uint32_t wait_value = 0) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
     const int row = item_ct1.get_group(2);
     auto &hit = *sycl::ext::oneapi::group_local_memory_for_overwrite<int>(
         sycl::ext::oneapi::this_work_item::get_work_group<3>());
     if (item_ct1.get_local_id(2) == 0) {
+        if (wait_flag != nullptr) {   // 143-amdk: the wait_flag_ge launch folded in
+            while (strata::sys_load(wait_flag) < wait_value) strata_spin_pause();   // system-scope load: a volatile read does not bypass the cache on Intel
+            /*
+            DPCT1078: Consider replacing memory_order::acq_rel with
+            memory_order::seq_cst for correctness if strong memory order
+            restrictions are needed.
+            */
+            sycl::atomic_fence(sycl::memory_order::acq_rel,
+                               sycl::memory_scope::system);
+        }
         int h = 0;
         const int c = *count;
 #pragma unroll
@@ -513,7 +524,37 @@ void copy_rows_from_mapped(float* dst, const float* src, int64_t rows, int64_t w
                         copy_rows_from_mapped_kernel(
                             (sycl::float4 *)dst,
                             (const sycl::float4 *)src, width_ct2,
-                            hit_rows, count);
+                            hit_rows, count, nullptr, 0);
+                    });
+            });
+    }
+}
+void copy_rows_from_mapped_after(const uint32_t* flag, uint32_t value, float* dst, const float* src, int64_t rows,
+                                 int64_t width, const int32_t* hit_rows, const int32_t* count, void* stream) {
+    if (rows <= 0) return;
+    if ((width & 3) != 0 || ((uintptr_t) dst & 15) != 0 || ((uintptr_t) src & 15) != 0) {
+        std::fprintf(stderr, "copy_rows_from_mapped_after: width must be a multiple of 4 and both pointers 16-byte aligned\n");
+        std::exit(1);
+    }
+    {
+        auto exp_props = sycl::ext::oneapi::experimental::properties{
+            sycl::ext::oneapi::experimental::use_root_sync};
+
+        strata::q_of(stream)
+            ->submit([&](sycl::handler &cgh) {
+                auto width_ct2 = width / 4;
+
+                cgh.parallel_for<dpct_kernel_name<
+                    class copy_rows_from_mapped_after_kernel>>(
+                    sycl::nd_range<3>(sycl::range(1, 1, (unsigned)rows) *
+                                          sycl::range(1, 1, 128),
+                                      sycl::range(1, 1, 128)),
+                    exp_props, [=](sycl::nd_item<3> item_ct1) {
+                        copy_rows_from_mapped_kernel(
+                            (sycl::float4 *)dst,
+                            (const sycl::float4 *)src, width_ct2,
+                            hit_rows, count, (const volatile uint32_t *)flag,
+                            value);
                     });
             });
     }

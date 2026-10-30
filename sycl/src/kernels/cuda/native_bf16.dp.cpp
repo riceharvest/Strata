@@ -3,8 +3,10 @@
 #include <dpct/dpct.hpp>
 #include "strata/sycl_queue.hpp"
 #include "strata/kernels/bf16_gemv.hpp"
+#include "strata/kernels/window_limits.hpp"
 #include "s26_tsum.dp.hpp"
 #include "strata/kernels/bf16_bits.hpp"
+#include "strata/kernels/pdl.hpp"
 
 #include <cstdlib>
 #include <limits>
@@ -102,10 +104,20 @@ __dpct_inline__ void bf16_f32_mmvf_kernel(const float *__restrict__ x,
 // token keeps its own accumulator with exactly the single-row kernel's order (pairs, two ordered FMAs, the same warp
 // and block reductions), so each output is bit-identical to a bf16_f32_mmvf_kernel launch of its own.
 template <int BLOCK_SIZE, int NT, bool EXACT_T = true>
-__dpct_inline__ void bf16_f32_mmvf_multi_kernel(
-    const float *__restrict__ x, int64_t ldx, const uint16_t *__restrict__ w,
-    float *__restrict__ y, int64_t ldy, int n_in, int n_tok) {
+/*
+DPCT1110: The total declared local variable size in device function
+bf16_f32_mmvf_multi_kernel exceeds 128 bytes and may cause high register
+pressure. Consult with your hardware vendor to find the total register size
+available and adjust the code, or use smaller sub-group size to avoid high
+register pressure.
+*/
+void bf16_f32_mmvf_multi_kernel(const float *x_, int64_t ldx,
+                                const uint16_t *__restrict__ w, float *y_,
+                                int64_t ldy, int n_in, int n_tok) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    const float *STRATA_PDL_RESTRICT x =
+        x_; // __restrict__ below sm_70 only (pdl.hpp, #1469)
+    float* STRATA_PDL_RESTRICT y = y_;
     const int t = item_ct1.get_local_id(2);
     const uint16_t *row = w + (size_t)item_ct1.get_group(2) * n_in;
     const uint32_t* weights2 = reinterpret_cast<const uint32_t*>(row);
@@ -120,13 +132,28 @@ __dpct_inline__ void bf16_f32_mmvf_multi_kernel(
     float acc[NT];
 #pragma unroll
     for (int k = 0; k < NT; ++k) acc[k] = 0.0f;
-    for (int pair = t; pair < n_in / 2; pair += BLOCK_SIZE) {
+    // PDL (pdl.hpp): this thread's first PRE weight pairs are loaded before waiting for the activations
+    constexpr int PRE = kPdlPrefetch ? 8 : 0;
+    uint32_t wpre[PRE > 0 ? PRE : 1];
+#pragma unroll
+    for (int q = 0; q < PRE; ++q) {
+        const int pair = t + q * BLOCK_SIZE;
         /*
         DPCT1098: The '*' expression is used instead of the __ldg call.
         These two expressions do not provide the exact same functionality. Check
         the generated code for potential precision and/or performance issues.
         */
-        const uint32_t weight = *(weights2 + pair);
+        wpre[q] = pair < n_in / 2 ? *(weights2 + pair) : 0u;
+    }
+    pdl_wait();
+    int q = 0;
+    for (int pair = t; pair < n_in / 2; pair += BLOCK_SIZE, ++q) {
+        /*
+        DPCT1098: The '*' expression is used instead of the __ldg call.
+        These two expressions do not provide the exact same functionality. Check
+        the generated code for potential precision and/or performance issues.
+        */
+        const uint32_t weight = q < PRE ? wpre[q] : *(weights2 + pair);
         const float w0 = f32_from_bf16((uint16_t) weight), w1 = f32_from_bf16((uint16_t) (weight >> 16));
 #pragma unroll
         for (int k = 0; k < NT; ++k) {
@@ -177,6 +204,26 @@ __dpct_inline__ void bf16_f32_mmvf_multi_kernel(
         for (int k = 0; k < NT; ++k)
             if (EXACT_T || k < n_tok)
                 y[(size_t)k * ldy + item_ct1.get_group(2)] = acc[k];
+}
+
+// Auto generated SYCL kernel wrapper used to migration kernel function pointer.
+template <int BLOCK_SIZE, int NT, bool EXACT_T = true>
+void bf16_f32_mmvf_multi_kernel_wrapper(const float *x_, int64_t ldx,
+                                        const uint16_t *__restrict w, float *y_,
+                                        int64_t ldy, int n_in, int n_tok) {
+    sycl::queue queue = *dpct::kernel_launcher::_que;
+    unsigned int localMemSize = dpct::kernel_launcher::_local_mem_size;
+    sycl::nd_range<3> nr = dpct::kernel_launcher::_nr;
+
+    auto exp_props = sycl::ext::oneapi::experimental::properties{
+        sycl::ext::oneapi::experimental::use_root_sync};
+
+    queue.parallel_for<dpct_kernel_name<class bf16_f32_mmvf_multi_kernel_>>(
+        nr, exp_props,
+        [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
+            bf16_f32_mmvf_multi_kernel<BLOCK_SIZE, NT, EXACT_T>(
+                x_, ldx, w, y_, ldy, n_in, n_tok);
+        });
 }
 
 // S25 (STRATA_MMVF_ROWS=1): RPB output rows per block. Each block read its row's weights once but all T activation
@@ -575,12 +622,12 @@ bool bf16_gemv_fp32_mmvf_multi_aux(const float* x, int64_t ldx, const uint16_t* 
 void bf16_gemv_fp32_mmvf_multi(const float* x, int64_t ldx, const uint16_t* w, float* y, int64_t ldy,
                                int64_t n_in, int64_t n_out, int n_tok, void* stream) {
     if (n_tok == 1 && ldy >= n_out) { bf16_gemv_fp32_mmvf(x, w, y, n_in, n_out, stream); return; }
-    if (n_tok < 1 || n_tok > 8 || n_in <= 0 || (n_in & 1) != 0 || n_out <= 0 || (ldx & 1) != 0 || x == nullptr ||
-        w == nullptr || y == nullptr || (reinterpret_cast<uintptr_t>(x) & 7u) != 0)
-        throw std::invalid_argument("bf16_gemv_fp32_mmvf_multi: 1..8 rows, even n_in/ldx, aligned pointers");
+    if (n_tok < 1 || n_tok > STRATA_VERIFY_MAX_T || n_in <= 0 || (n_in & 1) != 0 || n_out <= 0 || (ldx & 1) != 0 ||
+        x == nullptr || w == nullptr || y == nullptr || (reinterpret_cast<uintptr_t>(x) & 7u) != 0)
+        throw std::invalid_argument("bf16_gemv_fp32_mmvf_multi: 1..8 rows (16 in a wide build), even n_in/ldx, aligned pointers");
     const dpct::queue_ptr st = strata::q_of(stream);
     static const bool rows = [] { const char* v = std::getenv("STRATA_MMVF_ROWS"); return v && v[0] == '1'; }();
-    if (rows && n_out >= 64) {
+    if (rows && n_out >= 64 && n_tok <= 8) {   // (the opt-in rows kernels hold 8 columns: a wider window takes the switch below)
         const int ni = (int) n_in, no = (int) n_out;
         switch (mmvf_block_size(n_in)) {
             case 32: launch_rows<32>(x, ldx, w, y, ldy, ni, no, n_tok, st); break;
@@ -616,9 +663,45 @@ void bf16_gemv_fp32_mmvf_multi(const float* x, int64_t ldx, const uint16_t* w, f
                 dpct::get_error_string_dummy(result));
         return;
     }
+    // 9..16 rows (wide builds only): one exact instantiation per row count, each row's dot independent of the others.  7 and 8
+    // rows stay with the default case below, the instantiation they always had.
+#if STRATA_VERIFY_MAX_T > 8
+#define STRATA_MMVF_W(N, T) case T: {                                          \
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};    \
+            st->submit([&](sycl::handler &cgh) {                               \
+                auto x_ct0 = x;                                                \
+                auto ldx_ct1 = ldx;                                            \
+                auto w_ct2 = w;                                                \
+                auto y_ct3 = y;                                                \
+                auto ldy_ct4 = ldy;                                            \
+                auto n_in_ct5 = (int)n_in;                                     \
+                auto n_tok_ct6 = n_tok;                                        \
+                cgh.parallel_for<dpct_kernel_name<                             \
+                    class bf16_f32_mmvf_multi_kernel_wide,                     \
+                    dpct_kernel_scalar<N>, dpct_kernel_scalar<T>,              \
+                    dpct_kernel_scalar<true>>>(                                \
+                    sycl::nd_range<3>(sycl::range(1, 1, (unsigned)n_out) *     \
+                                          sycl::range(1, 1, N),                \
+                                      sycl::range(1, 1, N)),                   \
+                    exp_props,                                                 \
+                    [=](sycl::nd_item<3> item_ct1)                             \
+                        [[sycl::reqd_sub_group_size(32)]] {                    \
+                            bf16_f32_mmvf_multi_kernel<N, T, true>(            \
+                                x_ct0, ldx_ct1, w_ct2, y_ct3, ldy_ct4,         \
+                                n_in_ct5, n_tok_ct6);                          \
+                        });                                                    \
+            });                                                                \
+        } break;
+#define STRATA_MMVF_WIDE(N) \
+        STRATA_MMVF_W(N, 9) STRATA_MMVF_W(N, 10) STRATA_MMVF_W(N, 11) STRATA_MMVF_W(N, 12) \
+        STRATA_MMVF_W(N, 13) STRATA_MMVF_W(N, 14) STRATA_MMVF_W(N, 15) STRATA_MMVF_W(N, 16)
+#else
+#define STRATA_MMVF_WIDE(N)
+#endif
 #define STRATA_MMVF_M(N)                                                       \
     case N:                                                                    \
         switch (n_tok) {                                                       \
+        STRATA_MMVF_WIDE(N)                                                    \
         case 1: {                                                              \
             auto exp_props = sycl::ext::oneapi::experimental::properties{};               \
                                                                                \
@@ -821,6 +904,10 @@ void bf16_gemv_fp32_mmvf_multi(const float* x, int64_t ldx, const uint16_t* w, f
         STRATA_MMVF_M(160); STRATA_MMVF_M(192); STRATA_MMVF_M(224); STRATA_MMVF_M(256);
     }
 #undef STRATA_MMVF_M
+#undef STRATA_MMVF_WIDE
+#ifdef STRATA_MMVF_W
+#undef STRATA_MMVF_W
+#endif
     /*
     DPCT1010: SYCL uses exceptions to report errors and does not use the
     error codes. The cudaGetLastError function call was replaced with 0. You

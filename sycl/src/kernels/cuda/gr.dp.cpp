@@ -258,12 +258,29 @@ auto &scratch = *sycl::ext::oneapi::group_local_memory_for_overwrite<double[8]>(
 
 /// `lo = silu((bf16(xn) @ w_down.T) / hc)`, ONE BLOCK PER OUTPUT ROW with its warps splitting the reduction.
 template <typename Activation>
-__dpct_inline__ void gr_down_kernel(const Activation *__restrict__ xq,
-                                    const uint16_t *__restrict__ w_down,
-                                    int hc_dim, int hc_lr, int hc,
-                                    Activation *__restrict__ lq) {
+__dpct_inline__ void
+gr_down_kernel(const Activation *__restrict__ xq,
+               const uint16_t *__restrict__ w_down, int hc_dim, int hc_lr,
+               int hc, Activation *__restrict__ lq,
+               const uint16_t *__restrict__ w_inject,
+               float *__restrict__ inject, bool do_inject) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
     const int k = item_ct1.get_group(2);
+    if (do_inject && k == hc_lr) {
+        // Track F: the inject projection is the down grid's last block.  One warp per stream, the same
+        // lane stride and warp_sumf as `gr_inject_kernel`, so the four values are bitwise the old kernel's.
+        const int c = item_ct1.get_local_id(2) >> 5;
+        if (c >= hc) return;
+        const int lane = item_ct1.get_local_id(2) & 31;
+        const uint16_t* row = w_inject + (size_t) c * hc_dim;
+        float acc = 0.0f;
+#pragma unroll
+        for (int i = lane; i < hc_dim; i += 32)
+            acc += activation_f32(xq[i]) * bf16_bits_to_f32(row[i]);
+        acc = warp_sumf(acc);
+        if (lane == 0) inject[c] = acc;
+        return;
+    }
     if (k >= hc_lr) return;
     const int lane = item_ct1.get_local_id(2) & 31;
     const int warp = item_ct1.get_local_id(2) >> 5;
@@ -368,6 +385,46 @@ __dpct_inline__ void gr_mean_kernel(const float *__restrict__ gated, int n_embd,
     mixed[d] = m / (float) hc;
 }
 
+/// Track F: `gr_gate_kernel` and `gr_mean_kernel` in one launch.  One block owns WARPS columns for every
+/// stream; a warp computes one column's dot per stream (the same lane stride and warp_sumf as the old gate),
+/// the per-stream values meet in shared, and the mean adds them in the same c order as the old kernel.
+template <typename Activation>
+__dpct_inline__ void gr_gate_mean_kernel(const Activation *__restrict__ lq,
+                                         const uint16_t *__restrict__ w_up,
+                                         const float *__restrict__ xn,
+                                         int hc_lr, int n_embd, int hc,
+                                         float *__restrict__ mixed) {
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    const int lane = item_ct1.get_local_id(2) & 31;
+    const int warp = item_ct1.get_local_id(2) >> 5;
+    const int d = item_ct1.get_group(2) * WARPS + warp;
+    auto &g =
+        *sycl::ext::oneapi::group_local_memory_for_overwrite<float[4][WARPS]>(
+            sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    if (d < n_embd) {
+        for (int c = 0; c < hc; ++c) {
+            const int i = c * n_embd + d;
+            const uint16_t* row = w_up + (size_t) i * hc_lr;
+            float acc = 0.0f;
+#pragma unroll
+            for (int k = lane; k < hc_lr; k += 32)
+                acc += activation_f32(lq[k]) * bf16_bits_to_f32(row[k]);
+            acc = warp_sumf(acc);
+            if (lane == 0) g[c][warp] = xn[i] * sigmoid_f(acc);
+        }
+    }
+    item_ct1.barrier(sycl::access::fence_space::local_space);
+    if (item_ct1.get_local_id(2) < WARPS) {
+        const int dd = item_ct1.get_group(2) * WARPS + item_ct1.get_local_id(2);
+        if (dd < n_embd) {
+            float m = 0.0f;
+#pragma unroll
+            for (int c = 0; c < hc; ++c) m += g[c][item_ct1.get_local_id(2)];
+            mixed[dd] = m / (float) hc;
+        }
+    }
+}
+
 /// `inject[c] = bf16(xn) @ w_inject[c]`, one value per stream: ONE WARP PER STREAM, lanes striding hc_dim.
 ///
 /// This mirrors `gr_down_kernel` rather than using a block-wide reduction.  `hc` is 4 at the real geometry,
@@ -375,10 +432,8 @@ __dpct_inline__ void gr_mean_kernel(const float *__restrict__ gated, int n_embd,
 /// work; a warp per stream is the same shape as the down projection and reuses its pattern exactly.  The
 /// whole kernel is one block of `32*hc` threads, which is small - and it is a 4-value output, so it is.
 template <typename Activation>
-__dpct_inline__ void gr_inject_kernel(const Activation *__restrict__ xq,
-                                      const uint16_t *__restrict__ w_inject,
-                                      int hc_dim, int hc,
-                                      float *__restrict__ inject) {
+void gr_inject_kernel(const Activation* __restrict__ xq, const uint16_t* __restrict__ w_inject,
+                                 int hc_dim, int hc, float* __restrict__ inject) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
     const int c = item_ct1.get_local_id(2) >> 5;
     if (c >= hc) return;
@@ -425,6 +480,7 @@ __dpct_inline__ void gr_write_kernel(const float *__restrict__ R,
 
 void gr_set_fp32_activations(bool enabled) { fp32_activations = enabled; }
 void gr_set_native_mmvf(bool enabled) { native_mmvf = enabled; }
+bool gr_native_mmvf_enabled() { return native_mmvf; }
 
 size_t gr_workspace_init(const GrShapes& s, void* base, GrWorkspace& out) {
     const size_t hc_dim = (size_t) s.hc * (size_t) s.n_embd;
@@ -487,6 +543,7 @@ void gr_read(const float *R, const float *w_norm, const uint16_t *w_down,
     // One setting selects every projection in this call. Captured graphs retain these kernel variants.
     const bool use_native = native_mmvf;
     const bool use_fp32 = fp32_activations || use_native;
+    const bool fused_gm = hc <= 4;   // gr_gate_mean_kernel's shared array holds hc <= 4 streams
     if (use_native) {
         if ((hc_dim & 1) != 0 || (hc_lr & 1) != 0)
             throw std::invalid_argument("gr_read native MMVF requires even hc*n_embd and hc_lr");
@@ -518,23 +575,46 @@ void gr_read(const float *R, const float *w_norm, const uint16_t *w_down,
         {
             auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
-            st->parallel_for<
-                dpct_kernel_name<class gr_down_kernel_6ff92b, float>>(
-                sycl::nd_range<3>(sycl::range(1, 1, hc_lr) *
-                                      sycl::range(1, 1, THREADS),
-                                  sycl::range(1, 1, THREADS)),
-                exp_props,
-                [=](sycl::nd_item<3> item_ct1)
-                    [[sycl::reqd_sub_group_size(32)]] {
-                        gr_down_kernel<float>(ws.xn, w_down, hc_dim, hc_lr, hc,
-                                              ws.lo);
-                    });
+            st->submit([&](sycl::handler &cgh) {
+                auto w_inject_nullptr_ct8 = w_inject != nullptr;
+
+                cgh.parallel_for<
+                    dpct_kernel_name<class gr_down_kernel_4b082c, float>>(
+                    sycl::nd_range<3>(
+                        sycl::range(1, 1,
+                                    hc_lr + (w_inject != nullptr ? 1 : 0)) *
+                            sycl::range(1, 1, THREADS),
+                        sycl::range(1, 1, THREADS)),
+                    exp_props,
+                    [=](sycl::nd_item<3> item_ct1)
+                        [[sycl::reqd_sub_group_size(32)]] {
+                            gr_down_kernel<float>(ws.xn, w_down, hc_dim, hc_lr,
+                                                  hc, ws.lo, w_inject, inject,
+                                                  w_inject_nullptr_ct8);
+                        });
+            });
         }
+        if (fused_gm)
         {
             auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
             st->parallel_for<
-                dpct_kernel_name<class gr_gate_kernel_abf73c, float>>(
+                dpct_kernel_name<class gr_gate_mean_kernel_f30bea, float>>(
+                sycl::nd_range<3>(
+                    sycl::range(1, 1, (n_embd + WARPS - 1) / WARPS) *
+                        sycl::range(1, 1, THREADS),
+                    sycl::range(1, 1, THREADS)),
+                exp_props,
+                [=](sycl::nd_item<3> item_ct1)
+                    [[sycl::reqd_sub_group_size(32)]] {
+                        gr_gate_mean_kernel<float>(ws.lo, w_up, ws.xn, hc_lr,
+                                                   n_embd, hc, mixed);
+                    });
+        } else {
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};
+
+            st->parallel_for<
+                dpct_kernel_name<class gr_gate_kernel_5f6dc0, float>>(
                 sycl::nd_range<3>(
                     sycl::range(1, 1, (hc_dim + WARPS - 1) / WARPS) *
                         sycl::range(1, 1, THREADS),
@@ -567,23 +647,46 @@ void gr_read(const float *R, const float *w_norm, const uint16_t *w_down,
         {
             auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
-            st->parallel_for<
-                dpct_kernel_name<class gr_down_kernel_518fbb, uint16_t>>(
-                sycl::nd_range<3>(sycl::range(1, 1, hc_lr) *
-                                      sycl::range(1, 1, THREADS),
-                                  sycl::range(1, 1, THREADS)),
-                exp_props,
-                [=](sycl::nd_item<3> item_ct1)
-                    [[sycl::reqd_sub_group_size(32)]] {
-                        gr_down_kernel<uint16_t>(ws.xq, w_down, hc_dim, hc_lr,
-                                                 hc, ws.lq);
-                    });
+            st->submit([&](sycl::handler &cgh) {
+                auto w_inject_nullptr_ct8 = w_inject != nullptr;
+
+                cgh.parallel_for<
+                    dpct_kernel_name<class gr_down_kernel_fc20f3, uint16_t>>(
+                    sycl::nd_range<3>(
+                        sycl::range(1, 1,
+                                    hc_lr + (w_inject != nullptr ? 1 : 0)) *
+                            sycl::range(1, 1, THREADS),
+                        sycl::range(1, 1, THREADS)),
+                    exp_props,
+                    [=](sycl::nd_item<3> item_ct1)
+                        [[sycl::reqd_sub_group_size(32)]] {
+                            gr_down_kernel<uint16_t>(
+                                ws.xq, w_down, hc_dim, hc_lr, hc, ws.lq,
+                                w_inject, inject, w_inject_nullptr_ct8);
+                        });
+            });
         }
+        if (fused_gm)
         {
             auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
             st->parallel_for<
-                dpct_kernel_name<class gr_gate_kernel_feafeb, uint16_t>>(
+                dpct_kernel_name<class gr_gate_mean_kernel_f110a6, uint16_t>>(
+                sycl::nd_range<3>(
+                    sycl::range(1, 1, (n_embd + WARPS - 1) / WARPS) *
+                        sycl::range(1, 1, THREADS),
+                    sycl::range(1, 1, THREADS)),
+                exp_props,
+                [=](sycl::nd_item<3> item_ct1)
+                    [[sycl::reqd_sub_group_size(32)]] {
+                        gr_gate_mean_kernel<uint16_t>(ws.lq, w_up, ws.xn, hc_lr,
+                                                      n_embd, hc, mixed);
+                    });
+        } else {
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};
+
+            st->parallel_for<
+                dpct_kernel_name<class gr_gate_kernel_b5468d, uint16_t>>(
                 sycl::nd_range<3>(
                     sycl::range(1, 1, (hc_dim + WARPS - 1) / WARPS) *
                         sycl::range(1, 1, THREADS),
@@ -596,7 +699,7 @@ void gr_read(const float *R, const float *w_norm, const uint16_t *w_down,
                     });
         }
     }
-    if (!use_native)
+    if (!use_native && !fused_gm)
     {
         auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
@@ -610,53 +713,9 @@ void gr_read(const float *R, const float *w_norm, const uint16_t *w_down,
             });
     }
     // Absent for the final mixer, and then nothing is written - computing an injection nobody reads would be
-    // a claim, not a convenience.
-    if (w_inject != nullptr) {
-        const int nthreads = 32 * hc;
-        if (use_native)
-            bf16_gemv_fp32_mmvf(ws.xn, w_inject, inject, hc_dim, hc, stream);
-        else if (use_fp32)
-            /*
-            DPCT1049: The work-group size passed to the SYCL kernel may
-            exceed the limit. To get the device limit, query
-            info::device::max_work_group_size. Adjust the work-group size if
-            needed.
-            */
-        {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{};
-
-            st->parallel_for<
-                dpct_kernel_name<class gr_inject_kernel_569ce0, float>>(
-                sycl::nd_range<3>(sycl::range(1, 1, nthreads),
-                                  sycl::range(1, 1, nthreads)),
-                exp_props,
-                [=](sycl::nd_item<3> item_ct1)
-                    [[sycl::reqd_sub_group_size(32)]] {
-                        gr_inject_kernel<float>(ws.xn, w_inject, hc_dim, hc,
-                                                inject);
-                    });
-        } else
-        /*
-        DPCT1049: The work-group size passed to the SYCL kernel may
-        exceed the limit. To get the device limit, query
-        info::device::max_work_group_size. Adjust the work-group size if
-        needed.
-        */
-        {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{};
-
-            st->parallel_for<
-                dpct_kernel_name<class gr_inject_kernel_d9aa02, uint16_t>>(
-                sycl::nd_range<3>(sycl::range(1, 1, nthreads),
-                                  sycl::range(1, 1, nthreads)),
-                exp_props,
-                [=](sycl::nd_item<3> item_ct1)
-                    [[sycl::reqd_sub_group_size(32)]] {
-                        gr_inject_kernel<uint16_t>(ws.xq, w_inject, hc_dim, hc,
-                                                   inject);
-                    });
-        }
-    }
+    // a claim, not a convenience.  The non-native calls compute it in the down grid's last block (Track F).
+    if (w_inject != nullptr && use_native)
+        bf16_gemv_fp32_mmvf(ws.xn, w_inject, inject, hc_dim, hc, stream);
 
     /*
     DPCT1010: SYCL uses exceptions to report errors and does not use the

@@ -44,7 +44,123 @@ T *dalloc(size_t n) {
 }
 }  // namespace
 
-int main() {
+// A decode-shaped microbench: a 32k pool, the 2,051-cell selection the QSA decoder gathers per layer, random
+// cells (so the reads miss L2).  Reports the gather's effective traffic per call and GB/s.  Not part of the test.
+int bench() {
+    k::QsaShapes s = k::qsa_real_shapes();
+    const int H = (int) s.n_head_kv, D = (int) s.head_dim, P = (int) s.page_size, G = D / k::KV_Q8_GROUP;
+    const int ctx = 32768, pages = ctx / P;
+    const long long rows = (long long) pages * H * P;
+    const int max_ids = (int) k::qsa_selection_width(ctx, s);
+    std::mt19937 rng(7);
+    std::vector<int8_t> kq((size_t) rows * D), vq((size_t) rows * D);
+    std::vector<uint16_t> ks((size_t) rows * G), vs((size_t) rows * G);
+    for (auto& x : kq) x = (int8_t) (rng() & 0xFF);
+    for (auto& x : vq) x = (int8_t) (rng() & 0xFF);
+    for (auto& x : ks) x = (uint16_t) (0x3000 | (rng() & 0x3FF));
+    for (auto& x : vs) x = (uint16_t) (0x3000 | (rng() & 0x3FF));
+    std::vector<int32_t> table(pages);
+    for (int i = 0; i < pages; ++i) table[i] = i;
+    std::shuffle(table.begin(), table.end(), rng);
+    std::vector<int32_t> ids(max_ids);
+    for (auto& x : ids) x = (int32_t) (rng() % ctx);
+    /*
+    DPCT1114: cudaMemcpy is migrated to asynchronization memcpy, assuming
+    in the original code the source host memory is pageable memory. If the
+    memory is not pageable, call wait() on event return by memcpy API to ensure
+    synchronization behavior.
+    */
+    int8_t *d_kq = dalloc<int8_t>(kq.size());
+        ck(DPCT_CHECK_ERROR(
+               (dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(d_kq, kq.data(), kq.size()).wait()),
+           "up");
+    /*
+    DPCT1114: cudaMemcpy is migrated to asynchronization memcpy, assuming
+    in the original code the source host memory is pageable memory. If the
+    memory is not pageable, call wait() on event return by memcpy API to ensure
+    synchronization behavior.
+    */
+    int8_t *d_vq = dalloc<int8_t>(vq.size());
+        ck(DPCT_CHECK_ERROR(
+               (dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(d_vq, vq.data(), vq.size()).wait()),
+           "up");
+    /*
+    DPCT1114: cudaMemcpy is migrated to asynchronization memcpy, assuming
+    in the original code the source host memory is pageable memory. If the
+    memory is not pageable, call wait() on event return by memcpy API to ensure
+    synchronization behavior.
+    */
+    uint16_t *d_ks = dalloc<uint16_t>(ks.size());
+        ck(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(d_ks, ks.data(),
+                                                              ks.size() * 2).wait()),
+           "up");
+    /*
+    DPCT1114: cudaMemcpy is migrated to asynchronization memcpy, assuming
+    in the original code the source host memory is pageable memory. If the
+    memory is not pageable, call wait() on event return by memcpy API to ensure
+    synchronization behavior.
+    */
+    uint16_t *d_vs = dalloc<uint16_t>(vs.size());
+        ck(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(d_vs, vs.data(),
+                                                              vs.size() * 2).wait()),
+           "up");
+    /*
+    DPCT1114: cudaMemcpy is migrated to asynchronization memcpy, assuming
+    in the original code the source host memory is pageable memory. If the
+    memory is not pageable, call wait() on event return by memcpy API to ensure
+    synchronization behavior.
+    */
+    int32_t *d_table = dalloc<int32_t>(pages);
+        ck(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(
+               d_table, table.data(), pages * 4).wait()),
+           "up");
+    /*
+    DPCT1114: cudaMemcpy is migrated to asynchronization memcpy, assuming
+    in the original code the source host memory is pageable memory. If the
+    memory is not pageable, call wait() on event return by memcpy API to ensure
+    synchronization behavior.
+    */
+    int32_t *d_ids = dalloc<int32_t>(max_ids);
+        ck(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(d_ids, ids.data(),
+                                                              max_ids * 4).wait()),
+           "up");
+    int32_t* d_step = dalloc<int32_t>(k::kStepCount);
+    int32_t hstep[k::kStepCount] = {0, 0, 0, max_ids};
+    /*
+    DPCT1114: cudaMemcpy is migrated to asynchronization memcpy, assuming
+    in the original code the source host memory is pageable memory. If the
+    memory is not pageable, call wait() on event return by memcpy API to ensure
+    synchronization behavior.
+    */
+    ck(DPCT_CHECK_ERROR(
+           (dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(d_step, hstep, sizeof hstep).wait()),
+       "up");
+    uint16_t* k8 = dalloc<uint16_t>((size_t) max_ids * H * D);
+    uint16_t* v8 = dalloc<uint16_t>((size_t) max_ids * H * D);
+    for (int i = 0; i < 5; ++i) k::kv_gather_q8_step(d_kq, d_vq, d_ks, d_vs, d_table, d_ids, d_step, max_ids, s, k8, v8, nullptr);
+    ck(DPCT_CHECK_ERROR(dpct::get_current_device().queues_wait_and_throw()),
+       "warmup");
+    const int reps = 200;
+    dpct::event_ptr e0, e1; e0 = new sycl::event(); e1 = new sycl::event();
+    dpct::sync_barrier(e0);
+    for (int r = 0; r < reps; ++r) k::kv_gather_q8_step(d_kq, d_vq, d_ks, d_vs, d_table, d_ids, d_step, max_ids, s, k8, v8, nullptr);
+    dpct::sync_barrier(e1); ck(DPCT_CHECK_ERROR(e1->wait_and_throw()), "time");
+    float ms = 0; ms = (e1->get_profiling_info<
+                            sycl::info::event_profiling::command_end>() -
+                        e0->get_profiling_info<
+                            sycl::info::event_profiling::command_start>()) /
+                       1000000.0f;
+    const double bytes = (double) max_ids * H * D * 2                       // K + V codes
+                       + (double) max_ids * H * G * 2 * 2                    // K + V scales
+                       + (double) max_ids * H * D * 2 * 2;                   // K + V fp16 scratch write
+    const double us = ms * 1000.0 / reps;
+    std::printf("kv_gather_q8 bench: %d ids, %.1f us/call, %.1f GB/s (%.2f MB moved)\n", max_ids, us,
+                bytes / (us * 1e-6) / 1e9, bytes / 1e6);
+    return 0;
+}
+
+int main(int argc, char** argv) {
+    for (int i = 1; i < argc; ++i) if (!std::strcmp(argv[i], "--bench")) return bench();
     k::QsaShapes s = k::qsa_real_shapes();
     s.page_size = 64;                                                              // several pages in a small pool
     const int H = (int) s.n_head_kv, D = (int) s.head_dim, P = (int) s.page_size, G = D / k::KV_Q8_GROUP;

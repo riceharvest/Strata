@@ -10,15 +10,23 @@
 
 #include <climits>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 
 namespace strata::core {
 
 NativeHead::~NativeHead() {
+    unload();
+}
+
+void NativeHead::unload() {
     if (weights_) strata::kernels::native_q6_k_unpack(weights_);
+    if (weights_) strata::kernels::native_q8_0_sm60_release(weights_);
     if (scratch_) sycl::free(scratch_, dpct::get_in_order_queue());
     if (weights_) sycl::free(weights_, dpct::get_in_order_queue());
+    scratch_ = nullptr;
+    weights_ = nullptr;
 }
 
 bool NativeHead::load(const std::vector<std::string> &shards, int64_t n_in,
@@ -84,6 +92,8 @@ bool NativeHead::load(const std::vector<std::string> &shards, int64_t n_in,
             return false;
         }
         weights_ = weights;
+        { int d = -1; if (DPCT_CHECK_ERROR(d = dpct::get_current_device_id()) ==
+                          0) device_ = d; }
         scratch_ = scratch;
         bytes_ = bytes;
         n_in_ = (int) n_in;
@@ -194,6 +204,57 @@ bool NativeEmbed::load(const std::vector<std::string> &shards, int64_t n_embd,
             return false;
         }
         strata::platform::advise_willneed(gguf.tensor_data(*t), bytes_);   // copied out of the mapping below
+        // STRATA_EMBED_VRAM=1: the table in the current device's VRAM instead of mapped host memory. The same
+        // bytes, read by the same gather kernels through dev_ (bitwise the same rows); what changes is where a
+        // prompt's scattered row reads go: over a PCIe Gen2 x4 link they cost more than the table's size in VRAM
+        // is worth. Taken only with the table plus 512 MiB free; otherwise, or when the upload fails, the mapped
+        // placement below is used as before (and the fallback is said).
+        if (const char* ev = std::getenv("STRATA_EMBED_VRAM"); ev != nullptr && ev[0] == '1') {
+            size_t free_b = 0, total_b = 0;
+            /*
+            DPCT1106: 'cudaMemGetInfo' was migrated with the Intel
+            extensions for device information which may not be supported by all
+            compilers or runtimes. You may need to adjust the code.
+            */
+            const bool have_free =
+                DPCT_CHECK_ERROR(dpct::get_current_device().get_memory_info(
+                    free_b, total_b)) == 0;
+            void* d = nullptr;
+            if (have_free &&
+                (uint64_t)free_b > bytes_ + ((uint64_t)512 << 20) &&
+                DPCT_CHECK_ERROR(d = (void *)sycl::malloc_device(
+                                     bytes_, dpct::get_in_order_queue())) ==
+                    0) {
+                /*
+                DPCT1114: cudaMemcpy is migrated to asynchronization
+                memcpy, assuming in the original code the source host memory is
+                pageable memory. If the memory is not pageable, call wait() on
+                event return by memcpy API to ensure synchronization behavior.
+                */
+                if (DPCT_CHECK_ERROR(dpct::get_in_order_queue().memcpy(
+                        d, gguf.tensor_data(*t), bytes_).wait()) == 0) {
+                    std::fprintf(stderr, "strata: native embedding: STRATA_EMBED_VRAM=1: %llu MiB placed in VRAM "
+                                         "(%llu MiB were free)\n",
+                                 (unsigned long long) (bytes_ >> 20), (unsigned long long) (free_b >> 20));
+                    dev_ = d;   // host_ stays null: the destructor frees dev_
+                    type_ = (int) t->type;
+                    n_embd_ = n_embd;
+                    n_vocab_ = n_vocab;
+                    return true;
+                }
+                (void)DPCT_CHECK_ERROR(
+                    sycl::free(d, dpct::get_in_order_queue()));
+            }
+            /*
+            DPCT1010: SYCL uses exceptions to report errors and does not
+            use the error codes. The cudaGetLastError function call was replaced
+            with 0. You need to rewrite this code.
+            */
+            (void)0;
+            std::fprintf(stderr, "strata: native embedding: STRATA_EMBED_VRAM=1 not taken (%llu MiB free, the table "
+                                 "needs %llu MiB plus 512 MiB): kept in mapped host memory\n",
+                         (unsigned long long) (have_free ? free_b >> 20 : 0), (unsigned long long) (bytes_ >> 20));
+        }
         /*
         DPCT1048: The original value cudaHostAllocMapped is not meaningful in
         the migrated code and was removed or replaced with 0. You may need to
@@ -219,10 +280,10 @@ bool NativeEmbed::load(const std::vector<std::string> &shards, int64_t n_embd,
                                      bytes_, dpct::get_in_order_queue())) !=
                     0 ||
                 /*
-                DPCT1114: cudaMemcpy is migrated to asynchronization memcpy,
-                assuming in the original code the source host memory is pageable
-                memory. If the memory is not pageable, call wait() on event
-                return by memcpy API to ensure synchronization behavior.
+                DPCT1114: cudaMemcpy is migrated to asynchronization
+                memcpy, assuming in the original code the source host memory is
+                pageable memory. If the memory is not pageable, call wait() on
+                event return by memcpy API to ensure synchronization behavior.
                 */
                 DPCT_CHECK_ERROR(dpct::get_in_order_queue().memcpy(
                     d, gguf.tensor_data(*t), bytes_).wait()) != 0) {

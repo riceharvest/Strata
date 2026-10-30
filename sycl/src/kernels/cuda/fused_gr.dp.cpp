@@ -14,6 +14,7 @@
 #include "strata/kernels/verify_kernels.hpp"
 #include "strata/kernels/fused_gr_q8.hpp"
 #include "strata/kernels/fused_gr_fused.hpp"
+#include "strata/sycl_doorbell.hpp"
 
 #include <atomic>
 #include <cstdio>
@@ -22,6 +23,9 @@
 #include <random>
 #include <string>
 #include <vector>
+#include <type_traits>
+#include <cmath>
+#include <time.h>
 
 namespace strata::kernels {
 namespace {
@@ -800,6 +804,92 @@ auto &lo = *sycl::ext::oneapi::group_local_memory_for_overwrite<
         for (int c = 0; c < HC; ++c) s += g[k][c][col];
         GR_PICK(m, k, mixed)[d0 + col] = s / (float) HC;
     }
+}
+
+// 149-cuda: the same up projection with one warp per row instead of eight rows per warp.  A block still covers all HC
+// streams x a few columns, so the cross-stream sum stays in local memory, and every row's dot, xor tree and epilogue
+// are gr_up_multi_kernel's - bitwise the same outputs.  8 warps cover 2 columns x 4 streams (8 rows), so the grid grows
+// from UPM_BLOCKS (160) to N/2 (1280).  OPT-IN here (STRATA_GR_UP_WIDE=1): upstream turns it on by default on a 12.0
+// card, which is not a B70 default; docs/INTEL.md measured nothing for it on Xe2.
+constexpr int UPW_COLS = 2;
+constexpr int UPW_BLOCKS = N / UPW_COLS;
+inline bool gr_up_wide_on() {
+    static const bool v = [] { const char* e = std::getenv("STRATA_GR_UP_WIDE"); return e && std::atoi(e) != 0; }();
+    return v;
+}
+__dpct_inline__ void gr_up_wide_kernel(GrMulti m) {
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    auto &lo = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[kFusedGrMaxT][LR]>(
+        sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    auto &g = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[kFusedGrMaxT][HC][UPW_COLS]>(
+        sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    const int t = item_ct1.get_local_id(2), lane = t & 31, warp = t >> 5;
+    const int T = m.T;
+    const int d0 = item_ct1.get_group(2) * UPW_COLS;
+    for (int i = t; i < T * LR; i += THREADS) {   // the down kernel's partial sums, as gr_up_multi_kernel's prologue
+        const int k = i / LR, r = i % LR;
+        float x = 0.0f;
+#pragma unroll
+        for (int sp = 0; sp < DOWN_SPLIT; ++sp) if (sp < m.nsplit) x += m.part[((size_t) sp * kFusedGrMaxT + k) * LR + r];
+        x /= (float) HC;
+        const float v = x / (1.0f + sycl::native::exp(-x));
+        lo[k][r] = v;
+        if (item_ct1.get_group(2) == 0) GR_PICK(m, k, lo)[r] = v;   // the same values in every block
+    }
+    item_ct1.barrier();
+    const int pk = lane < T ? lane : 0;
+    const float* const pR = GR_PICK(m, pk, R);
+    const float* const pWn = GR_PICK(m, pk, w_norm);
+    const float* const pRs = GR_PICK(m, pk, rs);
+    const bool pApply = GR_PICK(m, pk, apply);
+    const float* const pBo = GR_PICK(m, pk, bo_prev);
+    const float* const pIp = GR_PICK(m, pk, inj_prev);
+    float* const pRout = GR_PICK(m, pk, R_out);
+    if (warp < HC * UPW_COLS) {
+        const int c = warp / UPW_COLS, dd = warp - c * UPW_COLS, i = c * N + d0 + dd;
+        const sycl::uint4 *w4 = reinterpret_cast<const sycl::uint4 *>(m.a[0].w_up + (size_t)i * LR);
+        const sycl::uint4 wa = *(w4 + lane);
+        const sycl::uint4 wb = lane < LR / 8 - 32 ? *(w4 + 32 + lane) : sycl::uint4(0, 0, 0, 0);
+        float rv = 0.0f, wn = 0.0f, rsc = 0.0f, bo = 0.0f, ip = 0.0f;
+        bool apply = false;
+        if (lane < T) {
+            rv = pR[i];
+            wn = pWn[i];
+            rsc = pRs[c];
+            apply = pApply;
+            if (apply) { bo = pBo[d0 + dd]; ip = pIp[c]; }
+        }
+        float mine = 0.0f;
+#pragma unroll
+        for (int k = 0; k < kFusedGrMaxT; ++k) {
+            if (k >= T) break;
+            float acc = dot8(wa, lo[k] + lane * 8);
+            if (lane < LR / 8 - 32) acc += dot8(wb, lo[k] + (32 + lane) * 8);
+            acc = warp_sum(acc);
+            if (lane == k) mine = acc;
+        }
+        if (lane < T) {
+            if (apply) {
+                rv = sycl::fma(bo, 2.0f * sigmoidf_(ip / (float)HC), rv);
+                pRout[i] = rv;
+            }
+            const float x = rv * wn * rsc;
+            g[lane][c][dd] = x * sigmoidf_(mine);
+        }
+    }
+    item_ct1.barrier();
+    for (int i = t; i < T * UPW_COLS; i += THREADS) {
+        const int k = i / UPW_COLS, col = i - k * UPW_COLS;
+        float s = 0.0f;
+#pragma unroll
+        for (int c = 0; c < HC; ++c) s += g[k][c][col];
+        GR_PICK(m, k, mixed)[d0 + col] = s / (float) HC;
+    }
+}
+inline void launch_gr_up_wide(dpct::queue_ptr st, const GrMulti& m) {
+    st->parallel_for<dpct_kernel_name<class gr_up_wide_k>>(
+        sycl::nd_range<3>(sycl::range(1, 1, UPW_BLOCKS) * sycl::range(1, 1, THREADS), sycl::range(1, 1, THREADS)),
+        [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] { gr_up_wide_kernel(m); });
 }
 
 // gr_more_groups launches (BIG: large GRF, as gr_large_grf)
@@ -2475,15 +2565,53 @@ static float* down_partials(sycl::queue* q) {
     return p;
 }
 
-bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, void* stream, unsigned long long* stamp_buf,
-                         int stamp_i0) {
+// STRATA_HC_REQ8: `w_down` / `w_up` hold int8 codes with one fp32 scale per 32 values (`s_down` / `s_up`, FusedGrArgs).
+// SYCL port: the kernels here read bf16 rows, so the codes are expanded into a per-queue bf16 scratch first
+// (hc_q8_to_bf16, round to nearest even) and the read runs on that. Upstream's own Q8 kernels (ldw / dotw) are not
+// ported: the memory the Q8 weights save is kept, the bandwidth they would save is not. One expansion a call, ordered
+// on the queue (a graph capture records the launches; the scratch is allocated on first use, before any capture
+// through fused_gr_check's warm-up on the same queue).
+static uint16_t* req8_scratch(sycl::queue* q) {
+    static std::mutex mu;
+    static std::unordered_map<sycl::queue*, uint16_t*> bufs;
+    std::lock_guard<std::mutex> lk(mu);
+    auto it = bufs.find(q);
+    if (it != bufs.end()) return it->second;
+    uint16_t* p = sycl::malloc_device<uint16_t>((size_t) 2 * LR * D, *q);   // [w_down | w_up]
+    bufs[q] = p;
+    return p;
+}
+static void req8_expand(const FusedGrArgs& a, sycl::queue* q, void* stream, const uint16_t** wd, const uint16_t** wu) {
+    *wd = a.w_down;
+    *wu = a.w_up;
+    if (a.s_down == nullptr && a.s_up == nullptr) return;
+    uint16_t* buf = req8_scratch(q);
+    if (a.s_down != nullptr) {
+        hc_q8_to_bf16(a.w_down, a.s_down, buf, (long long) LR * D, stream);
+        *wd = buf;
+    }
+    if (a.s_up != nullptr) {
+        hc_q8_to_bf16(a.w_up, a.s_up, buf + (size_t) LR * D, (long long) LR * D, stream);
+        *wu = buf + (size_t) LR * D;
+    }
+}
+
+// One read of at most kFusedGrMaxT tokens: the kernels below are built for that many (the instantiations, the local
+// memory, the by-value launch argument), whatever the window is.
+static bool fused_gr_read_multi_slice(const FusedGrArgs* a, int n_tok, float* xn_scratch, void* stream,
+                                      unsigned long long* stamp_buf, int stamp_i0) {
     if (n_tok < 1 || n_tok > kFusedGrMaxT || xn_scratch == nullptr) {
         std::fprintf(stderr, "fused_gr_read_multi: invalid arguments\n");
         std::exit(1);
     }
     GrMulti m;
+    dpct::queue_ptr st = strata::q_of(stream);
+    const uint16_t *req_wd = nullptr, *req_wu = nullptr;
+    if (a != nullptr && n_tok >= 1 && (a[0].s_down != nullptr || a[0].s_up != nullptr)) req8_expand(a[0], st, stream, &req_wd, &req_wu);
     for (int t = 0; t < n_tok; ++t) {
         m.a[t] = a[t];
+        if (req_wd != nullptr && a[0].s_down != nullptr) { m.a[t].w_down = req_wd; m.a[t].s_down = nullptr; }
+        if (req_wu != nullptr && a[0].s_up != nullptr) { m.a[t].w_up = req_wu; m.a[t].s_up = nullptr; }
         const FusedGrArgs& x = a[t];
         if (!x.R || !x.w_norm || !x.w_down || !x.w_up || !x.lo || !x.rs || !x.mixed || (x.w_inject && !x.inject_out) ||
             (x.apply && (!x.bo_prev || !x.inj_prev || !x.R_out)) || x.w_down != a[0].w_down || x.w_up != a[0].w_up ||
@@ -2494,7 +2622,6 @@ bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
     }
     m.xn = xn_scratch;
     m.T = n_tok;
-    dpct::queue_ptr st = strata::q_of(stream);
     // STRATA_HC_Q8=1: the Q8_0 projections native_dense loaded (null otherwise: the BF16 read below, as before)
     if (a[0].q8_down != nullptr && a[0].q8_up != nullptr && gr_q8::read(m, st)) return false;
     // STRATA_GR_FUSED=1: the two-kernel BF16 read above (another summation order - opt-in; unset: the reads below)
@@ -2746,6 +2873,8 @@ bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
     if (gr_more_groups(st)) {
         if (gr_large_grf(st)) launch_gr_up_more<true>(st, m);
         else launch_gr_up_more<false>(st, m);
+    } else if (gr_up_wide_on()) {
+        launch_gr_up_wide(st, m);   // STRATA_GR_UP_WIDE=1 (opt-in): one warp a row, N/2 blocks; the same bits
     } else {
         launch_gr_up_multi(st, m, gr_large_grf(st));   // STRATA_GR_UP_COLS (16 default, 8, 4): the same bits; Arc A-series: large GRF
     }
@@ -2757,6 +2886,109 @@ bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
     const dpct::err0 e = 0;
     return false;   // SYCL port: the q8_1 images (S26 STRATA_QFUSE) are not built; the caller quantizes (the Q8_0 read: gr_q8 above)
 }
+
+// The multi read for a window of up to kFusedGrWideT tokens.  Up to kFusedGrMaxT tokens it is the read above untouched
+// (the same kernels, the same bits).  A wider window (9..16 rows: the batch groups of a four-card split) is read in
+// slices of at most kFusedGrMaxT tokens, in order on the stream.  Every token's outputs are strictly its own (no value
+// crosses tokens), so the slices are bitwise the one wide read; the cost is the hyper-connection weights read once per
+// slice.  The STRATA_QFUSE counters belong to token 0: each slice's first token carries them (the kernels zero them
+// again for the next launch); the profile stamps are the first slice's.
+bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, void* stream, unsigned long long* stamp_buf,
+                         int stamp_i0) {
+    if (n_tok <= kFusedGrMaxT) return fused_gr_read_multi_slice(a, n_tok, xn_scratch, stream, stamp_buf, stamp_i0);
+    if (n_tok > kFusedGrWideT || a == nullptr || xn_scratch == nullptr) {
+        std::fprintf(stderr, "fused_gr_read_multi: invalid arguments (%d tokens)\n", n_tok);
+        std::exit(1);
+    }
+    bool q8 = false;
+    for (int c0 = 0; c0 < n_tok; c0 += kFusedGrMaxT) {
+        const int ct = n_tok - c0 < kFusedGrMaxT ? n_tok - c0 : kFusedGrMaxT;
+        FusedGrArgs s[kFusedGrMaxT];
+        for (int k = 0; k < ct; ++k) s[k] = a[c0 + k];
+        s[0].q8_cnt = a[0].q8_cnt;
+        q8 = fused_gr_read_multi_slice(s, ct, xn_scratch + (size_t) c0 * D, stream, c0 == 0 ? stamp_buf : nullptr, stamp_i0);
+    }
+    return q8;
+}
+
+// STRATA_HC_Q8 on a bf16 pack: one warp a Q8_0 block, ggml's reference rounding (d = amax / 127 as fp16, q = round(x * (1 / d)))
+__dpct_inline__ void gr_quantize_q8_0_kernel(const uint16_t *__restrict__ w,
+                                             uint8_t *__restrict__ out,
+                                             int64_t nb) {
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    const int64_t b =
+        (int64_t)item_ct1.get_group(2) * 8 + (item_ct1.get_local_id(2) >> 5);
+    const int lane = item_ct1.get_local_id(2) & 31;
+    if (b >= nb) return;
+    const float v = sycl::bit_cast<float>((uint32_t)w[b * 32 + lane] << 16);
+    float amax = sycl::fabs(v);
+#pragma unroll
+    /*
+    DPCT1108: '__shfl_xor_sync' was migrated with the experimental feature
+    masked sub_group function which may not be supported by all compilers or
+    runtimes. You may need to adjust the code.
+    */
+    for (int o = 16; o > 0; o >>= 1) amax = sycl::fmax(
+        amax, dpct::experimental::permute_sub_group_by_xor(
+                  0xffffffffu,
+                  sycl::ext::oneapi::this_work_item::get_sub_group(), amax, o));
+    const float d = amax / 127.0f, id = d != 0.0f ? 1.0f / d : 0.0f;
+    uint8_t* o = out + b * 34;
+    if (lane == 0) {
+        const unsigned short h = sycl::bit_cast<unsigned short, sycl::half>(
+            sycl::vec<float, 1>(d)
+                .convert<sycl::half, sycl::rounding_mode::rte>()[0]);
+        o[0] = (uint8_t) (h & 255u);
+        o[1] = (uint8_t) (h >> 8);
+    }
+    o[2 + lane] = (uint8_t)(int8_t)sycl::rint(sycl::round(v * id));
+}
+
+__dpct_inline__ void gr_dequant_q8_0_kernel(const uint8_t *__restrict__ q8,
+                                            uint16_t *__restrict__ out,
+                                            int64_t nb) {
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    const int64_t b =
+        (int64_t)item_ct1.get_group(2) * 8 + (item_ct1.get_local_id(2) >> 5);
+    const int lane = item_ct1.get_local_id(2) & 31;
+    if (b >= nb) return;
+    const uint8_t* p = q8 + b * 34;
+    const float d =
+        sycl::vec<sycl::half, 1>(sycl::bit_cast<sycl::half, unsigned short>(
+                                     (unsigned short)(p[0] | (p[1] << 8))))
+            .convert<float, sycl::rounding_mode::automatic>()[0];
+    out[b * 32 + lane] = bf16_from_f32(d * (float) (int8_t) p[2 + lane]);
+}
+
+void fused_gr_dequant_q8_0(const uint8_t* q8, uint16_t* bf16, int64_t n_blocks, void* stream) {
+    auto exp_props = sycl::ext::oneapi::experimental::properties{};
+
+    strata::q_of(stream)
+        ->parallel_for<dpct_kernel_name<class gr_dequant_q8_0_kernel_3f77e8>>(
+            sycl::nd_range<3>(
+                sycl::range(1, 1, (unsigned)((n_blocks + 7) / 8)) *
+                    sycl::range(1, 1, 256),
+                sycl::range(1, 1, 256)),
+            exp_props, [=](sycl::nd_item<3> item_ct1) {
+                gr_dequant_q8_0_kernel(q8, bf16, n_blocks);
+            });
+}
+
+void fused_gr_quantize_q8_0(const uint16_t* bf16, uint8_t* out, int64_t n_blocks, void* stream) {
+    auto exp_props = sycl::ext::oneapi::experimental::properties{};
+
+    strata::q_of(stream)
+        ->parallel_for<dpct_kernel_name<class gr_quantize_q8_0_kernel_4213b5>>(
+            sycl::nd_range<3>(
+                sycl::range(1, 1, (unsigned)((n_blocks + 7) / 8)) *
+                    sycl::range(1, 1, 256),
+                sycl::range(1, 1, 256)),
+            exp_props,
+            [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
+                gr_quantize_q8_0_kernel(bf16, out, n_blocks);
+            });
+}
+
 
 // the bench only (AMD latency-hidden kernels): nothing to switch on the SYCL port
 void fused_gr_set_fast(int) {}
@@ -2773,6 +3005,15 @@ void fused_gr_read(const FusedGrArgs& a, void* stream) {
         std::exit(1);
     }
     dpct::queue_ptr st = strata::q_of(stream);
+    if (a.s_down != nullptr || a.s_up != nullptr) {   // STRATA_HC_REQ8: the read on the expanded bf16 rows
+        FusedGrArgs b = a;
+        const uint16_t *wd = nullptr, *wu = nullptr;
+        req8_expand(a, st, stream, &wd, &wu);
+        if (a.s_down != nullptr) { b.w_down = wd; b.s_down = nullptr; }
+        if (a.s_up != nullptr) { b.w_up = wu; b.s_up = nullptr; }
+        fused_gr_read(b, stream);
+        return;
+    }
     // SYCL port: the multi-token read's sliced down kernel and per-(token, stream) norm sum in their own orders, so a
     // window's token would differ in its last bits from this kernel's. The header promises "every token's outputs
     // are bitwise fused_gr_read(a[t])" (gr_parity checks it): with those paths on, the single read IS the multi read
@@ -3096,6 +3337,731 @@ void fused_gr_check() {
                  use >= kHcSplit ? "; checked bit for bit against the plain read on this card (STRATA_HC_SPLIT=1 or 0 "
                                    "for the earlier ones)" : "");
 }
+
+
+
+namespace {
+__dpct_inline__ void hc_q8_bf16_kernel(const int8_t *__restrict__ q,
+                                       const float *__restrict__ sc,
+                                       uint16_t *__restrict__ out,
+                                       long long n) {
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    const long long i =
+        (long long)item_ct1.get_group(2) * item_ct1.get_local_range(2) +
+        item_ct1.get_local_id(2);
+    if (i >= n) return;
+    const float v = sc[i / 32] * (float) q[i];
+    uint32_t b = sycl::bit_cast<unsigned int>(v);
+    b += 0x7fffu + ((b >> 16) & 1u);                  // round to nearest even (the values are finite)
+    out[i] = (uint16_t) (b >> 16);
+}
+}  // namespace
+
+void hc_q8_to_bf16(const void* codes, const float* scales, uint16_t* out, long long n, void* stream) {
+    auto exp_props = sycl::ext::oneapi::experimental::properties{};
+
+    strata::q_of(stream)
+        ->parallel_for<dpct_kernel_name<class hc_q8_bf16_kernel_d33924>>(
+            sycl::nd_range<3>(sycl::range(1, 1, (unsigned)((n + 255) / 256)) *
+                                  sycl::range(1, 1, 256),
+                              sycl::range(1, 1, 256)),
+            exp_props, [=](sycl::nd_item<3> item_ct1) {
+                hc_q8_bf16_kernel((const int8_t *)codes, scales, out, n);
+            });
+}
+
+// ================================== the read as ONE persistent kernel (opt-in STRATA_HC_PERSIST=1, CUDA + HIP) ==============
+// 80 blocks that must all be resident (a start-up run per T decides; larger T keep the default read) and two grid
+// barriers on an atomic counter.  Block b: (A) stages R' * w_norm for columns [128 b, 128 b + 128) (one stream) and writes
+// that slice's sum of squares and the UNSCALED partial dots of the 320 down + 4 inject rows (the v3 identity
+// w . xn = sum_c rs[c] (w[:, c] . x'[c])); barrier; (B) rs per stream, then rows (k, r) = b + 80 j reduced to lo / inject;
+// barrier; (C) the up projection read straight from VRAM, a thread pair per row, the epilogue as gr_up_kernel.
+// ANOTHER SUMMATION ORDER than the default read (not bitwise; the init check bounds the difference).  Only the verifier's hyper-connection reads use it: they run on one stream per card (both pipeline
+// verifiers share it), so two of these kernels never wait on each other; the drafter's reads keep the default kernels.
+#if defined(__HIPCC__) || defined(SYCL_LANGUAGE_VERSION)
+namespace {
+namespace hcp {
+// CUDA spells the shuffle with an explicit mask; HIP without.  One helper so the kernel body below stays portable.
+template <typename T> __dpct_inline__ T shfl_xor_persist(T v, int mask) {
+#if defined(__HIPCC__)
+    return __shfl_xor(v, mask);
+#else
+    /*
+    DPCT1108: '__shfl_xor_sync' was migrated with the experimental feature
+    masked sub_group function which may not be supported by all compilers or
+    runtimes. You may need to adjust the code.
+    */
+    return dpct::experimental::permute_sub_group_by_xor(
+        0xffffffffu, sycl::ext::oneapi::this_work_item::get_sub_group(), v,
+        mask);
+#endif
+}
+// Measured on gfx1030 (bench/results/2026-10-12-hc-persist-gfx1030): the gain over the three-kernel read is (1) the down
+// projection split by column slices over all 80 blocks (the default read runs 41 blocks staging the activations through
+// LDS) and (2) one launch with two grid barriers instead of three launches and the gaps between them.  Prefetching the
+// up weights (into registers or by touching them into L2 / Infinity Cache) and the epilogue inputs measured no gain on
+// gfx1030 and is gone: the 13 MB are read once from VRAM whichever way.
+constexpr int NB = 80, SL = D / NB, SPS = N / SL, UPC = N / NB, NR = LR + HC;
+static_assert(UPC * HC * 2 == THREADS, "a thread pair per up row");
+struct PArgs {
+    FusedGrArgs a[kFusedGrMaxT];
+    float* part;        // [T][NR][NB]
+    float* ssp;         // [T][NB]
+    unsigned* bar;      // [0] count, [32] generation, [48] abort (a barrier that timed out)
+    unsigned long long timeout_ticks;   // s_memrealtime ticks (100 MHz) a barrier waits before it aborts the read
+    double* partd;      // STRATA_HC_PERSIST=3 (a reference only): the partial dots and sums of squares in double
+    double* sspd;
+};
+// Returns false when the read was aborted: a block waited longer than `ticks` (the 80 blocks were not all resident - the
+// start-up check finds that out by running every T with a short timeout) or another block aborted.  Then every block
+// leaves the kernel; the outputs are not written completely and bar[48] stays set until the host clears the words.
+__dpct_inline__ bool grid_sync(unsigned *bar, unsigned long long ticks) {
+#if defined(__GFX11__) || defined(__GFX12__)
+    // gfx11 and gfx12 have no s_memrealtime (clang: "needs target feature s-memrealtime"), so no barrier clock: this read is not
+    // offered there (fused_gr_persist_init refuses it; an R9700 measured it neutral to 1% slower in #2226), and a launch that gets
+    // here anyway aborts at once instead of waiting for a barrier it cannot time.
+    (void) ticks;
+    if (threadIdx.x == 0) __hip_atomic_store(&bar[48], 1u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    return false;
+#elif defined(SYCL_LANGUAGE_VERSION)
+    // SYCL port: the same generation barrier. No clock64 / __nanosleep: the wait is a bounded spin (`ticks` is a count of
+    // reads here, see kTicksRun / kTicksCheck) on system-scope loads (strata::sys_load: a volatile read is served from the
+    // GPU's cache on Intel and never sees another work-group's store). The bound turns a card that cannot hold all NB
+    // work-groups resident into a wrong-but-short read (the start-up check finds that out) rather than a hang that
+    // wedges the GT.
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    auto &s_abort = *sycl::ext::oneapi::group_local_memory_for_overwrite<int>(
+        sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    item_ct1.barrier();
+    if (item_ct1.get_local_id(2) == 0) {
+        int ab = 0;
+        const unsigned gen = strata::sys_load(&bar[32]);
+        sycl::atomic_fence(sycl::memory_order::acq_rel, sycl::memory_scope::device);
+        const unsigned arrived =
+            dpct::atomic_fetch_add<sycl::access::address_space::generic_space>(&bar[0], 1u);
+        if (arrived == NB - 1) {
+            dpct::atomic_exchange<sycl::access::address_space::generic_space>(&bar[0], 0u);
+            sycl::atomic_fence(sycl::memory_order::acq_rel, sycl::memory_scope::device);
+            dpct::atomic_fetch_add<sycl::access::address_space::generic_space>(&bar[32], 1u);
+        } else {
+            unsigned long long spin = 0;
+            while (strata::sys_load(&bar[32]) == gen) {
+                if (strata::sys_load(&bar[48]) != 0u) { ab = 1; break; }
+                if (++spin > ticks) {
+                    dpct::atomic_exchange<sycl::access::address_space::generic_space>(&bar[48], 1u);
+                    ab = 1;
+                    break;
+                }
+            }
+        }
+        if (strata::sys_load(&bar[48]) != 0u) ab = 1;
+        s_abort = ab;
+    }
+    item_ct1.barrier();
+    sycl::atomic_fence(sycl::memory_order::acq_rel, sycl::memory_scope::device);
+    return s_abort == 0;
+#else
+    __shared__ int s_abort;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        int ab = 0;
+        const unsigned gen = __hip_atomic_load(&bar[32], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+        __threadfence();
+        const unsigned arrived = __hip_atomic_fetch_add(&bar[0], 1u, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT);
+        if (arrived == NB - 1) {
+            __hip_atomic_store(&bar[0], 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+            __hip_atomic_fetch_add(&bar[32], 1u, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
+        } else {
+            const unsigned long long t0 = __builtin_amdgcn_s_memrealtime();
+            while (__hip_atomic_load(&bar[32], __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT) == gen) {
+                if (__hip_atomic_load(&bar[48], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) != 0u) { ab = 1; break; }
+                if (__builtin_amdgcn_s_memrealtime() - t0 > ticks) {
+                    __hip_atomic_store(&bar[48], 1u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+                    ab = 1;
+                    break;
+                }
+                __builtin_amdgcn_s_sleep(1);
+            }
+        }
+        if (__hip_atomic_load(&bar[48], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) != 0u) ab = 1;
+        s_abort = ab;
+    }
+    __syncthreads();
+    __threadfence();
+    return s_abort == 0;
+#endif
+}
+// STRATA_HC_PERSIST=3 (a reference only, slow): every dot and sum accumulated in double
+__dpct_inline__ double dot8d(const sycl::uint4 w, const float *x) {
+    double acc = 0.0;
+    const unsigned u[4] = {w.x(), w.y(), w.z(), w.w()};
+#pragma unroll
+    for (int q = 0; q < 4; ++q) {
+        acc += (double)sycl::bit_cast<float>(u[q] << 16) * (double)x[2 * q];
+        acc += (double)sycl::bit_cast<float>(u[q] & 0xffff0000u) *
+               (double)x[2 * q + 1];
+    }
+    return acc;
+}
+template <int T, bool DP = false>
+/*
+DPCT1110: The total declared local variable size in device function
+persist_kernel exceeds 128 bytes and may cause high register pressure. Consult
+with your hardware vendor to find the total register size available and adjust
+the code, or use smaller sub-group size to avoid high register pressure.
+*/
+void persist_kernel(PArgs f) {
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    using A = typename std::conditional<DP, double, float>::type;
+    auto &xs =
+        *sycl::ext::oneapi::group_local_memory_for_overwrite<float[T][SL]>(
+            sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    auto &lo =
+        *sycl::ext::oneapi::group_local_memory_for_overwrite<float[T][LR]>(
+            sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    auto &s_rs =
+        *sycl::ext::oneapi::group_local_memory_for_overwrite<float[T][HC]>(
+            sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    auto &g =
+        *sycl::ext::oneapi::group_local_memory_for_overwrite<float[T][HC][UPC]>(
+            sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    const int tid = item_ct1.get_local_id(2), lane = tid & 31,
+              b = item_ct1.get_group(2);
+    const FusedGrArgs& a0 = f.a[0];
+    // (A) block b: columns [128 b, 128 b + 128) of D (one stream): R' * w_norm into LDS, the slice's sum of squares, and
+    // the UNSCALED partial dots of the 320 down + 4 inject rows (w . xn = sum_c rs[c] (w[:, c] . x'[c]))
+    const int c_b = b / SPS, col0 = b * SL;
+    if (tid < T * (SL / 4)) {
+        const int k = tid / (SL / 4), o4 = tid - k * (SL / 4);
+        const FusedGrArgs& a = f.a[k];
+        const int i = col0 + o4 * 4, d = i - c_b * N;
+        sycl::float4 r = *reinterpret_cast<const sycl::float4 *>(a.R + i);
+        if (a.apply) {
+            const float gw = 2.0f * sigmoidf_(a.inj_prev[c_b] / (float) HC);
+            const sycl::float4 bo =
+                *reinterpret_cast<const sycl::float4 *>(a.bo_prev + d);
+            r.x() = sycl::fma((float)(bo.x()), (float)gw, r.x());
+                r.y() = sycl::fma((float)(bo.y()), (float)gw, r.y());
+                r.z() = sycl::fma((float)(bo.z()), (float)gw, r.z());
+                r.w() = sycl::fma((float)(bo.w()), (float)gw, r.w());
+        }
+        const sycl::float4 gn =
+            *reinterpret_cast<const sycl::float4 *>(a.w_norm + i);
+        if constexpr (DP) {
+            double ss = (double)r.x() * r.x() + (double)r.y() * r.y() +
+                        (double)r.z() * r.z() + (double)r.w() * r.w();
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) ss += shfl_xor_persist(ss, o);
+            if (lane == 0) f.sspd[k * NB + b] = ss;
+        } else {
+            const float ss =
+                warp_sum(r.x() * r.x() + r.y() * r.y() + r.z() * r.z() +
+                         r.w() * r.w()); // warp k = token k
+            if (lane == 0) f.ssp[k * NB + b] = ss;
+        }
+        *reinterpret_cast<sycl::float4 *>(&xs[k][o4 * 4]) = sycl::float4(
+            r.x() * gn.x(), r.y() * gn.y(), r.z() * gn.z(), r.w() * gn.w());
+    }
+    /*
+    DPCT1065: Consider replacing sycl::nd_item::barrier() with
+    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
+    performance if there is no access to global memory.
+    */
+    item_ct1.barrier();
+    const int hw = tid >> 4, hl = tid & 15;
+    const bool inj = a0.w_inject != nullptr;
+    const int nrows = inj ? NR : LR;
+#pragma unroll 3
+    for (int r = hw; r < nrows; r += 16) {
+        const uint16_t* wrow = r < LR ? a0.w_down + (size_t) r * D : a0.w_inject + (size_t) (r - LR) * D;
+        /*
+        DPCT1098: The '*' expression is used instead of the __ldg call.
+        These two expressions do not provide the exact same functionality. Check
+        the generated code for potential precision and/or performance issues.
+        */
+        const sycl::uint4 w =
+            *(reinterpret_cast<const sycl::uint4 *>(wrow + col0) + hl);
+        A acc[T];
+#pragma unroll
+        for (int k = 0; k < T; ++k) {
+            A v;
+            if constexpr (DP) v = dot8d(w, &xs[k][hl * 8]); else v = dot8(w, &xs[k][hl * 8]);
+#pragma unroll
+            for (int o = 8; o > 0; o >>= 1) v += shfl_xor_persist(v, o);
+            acc[k] = v;
+        }
+#pragma unroll
+        for (int k = 0; k < T; ++k)
+            if (hl == k) {
+                if constexpr (DP) f.partd[((size_t) k * NR + r) * NB + b] = acc[k];
+                else f.part[((size_t) k * NR + r) * NB + b] = (float) acc[k];
+            }
+    }
+    if (!grid_sync(f.bar, f.timeout_ticks)) return;
+    // (B) rs per stream (every block), then rows (k, r) = b + 80 j reduced to lo / inject by the blocks in turn
+    if (tid < T * HC) {
+        const int k = tid / HC, c = tid - k * HC;
+        float rr;
+        if constexpr (DP) {
+            double sd = 0.0;
+#pragma unroll
+            for (int j = 0; j < SPS; ++j) sd += f.sspd[k * NB + c * SPS + j];
+            rr = (float)(1.0 / sycl::sqrt(sd / (double)N + (double)f.a[k].eps));
+        } else {
+            float s = 0.0f;
+#pragma unroll
+            for (int j = 0; j < SPS; ++j) s += f.ssp[k * NB + c * SPS + j];
+            rr = sycl::rsqrt(s / (float)N + f.a[k].eps);
+        }
+        s_rs[k][c] = rr;
+        if (b == 0) f.a[k].rs[c] = rr;
+    }
+    /*
+    DPCT1065: Consider replacing sycl::nd_item::barrier() with
+    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
+    performance if there is no access to global memory.
+    */
+    item_ct1.barrier();
+    for (int idx = b + NB * tid; idx < T * nrows; idx += NB * THREADS) {
+        const int k = idx / nrows, r = idx - k * nrows;
+        A sum = 0;
+        if constexpr (DP) {
+            const double* p1 = f.partd + ((size_t) k * NR + r) * NB;
+            for (int c = 0; c < HC; ++c) {
+                double p = 0.0;
+#pragma unroll
+                for (int j = 0; j < SPS; ++j) p += p1[c * SPS + j];
+                sum += (double) s_rs[k][c] * p;
+            }
+        } else {
+            const sycl::float4 *p4 = reinterpret_cast<const sycl::float4 *>(
+                f.part + ((size_t)k * NR + r) * NB);
+#pragma unroll
+            for (int c = 0; c < HC; ++c) {
+                float p = 0.0f;
+#pragma unroll
+                for (int j = 0; j < SPS / 4; ++j) {
+                    const sycl::float4 v = p4[c * (SPS / 4) + j];
+                    p += (v.x() + v.y()) + (v.z() + v.w());
+                }
+                sum = sycl::fma(s_rs[k][c], p, sum);
+            }
+        }
+        if (r < LR) {
+            const A x = sum / (A) HC;
+            f.a[k].lo[r] =
+                (float)(x / ((A)1 + (DP ? (A)sycl::exp((double)-x)
+                                        : (A)sycl::native::exp((float)-x))));
+        } else {
+            f.a[k].inject_out[r - LR] = (float) sum;
+        }
+    }
+    if (!grid_sync(f.bar, f.timeout_ticks)) return;
+    for (int idx = tid; idx < T * LR; idx += THREADS) {
+        const int k = idx / LR, r = idx - k * LR;
+        lo[k][r] = f.a[k].lo[r];
+    }
+    /*
+    DPCT1065: Consider replacing sycl::nd_item::barrier() with
+    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
+    performance if there is no access to global memory.
+    */
+    item_ct1.barrier();
+    // (C) the up projection, a thread pair per row (block b: columns 32 b .. 32 b + 31 of all four streams), then the
+    // epilogue as gr_up_kernel
+    {
+        const int d0 = b * UPC;
+        const int ur = tid >> 1, uh = tid & 1, uc = ur / UPC, udd = ur - uc * UPC, ui = uc * N + d0 + udd;
+        const sycl::uint4 *w4u =
+            reinterpret_cast<const sycl::uint4 *>(a0.w_up + (size_t)ui * LR) +
+            uh * 20;
+        A v[T];
+#pragma unroll
+        for (int k = 0; k < T; ++k) v[k] = 0;
+#pragma unroll 1
+        for (int j0 = 0; j0 < 20; j0 += 5) {   // five chunks a batch (all twenty at once costs registers)
+            sycl::uint4 w[5];
+#pragma unroll
+            /*
+            DPCT1098: The '*' expression is used instead of the __ldg call.
+            These two expressions do not provide the exact same functionality.
+            Check the generated code for potential precision and/or performance
+            issues.
+            */
+            for (int q = 0; q < 5; ++q) w[q] = *(w4u + j0 + q);
+#pragma unroll
+            for (int q = 0; q < 5; ++q)
+#pragma unroll
+                for (int k = 0; k < T; ++k) {
+                    if constexpr (DP) v[k] += dot8d(w[q], &lo[k][uh * 160] + (j0 + q) * 8);
+                    else v[k] += dot8(w[q], &lo[k][uh * 160] + (j0 + q) * 8);
+                }
+        }
+        float acc[T];
+#pragma unroll
+        for (int k = 0; k < T; ++k) acc[k] = (float) (v[k] + shfl_xor_persist(v[k], 1));
+        if (uh == 0) {
+            const float wn = a0.w_norm[ui];
+#pragma unroll
+            for (int k = 0; k < T; ++k) {
+                const FusedGrArgs& a = f.a[k];
+                float rv = a.R[ui];
+                if (a.apply) {
+                    rv = sycl::fma((float)(a.bo_prev[d0 + udd]),
+                                   2.0f * sigmoidf_(a.inj_prev[uc] / (float)HC),
+                                   rv);
+                    a.R_out[ui] = rv;
+                }
+                g[k][uc][udd] = rv * wn * s_rs[k][uc] * sigmoidf_(acc[k]);
+            }
+        }
+    }
+    /*
+    DPCT1065: Consider replacing sycl::nd_item::barrier() with
+    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
+    performance if there is no access to global memory.
+    */
+    item_ct1.barrier();
+    for (int idx = tid; idx < T * UPC; idx += THREADS) {
+        const int k = idx / UPC, col = idx - k * UPC;
+        float s = 0.0f;
+#pragma unroll
+        for (int c = 0; c < HC; ++c) s += g[k][c][col];
+        f.a[k].mixed[b * UPC + col] = s / (float) HC;
+    }
+}
+
+struct DevState {
+    float* part = nullptr;
+    float* ssp = nullptr;
+    double* partd = nullptr;
+    double* sspd = nullptr;
+    unsigned* bar = nullptr;
+    int max_t = 0;      // 0: off on this card
+    bool tried = false;
+};
+DevState g_dev[64];
+bool dp_on() {
+    static const bool dp = [] { const char* v = std::getenv("STRATA_HC_PERSIST"); return v != nullptr && std::atoi(v) == 3; }();
+    return dp;
+}
+// SYCL port: the barrier waits are bounded spins, not clock ticks. The start-up check (where a timeout means "not resident
+// here") gives up after one spin_max(queue) reads, a read after ten.
+constexpr unsigned long long kTicksRun = 10ULL, kTicksCheck = 1ULL;   // x strata::spin_max(queue)
+template <int T, bool DP>
+void launch_k(const PArgs& f, dpct::queue_ptr s) {
+    s->parallel_for<dpct_kernel_name<class persist_kernel_k, dpct_kernel_scalar<T * 2 + (DP ? 1 : 0)>>>(
+        sycl::nd_range<3>(sycl::range(1, 1, NB) * sycl::range(1, 1, THREADS), sycl::range(1, 1, THREADS)),
+        [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] { persist_kernel<T, DP>(f); });
+}
+template <bool DP>
+void launch_t(const PArgs& f, int T, dpct::queue_ptr s) {
+    switch (T) {
+        case 1: launch_k<1, DP>(f, s); break;
+        case 2: launch_k<2, DP>(f, s); break;
+        case 3: launch_k<3, DP>(f, s); break;
+        case 4: launch_k<4, DP>(f, s); break;
+        case 5: launch_k<5, DP>(f, s); break;
+        case 6: launch_k<6, DP>(f, s); break;
+        case 7: launch_k<7, DP>(f, s); break;
+        case 8: launch_k<8, DP>(f, s); break;
+        default: break;
+    }
+}
+void launch(const FusedGrArgs *a, int n_tok, const DevState &st,
+            dpct::queue_ptr s, unsigned long long ticks) {
+    PArgs f;
+    for (int t = 0; t < n_tok; ++t) f.a[t] = a[t];
+    f.part = st.part; f.ssp = st.ssp; f.bar = st.bar; f.partd = st.partd; f.sspd = st.sspd;
+    f.timeout_ticks = ticks * (unsigned long long) strata::spin_max(*s);
+    if (dp_on()) launch_t<true>(f, n_tok, s); else launch_t<false>(f, n_tok, s);
+}
+bool env_on() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_HC_PERSIST"); return v != nullptr && std::atoi(v) != 0; }();
+    return on;
+}
+}  // namespace hcp
+}  // namespace
+
+void fused_gr_persist_init() try {
+    if (!hcp::env_on()) return;
+    int dev = 0;
+    dev = dpct::get_current_device_id();
+    if (dev < 0 || dev >= 64 || hcp::g_dev[dev].tried) return;
+    hcp::DevState& st = hcp::g_dev[dev];
+    st.tried = true;
+    dpct::device_info prop{};
+    dpct::get_device(dev).get_device_info(prop);
+    if (prop.get_max_sub_group_size() != 32) {
+        std::fprintf(stderr,
+                     "strata hc: CUDA%d: STRATA_HC_PERSIST=1 is off here: the "
+                     "kernel is written for 32-lane waves "
+                     "(this card runs %d)\n",
+                     dev, prop.get_max_sub_group_size());
+        return;
+    }
+#if defined(__HIPCC__)
+    if (false) {
+        std::fprintf(stderr, "strata hc: CUDA%d: STRATA_HC_PERSIST=1 is off here: gfx11 / gfx12 have no s_memrealtime for the barrier "
+                             "timeout (written and measured for gfx1030; an R9700 saw no gain from it, #2226)\n", dev);
+        return;
+    }
+#endif
+    const int mp = prop.get_max_compute_units(); // only for the confirmation
+                                                 // line (WGPs on RDNA)
+    bool ok = DPCT_CHECK_ERROR(st.part = sycl::malloc_device<float>(
+                                   (size_t)kFusedGrMaxT * hcp::NR * hcp::NB,
+                                   dpct::get_in_order_queue())) == 0 &&
+              DPCT_CHECK_ERROR(st.ssp = sycl::malloc_device<float>(
+                                   (size_t)kFusedGrMaxT * hcp::NB,
+                                   dpct::get_in_order_queue())) == 0 &&
+              DPCT_CHECK_ERROR(st.bar = sycl::malloc_device<unsigned int>(
+                                   64, dpct::get_in_order_queue())) == 0 &&
+              DPCT_CHECK_ERROR(st.partd = sycl::malloc_device<double>(
+                                   (size_t)kFusedGrMaxT * hcp::NR * hcp::NB,
+                                   dpct::get_in_order_queue())) == 0 &&
+              DPCT_CHECK_ERROR(st.sspd = sycl::malloc_device<double>(
+                                   (size_t)kFusedGrMaxT * hcp::NB,
+                                   dpct::get_in_order_queue())) == 0 &&
+              DPCT_CHECK_ERROR(dpct::get_in_order_queue()
+                                   .memset(st.bar, 0, 64 * sizeof(unsigned))
+                                   .wait()) == 0;
+    if (!ok) {
+        /*
+        DPCT1026: The call to cudaGetLastError was removed because this
+        functionality is redundant in SYCL.
+        */
+        std::fprintf(stderr,
+                     "strata hc: CUDA%d: STRATA_HC_PERSIST=1 is off here: "
+                     "workspace allocation failed\n",
+                     dev);
+        return;
+    }
+    // the check: random weights and inputs with the pending write and the inject rows, against the default read; the
+    // persistent read sums in another order, so it is bounded, not bitwise.  Every T is RUN with a 50 ms barrier timeout; a
+    // timeout means "not resident here" and larger T keep the default read.  No occupancy API in front of it: it promised
+    // more than the card holds on 30 WGPs under HSA_CU_MASK (a hang without the timeout) and less than it holds with
+    // the HIP 7.1 runtime (1 block per WGP on 40 WGPs, which turned the read off although it runs resident).
+    std::mt19937 rng(11);
+    std::normal_distribution<float> nd(0.f, 1.f);
+    auto bf = [](float x) { uint32_t u; std::memcpy(&u, &x, 4); return (uint16_t) ((u + 0x7fff + ((u >> 16) & 1)) >> 16); };
+    const int TM = kFusedGrMaxT;
+    std::vector<float> R((size_t) TM * D), bo((size_t) TM * N), inj((size_t) TM * HC), wn(D);
+    for (auto& x : R) x = nd(rng);
+    for (auto& x : bo) x = 0.5f * nd(rng);
+    for (auto& x : inj) x = nd(rng);
+    for (auto& x : wn) x = 1.0f + 0.3f * nd(rng);
+    std::vector<uint16_t> wd((size_t) LR * D), wu((size_t) D * LR), wi((size_t) HC * D);
+    for (auto& x : wd) x = bf(0.02f * nd(rng));
+    for (auto& x : wu) x = bf(0.05f * nd(rng));
+    for (auto& x : wi) x = bf(0.02f * nd(rng));
+    float *dR, *dbo, *dinj, *dwn, *dxn, *dlo, *drs, *dio, *dmix;
+    uint16_t *dwd, *dwu, *dwi;
+    dR = (float *)sycl::malloc_device(R.size() * 4, dpct::get_in_order_queue());
+        dbo = (float *)sycl::malloc_device(bo.size() * 4,
+                                           dpct::get_in_order_queue());
+    dinj = (float *)sycl::malloc_device(inj.size() * 4,
+                                        dpct::get_in_order_queue());
+        dwn = (float *)sycl::malloc_device(wn.size() * 4,
+                                           dpct::get_in_order_queue());
+    dxn = (float *)sycl::malloc_device((size_t)TM * D * 4,
+                                       dpct::get_in_order_queue());
+        dlo = (float *)sycl::malloc_device((size_t)TM * LR * 4,
+                                           dpct::get_in_order_queue());
+    drs = (float *)sycl::malloc_device((size_t)TM * HC * 4,
+                                       dpct::get_in_order_queue());
+        dio = (float *)sycl::malloc_device((size_t)TM * HC * 4,
+                                           dpct::get_in_order_queue());
+    dmix = (float *)sycl::malloc_device((size_t)TM * N * 4,
+                                        dpct::get_in_order_queue());
+    dwd = (uint16_t *)sycl::malloc_device(wd.size() * 2,
+                                          dpct::get_in_order_queue());
+        dwu = (uint16_t *)sycl::malloc_device(wu.size() * 2,
+                                              dpct::get_in_order_queue());
+        dwi = (uint16_t *)sycl::malloc_device(wi.size() * 2,
+                                              dpct::get_in_order_queue());
+    /*
+    DPCT1114: cudaMemcpy is migrated to asynchronization memcpy, assuming
+    in the original code the source host memory is pageable memory. If the
+    memory is not pageable, call wait() on event return by memcpy API to ensure
+    synchronization behavior.
+    */
+    dpct::get_in_order_queue().memcpy(dbo, bo.data(), bo.size() * 4).wait();
+    /*
+    DPCT1114: cudaMemcpy is migrated to asynchronization memcpy, assuming
+    in the original code the source host memory is pageable memory. If the
+    memory is not pageable, call wait() on event return by memcpy API to ensure
+    synchronization behavior.
+    */
+    dpct::get_in_order_queue().memcpy(dinj, inj.data(), inj.size() * 4).wait();
+    /*
+    DPCT1114: cudaMemcpy is migrated to asynchronization memcpy, assuming
+    in the original code the source host memory is pageable memory. If the
+    memory is not pageable, call wait() on event return by memcpy API to ensure
+    synchronization behavior.
+    */
+    dpct::get_in_order_queue().memcpy(dwn, wn.data(), wn.size() * 4).wait();
+    /*
+    DPCT1114: cudaMemcpy is migrated to asynchronization memcpy, assuming
+    in the original code the source host memory is pageable memory. If the
+    memory is not pageable, call wait() on event return by memcpy API to ensure
+    synchronization behavior.
+    */
+    dpct::get_in_order_queue().memcpy(dwd, wd.data(), wd.size() * 2).wait();
+    /*
+    DPCT1114: cudaMemcpy is migrated to asynchronization memcpy, assuming
+    in the original code the source host memory is pageable memory. If the
+    memory is not pageable, call wait() on event return by memcpy API to ensure
+    synchronization behavior.
+    */
+    dpct::get_in_order_queue().memcpy(dwu, wu.data(), wu.size() * 2).wait();
+    /*
+    DPCT1114: cudaMemcpy is migrated to asynchronization memcpy, assuming
+    in the original code the source host memory is pageable memory. If the
+    memory is not pageable, call wait() on event return by memcpy API to ensure
+    synchronization behavior.
+    */
+    dpct::get_in_order_queue().memcpy(dwi, wi.data(), wi.size() * 2).wait();
+    double worst = 0.0;
+    int bad_t = 0, timeouts = 0;
+    // 0: the read agrees with the default read; 1: a barrier timed out (not resident); 2: wrong or a device error
+    auto check = [&](int T) -> int {
+        FusedGrArgs a[kFusedGrMaxT];
+#pragma unroll
+        for (int t = 0; t < T; ++t) {
+            a[t] = FusedGrArgs{};
+            a[t].R = dR + (size_t) t * D; a[t].R_out = dR + (size_t) t * D; a[t].apply = true;
+            a[t].bo_prev = dbo + (size_t) t * N; a[t].inj_prev = dinj + (size_t) t * HC;
+            a[t].w_norm = dwn; a[t].w_down = dwd; a[t].w_up = dwu; a[t].w_inject = dwi; a[t].eps = 1e-6f;
+            a[t].lo = dlo + (size_t) t * LR; a[t].rs = drs + (size_t) t * HC;
+            a[t].inject_out = dio + (size_t) t * HC; a[t].mixed = dmix + (size_t) t * N;
+        }
+        std::vector<float> out[2];
+        for (int which = 0; which < 2; ++which) {
+            dpct::get_in_order_queue()
+                .memcpy(dR, R.data(), R.size() * 4)
+                .wait();
+            dpct::get_in_order_queue()
+                .memset(dmix, 0xff, (size_t)TM * N * 4)
+                .wait();
+            dpct::get_in_order_queue()
+                .memset(dio, 0xff, (size_t)TM * HC * 4)
+                .wait();
+            dpct::get_current_device().queues_wait_and_throw();
+            if (which == 0) fused_gr_read_multi(a, T, dxn, nullptr);
+            else hcp::launch(a, T, st, &dpct::get_in_order_queue(),
+                             hcp::kTicksCheck);
+            /*
+            DPCT1026: The call to cudaGetLastError was removed because this
+            functionality is redundant in SYCL.
+            */
+            if (DPCT_CHECK_ERROR(
+                    dpct::get_current_device().queues_wait_and_throw()) != 0) {
+                ; return 2;
+            }
+            if (which == 1) {
+                unsigned abort_word = 0;
+                dpct::get_in_order_queue()
+                    .memcpy(&abort_word, st.bar + 48, sizeof abort_word)
+                    .wait();
+                if (abort_word != 0u) {
+                    dpct::get_in_order_queue()
+                        .memset(st.bar, 0, 64 * sizeof(unsigned))
+                        .wait();
+                    dpct::get_current_device().queues_wait_and_throw();
+                    return 1;
+                }
+            }
+            out[which].resize((size_t) T * (N + HC + D));
+            dpct::get_in_order_queue()
+                .memcpy(out[which].data(), dmix, (size_t)T * N * 4)
+                .wait();
+            dpct::get_in_order_queue()
+                .memcpy(out[which].data() + (size_t)T * N, dio,
+                        (size_t)T * HC * 4)
+                .wait();
+            dpct::get_in_order_queue()
+                .memcpy(out[which].data() + (size_t)T * (N + HC), dR,
+                        (size_t)T * D * 4)
+                .wait();
+        }
+        double mref = 0.0, md = 0.0;
+        bool finite = true;
+#pragma unroll
+        for (size_t i = 0; i < out[0].size(); ++i) {
+            finite = finite && sycl::isfinite(out[1][i]);
+            mref = std::fmax(mref, std::fabs((double) out[0][i]));
+            md = std::fmax(md, std::fabs((double) out[1][i] - out[0][i]));
+        }
+        const double rel = md / (mref > 0 ? mref : 1.0);
+        worst = std::fmax(worst, rel);
+        return finite && rel < 1e-4 ? 0 : 2;
+    };
+    int max_t = 0;
+    for (int T = 1; T <= kFusedGrMaxT && ok; ++T) {
+        const int r = check(T);
+        if (r == 1) ++timeouts; else if (r == 2) { bad_t = T; ok = false; }
+        if (r != 0) break;
+        max_t = T;
+    }
+    sycl::free(dR, dpct::get_in_order_queue());
+        sycl::free(dbo, dpct::get_in_order_queue());
+        sycl::free(dinj, dpct::get_in_order_queue());
+        sycl::free(dwn, dpct::get_in_order_queue());
+        sycl::free(dxn, dpct::get_in_order_queue());
+        sycl::free(dlo, dpct::get_in_order_queue());
+        sycl::free(drs, dpct::get_in_order_queue());
+    sycl::free(dio, dpct::get_in_order_queue());
+        sycl::free(dmix, dpct::get_in_order_queue());
+        sycl::free(dwd, dpct::get_in_order_queue());
+        sycl::free(dwu, dpct::get_in_order_queue());
+        sycl::free(dwi, dpct::get_in_order_queue());
+    dpct::get_in_order_queue().memset(st.bar, 0, 64 * sizeof(unsigned)).wait();
+    dpct::get_current_device().queues_wait_and_throw();
+    /*
+    DPCT1026: The call to cudaGetLastError was removed because this
+    functionality is redundant in SYCL.
+    */
+    if (!ok) {
+        std::fprintf(stderr, "strata hc: CUDA%d: STRATA_HC_PERSIST=1 is off here: the check failed at %d tokens "
+                             "(max relative difference %.3g)\n", dev, bad_t, worst);
+        return;
+    }
+    if (max_t == 0) {
+        std::fprintf(stderr, "strata hc: CUDA%d: STRATA_HC_PERSIST=1 is off here: 80 blocks are not resident at once on %d "
+                             "multiprocessors (the check timed out)\n", dev, mp);
+        return;
+    }
+    st.max_t = max_t;
+    std::fprintf(stderr, "strata hc: CUDA%d: STRATA_HC_PERSIST=1: the verifier's hyper-connection read runs as one "
+                         "persistent kernel (80 blocks on %d multiprocessors, up to %d tokens; %d token counts timed out in "
+                         "the check; checked against the default read, max relative difference %.2g)\n", dev, mp, max_t,
+                 timeouts, worst);
+}
+catch (sycl::exception const &exc) {
+  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
+            << ", line:" << __LINE__ << std::endl;
+  std::exit(1);
+}
+
+bool fused_gr_read_persist(const FusedGrArgs* a, int n_tok, void* stream) {
+    if (!hcp::env_on() || n_tok < 1) return false;
+    int dev = 0;
+    dev = dpct::get_current_device_id();
+    if (dev < 0 || dev >= 64) return false;
+    const hcp::DevState& st = hcp::g_dev[dev];
+    if (n_tok > st.max_t) return false;
+    if (a[0].q8_down != nullptr || a[0].q8_up != nullptr) return false;    // STRATA_HC_Q8: the default read
+    if (a[0].s_down != nullptr || a[0].s_up != nullptr) return false;      // STRATA_HC_REQ8: the default read
+    for (int t = 0; t < n_tok; ++t)
+        if (a[t].q8_mixed != nullptr) return false;                         // STRATA_QFUSE: the default read
+    hcp::launch(a, n_tok, st, strata::q_of(stream), hcp::kTicksRun);
+    return true;
+}
+#else
+void fused_gr_persist_init() {}
+bool fused_gr_read_persist(const FusedGrArgs*, int, void*) { return false; }
+#endif
 
 
 }  // namespace strata::kernels

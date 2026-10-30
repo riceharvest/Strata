@@ -5,6 +5,7 @@
 #include <dpct/dpct.hpp>
 #include "strata/sycl_queue.hpp"
 #include "strata/kernels/fused_gdn.hpp"
+#include "strata/core/geometry.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -17,6 +18,9 @@ static_assert(S == strata::core::kCompiledGeometry.ssm_state_size, "fused_gdn is
 constexpr int RG = 4;           // row groups
 constexpr int RPG = S / RG;     // 32 rows per thread
 
+// SILU: the output gate is SiLU(z) (Qwen3.6, qwen35moe) instead of sigmoid(z) (Flash-Next); a compile-time flag, so
+// the sigmoid instantiation is the kernel it was.
+template <bool SILU>
 /*
 DPCT1110: The total declared local variable size in device function
 gdn_step_norm_kernel exceeds 128 bytes and may cause high register pressure.
@@ -103,7 +107,9 @@ auto &sk = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[S]>(
         const float ss = wsum[0] + wsum[1] + wsum[2] + wsum[3];
         const float scale = sycl::rsqrt(ss / (float)S + eps);
         const float zz = z[head * S + col];
-        y[head * S + col] =
+        if constexpr (SILU) y[head * S + col] =
+            oc * scale * gamma[col] * (zz / (1.0f + sycl::native::exp(-zz)));
+        else y[head * S + col] =
             oc * scale * gamma[col] * (1.0f / (1.0f + sycl::native::exp(-zz)));
     }
 }
@@ -287,9 +293,10 @@ void fused_gdn_ab(const float* x, const uint16_t* w_alpha, const uint16_t* w_bet
     */
 }
 
-void fused_gdn_step_norm(float* state, const float* q, const float* k, const float* v, const float* gate,
-                         const float* beta, const float* z, const float* gamma, float eps, float* y, int h_k, int h_v,
-                         void* stream) {
+namespace {
+template <bool SILU>
+void step_norm(float* state, const float* q, const float* k, const float* v, const float* gate, const float* beta,
+               const float* z, const float* gamma, float eps, float* y, int h_k, int h_v, void* stream) {
     if (!state || !q || !k || !v || !gate || !beta || !z || !gamma || !y || h_k <= 0 || h_v <= 0 || h_v % h_k) {
         std::fprintf(stderr, "fused_gdn_step_norm: invalid arguments\n");
         std::exit(1);
@@ -303,15 +310,16 @@ void fused_gdn_step_norm(float* state, const float* q, const float* k, const flo
         auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         strata::q_of(stream)
-            ->parallel_for<dpct_kernel_name<class gdn_step_norm_kernel_51bed3>>(
+            ->parallel_for<dpct_kernel_name<class gdn_step_norm_kernel_51bed3,
+                                            dpct_kernel_scalar<SILU>>>(
                 sycl::nd_range<3>(sycl::range(1, 1, (unsigned)h_v) *
                                       sycl::range(1, RG, S),
                                   sycl::range(1, RG, S)),
                 exp_props,
                 [=](sycl::nd_item<3> item_ct1)
                     [[sycl::reqd_sub_group_size(32)]] {
-                        gdn_step_norm_kernel(state, q, k, v, gate, beta, z,
-                                             gamma, eps, y, h_k, h_v);
+                        gdn_step_norm_kernel<SILU>(state, q, k, v, gate, beta,
+                                                   z, gamma, eps, y, h_k, h_v);
                     });
     }
     /*
@@ -320,6 +328,19 @@ void fused_gdn_step_norm(float* state, const float* q, const float* k, const flo
     need to rewrite this code.
     */
     const dpct::err0 e = 0;
+}
+}  // namespace
+
+void fused_gdn_step_norm(float* state, const float* q, const float* k, const float* v, const float* gate,
+                         const float* beta, const float* z, const float* gamma, float eps, float* y, int h_k, int h_v,
+                         void* stream) {
+    step_norm<false>(state, q, k, v, gate, beta, z, gamma, eps, y, h_k, h_v, stream);
+}
+
+void fused_gdn_step_norm_silu(float* state, const float* q, const float* k, const float* v, const float* gate,
+                              const float* beta, const float* z, const float* gamma, float eps, float* y, int h_k,
+                              int h_v, void* stream) {
+    step_norm<true>(state, q, k, v, gate, beta, z, gamma, eps, y, h_k, h_v, stream);
 }
 
 }  // namespace strata::kernels

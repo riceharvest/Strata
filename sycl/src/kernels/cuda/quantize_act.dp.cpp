@@ -26,6 +26,9 @@
 #include <dpct/dpct.hpp>
 #include "strata/sycl_queue.hpp"
 #include "strata/kernels/quantize_act.hpp"
+#include "strata/kernels/quantize_act_dev.dp.hpp"
+#include "strata/kernels/swiglu.dp.hpp"
+#include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/f16_bits.hpp"
 
 #include <cmath>
@@ -53,34 +56,7 @@ __dpct_inline__ void quantize_q8_0_kernel(const float *__restrict__ x,
         (long long)item_ct1.get_group(2) * item_ct1.get_local_range(2) +
         item_ct1.get_local_id(2);
     if (b >= n_blocks) return;
-    const float* xb = x + b * QK8_0;
-    uint8_t* out = blocks + b * 34;                 // { fp16 d ; int8 qs[32] }
-
-    float amax = 0.0f;
-#pragma unroll
-    for (int i = 0; i < QK8_0; ++i) amax = sycl::fmax(amax, sycl::fabs(xb[i]));
-    if (amax == 0.0f) {
-        // ggml leaves the block zeroed: d = 0 and every q = 0.  Writing the fp16 zero explicitly rather than
-        // skipping keeps the block layout deterministic for the byte comparison.
-        const uint16_t zb = f16_from_f32(0.0f);
-        out[0] = (uint8_t) (zb & 0xFF);
-        out[1] = (uint8_t) (zb >> 8);
-#pragma unroll
-        for (int i = 0; i < QK8_0; ++i) out[2 + i] = 0;
-        return;
-    }
-    const float d32 = amax / 127.0f;
-    const uint16_t d16bits = f16_from_f32(d32);
-    out[0] = (uint8_t) (d16bits & 0xFF);
-    out[1] = (uint8_t) (d16bits >> 8);
-
-    // double division, matching the reference exactly (subtlety 2)
-    for (int i = 0; i < QK8_0; ++i) {
-        double q = sycl::rint((double)xb[i] / (double)d32);
-        if (q > 127.0) q = 127.0;
-        if (q < -128.0) q = -128.0;
-        out[2 + i] = (uint8_t) (int8_t) q;
-    }
+    quantize_q8_0_block(x + b * QK8_0, blocks + b * 34);
 }
 
 /// **THE HIT PATH'S QUANTIZER, AND IT EXISTS TO REPRODUCE `act_quant_q8_1` EXACTLY (R4.2h, round 331).**
@@ -109,29 +85,7 @@ __global__ void quantize_q8_0_scaled_kernel(const float* __restrict__ x, uint8_t
                                             float* __restrict__ scales, long long n_blocks) {
     const long long b = (long long) blockIdx.x * blockDim.x + threadIdx.x;
     if (b >= n_blocks) return;
-    const float* xb = x + b * QK8_0;
-    uint8_t* out = blocks + b * 34;
-
-    float amax = 0.0f;
-    for (int i = 0; i < QK8_0; ++i) amax = fmaxf(amax, fabsf(xb[i]));
-    // VERBATIM from `cpu/expert.cpp:144-145`, including the `amax > 0` guard, so the fp32 value written here
-    // is bit-identical to the `s` the CPU path used.
-    const float s = amax > 0.f ? amax / 127.f : 0.f;
-    const float inv = s > 0.f ? 1.f / s : 0.f;
-    scales[b] = s;
-
-    const uint16_t d16bits = f16_from_f32(s);
-    out[0] = (uint8_t) (d16bits & 0xFF);
-    out[1] = (uint8_t) (d16bits >> 8);
-    for (int i = 0; i < QK8_0; ++i) {
-        // VERBATIM from `cpu/expert.cpp:159-162`: reciprocal multiply, then `t + copysign(0.5, t)` truncated
-        // toward zero, which is `lround`'s rule - round half away from zero.
-        const float t = xb[i] * inv;
-        const float r = t + (t >= 0.f ? 0.5f : -0.5f);
-        int v = (int) r;
-        v = v < -127 ? -127 : (v > 127 ? 127 : v);
-        out[2 + i] = (uint8_t) (int8_t) v;
-    }
+    quantize_q8_0_scaled_block(x + b * QK8_0, blocks + b * 34, scales + b);
 }
 
 #else
@@ -207,18 +161,8 @@ __dpct_inline__ void dequant_q8_0_kernel(const uint8_t *__restrict__ blocks,
 constexpr int QK_K = 256;
 constexpr int Q8K_BYTES = 292;
 
-/// ggml's `nearest_int` (ggml-quants.c L621), transcribed rather than replaced.
-///
-/// The magic number is 1.5 * 2^23: adding it forces the mantissa's integer part into the low bits, and the
-/// mask/subtract recover it.  The reason it is transcribed and not written as `rintf` is that the two differ
-/// on exact ties - and that is the whole point of the constant, so a "cleaner" rewrite would silently change
-/// which way ties go.
-__dpct_inline__ int nearest_int_dev(float fval) {
-    const float val = fval + 12582912.0f;
-    int i;
-    memcpy(&i, &val, 4);
-    return (i & 0x007fffff) - 0x00400000;
-}
+// `nearest_int_dev` and the per-block quantizers live in `quantize_act_dev.cuh` (shared with the fused
+// kernels); the comment that used to justify this copy is there.
 
 __dpct_inline__ void quantize_q8_K_kernel(const float *__restrict__ x,
                                           uint8_t *__restrict__ blocks,
@@ -228,59 +172,7 @@ __dpct_inline__ void quantize_q8_K_kernel(const float *__restrict__ x,
         (long long)item_ct1.get_group(2) * item_ct1.get_local_range(2) +
         item_ct1.get_local_id(2);
     if (b >= n_blocks) return;
-    const float* xb = x + b * QK_K;
-    uint8_t* out = blocks + b * Q8K_BYTES;
-    float* d = (float*) out;
-    int8_t* qs = (int8_t*) (out + 4);
-    int16_t* bsums = (int16_t*) (out + 4 + QK_K);
-
-    // `max` is the SIGNED value at the largest magnitude position, and the comparison is STRICTLY greater,
-    // so a tie keeps the FIRST maximum - which is what `np.argmax` does in the reference transcription too.
-    float max = 0.0f, amax = 0.0f;
-    for (int j = 0; j < QK_K; ++j) {
-        const float ax = sycl::fabs(xb[j]);
-        if (ax > amax) {
-            amax = ax;
-            max = xb[j];
-        }
-    }
-    if (amax == 0.0f) {
-        // ggml writes d = 0 and zeroes qs, then `continue`s - which LEAVES bsums UNWRITTEN.  A zeroed block
-        // and an untouched one are indistinguishable to the dot product, but not to a byte comparison, so
-        // this zeroes bsums as well and the parity test's reference does the same.  Recorded because it is a
-        // deliberate divergence from the letter of the source.
-        *d = 0.0f;
-#pragma unroll
-        for (int j = 0; j < QK_K; ++j) qs[j] = 0;
-#pragma unroll
-        for (int j = 0; j < QK_K / 16; ++j) bsums[j] = 0;
-        return;
-    }
-    const float iscale = -127.0f / max;          // -127, NOT -128; see the header
-    for (int j = 0; j < QK_K; ++j) {
-        // `__fmul_rn`, NOT `iscale * xb[j]`.  ggml computes the product, ROUNDS IT TO F32, and then adds
-        // 12582912.0f inside `nearest_int`.  Written as a plain expression, nvcc CONTRACTS the multiply into
-        // the add as an FMA - which is a more accurate product but not the same one, and it flips the result
-        // wherever the true product sits just off a .5 boundary.  The first version of this kernel differed
-        // from the reference in 1 element of 524,288 for exactly this reason, and `__fmul_rn` pins the
-        // rounding step the source actually performs.
-        /*
-        DPCT1013: The rounding mode could not be specified and the generated
-        code may have different accuracy than the original code. Verify the
-        correctness. SYCL math built-in function rounding mode is aligned with
-        OpenCL C 1.2 standard.
-        */
-        const int v = nearest_int_dev(iscale * xb[j]);
-        qs[j] = (int8_t)sycl::min(
-            127, v); // MIN only - the source has no lower clamp
-    }
-    for (int j = 0; j < QK_K / 16; ++j) {
-        int sum = 0;
-#pragma unroll
-        for (int ii = 0; ii < 16; ++ii) sum += qs[j * 16 + ii];
-        bsums[j] = (int16_t) sum;
-    }
-    *d = 1.0f / iscale;
+    quantize_q8_K_block(x + b * QK_K, blocks + b * Q8K_BYTES);
 }
 
 __dpct_inline__ void dequant_q8_K_kernel(const uint8_t *__restrict__ blocks,
@@ -300,7 +192,279 @@ __dpct_inline__ void dequant_q8_K_kernel(const uint8_t *__restrict__ blocks,
     for (int i = 0; i < QK_K; ++i) out[i] = (float)qs[i] * d;
 }
 
+// ===================== fused silu(gate) * up + quantize =====================
+//
+// ONE kernel where two ran: `swiglu_kernel` wrote the products and the quantizer read them back.  The
+// products land in `gate_out` exactly as the standalone kernels stored them and the blocks are the same
+// bytes the standalone quantizers produced - the quantizer bodies (`quantize_act_dev.cuh`) run verbatim over
+// the shared products.  The swilu is PARALLEL (one lane per element): the first version ran 32 exp calls
+// serially per thread and measured SLOWER than the two kernels it replaced (M=8: +22.9%).
+//
+// `SwiluKind` selects the expression because the engine really has three (see `swiglu.cuh`); each is the
+// verbatim expression of the standalone kernel that this replaces.
+
+template <int KIND> __dpct_inline__ float swilu_apply(float g, float u) {
+    if constexpr (KIND == 0) return swilu_legacy(g, u);
+    else if constexpr (KIND == 1) return swilu_fast(g, u);
+    else return swilu_native(g, u);
+}
+
+// One WARP per 32-element block of pairs: lane j computes pair j (parallel exp), the products stage through
+// shared memory, then the quantizer body runs on them exactly as `quantize_q8_0_kernel` did.
+template <int KIND, bool SCALED>
+__dpct_inline__ void swilu_quantize_q8_0_kernel(const float *__restrict__ gate,
+                                                const float *__restrict__ up,
+                                                float *__restrict__ gate_out,
+                                                uint8_t *__restrict__ blocks,
+                                                float *__restrict__ scales,
+                                                long long n_blocks) {
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+auto &p =
+    *sycl::ext::oneapi::group_local_memory_for_overwrite<float[4][Q8_0_BLOCK]>(
+        sycl::ext::oneapi::this_work_item::get_work_group<
+            3>()); // one row per warp (4 warps per block)
+    const int warps_per_block = (int)(item_ct1.get_local_range(2) >> 5);
+    const long long b = (long long)item_ct1.get_group(2) * warps_per_block +
+                        (item_ct1.get_local_id(2) >> 5);
+    const int lane = item_ct1.get_local_id(2) & 31;
+    const int warp = item_ct1.get_local_id(2) >> 5;
+    if (b >= n_blocks) return;
+    const long long i0 = b * Q8_0_BLOCK;
+    const float v = swilu_apply<KIND>(gate[i0 + lane], up[i0 + lane]);
+    gate_out[i0 + lane] = v;
+    p[warp][lane] = v;
+    sycl::group_barrier(sycl::ext::oneapi::this_work_item::get_sub_group());
+    if (lane == 0) {
+        if constexpr (SCALED) quantize_q8_0_scaled_block(p[warp], blocks + b * 34, scales + b);
+        else quantize_q8_0_block(p[warp], blocks + b * 34);
+    }
+}
+
+// The same for the Q8_K contract (the shared expert's down projection): one warp per 256-element block,
+// lane j taking pairs j, j+32, ... so the 256 exp calls spread over the warp.
+template <int KIND>
+__dpct_inline__ void swilu_quantize_q8_K_kernel(const float *__restrict__ gate,
+                                                const float *__restrict__ up,
+                                                float *__restrict__ gate_out,
+                                                uint8_t *__restrict__ blocks,
+                                                long long n_blocks) {
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+auto &p = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[2][QK_K]>(
+    sycl::ext::oneapi::this_work_item::get_work_group<
+        3>()); // one row per warp (2 warps per block)
+    const int warps_per_block = (int)(item_ct1.get_local_range(2) >> 5);
+    const long long b = (long long)item_ct1.get_group(2) * warps_per_block +
+                        (item_ct1.get_local_id(2) >> 5);
+    const int lane = item_ct1.get_local_id(2) & 31;
+    const int warp = item_ct1.get_local_id(2) >> 5;
+    if (b >= n_blocks) return;
+    const long long i0 = b * QK_K;
+    for (int j = lane; j < QK_K; j += 32) {
+        const float v = swilu_apply<KIND>(gate[i0 + j], up[i0 + j]);
+        gate_out[i0 + j] = v;
+        p[warp][j] = v;
+    }
+    sycl::group_barrier(sycl::ext::oneapi::this_work_item::get_sub_group());
+    if (lane == 0) quantize_q8_K_block(p[warp], blocks + b * Q8K_BYTES);
+}
+
+template <int KIND>
+void swilu_quantize_q8_0_launch(const float* gate, const float* up, float* gate_out, int64_t n, uint8_t* blocks,
+                                float* scales, void* stream) {
+    const long long nb = n / QK8_0;
+    const int threads = 128;                                 // 4 warps = 4 blocks of 32 pairs
+    const unsigned grid = (unsigned) ((nb + 3) / 4);
+    if (scales != nullptr)
+    {
+        auto exp_props = sycl::ext::oneapi::experimental::properties{
+            sycl::ext::oneapi::experimental::use_root_sync};
+        dpct::has_capability_or_fail(
+            strata::q_of(stream)->get_device(),
+            {sycl::aspect::fp64});
+
+        strata::q_of(stream)
+            ->parallel_for<dpct_kernel_name<
+                class swilu_quantize_q8_0_kernel_ef821b,
+                dpct_kernel_scalar<KIND>, dpct_kernel_scalar<true>>>(
+                sycl::nd_range<3>(sycl::range(1, 1, grid) *
+                                      sycl::range(1, 1, threads),
+                                  sycl::range(1, 1, threads)),
+                exp_props, [=](sycl::nd_item<3> item_ct1) {
+                    swilu_quantize_q8_0_kernel<KIND, true>(gate, up, gate_out,
+                                                           blocks, scales, nb);
+                });
+    } else {
+        auto exp_props = sycl::ext::oneapi::experimental::properties{
+            sycl::ext::oneapi::experimental::use_root_sync};
+        dpct::has_capability_or_fail(
+            strata::q_of(stream)->get_device(),
+            {sycl::aspect::fp64});
+
+        strata::q_of(stream)
+            ->parallel_for<dpct_kernel_name<
+                class swilu_quantize_q8_0_kernel_a3976f,
+                dpct_kernel_scalar<KIND>, dpct_kernel_scalar<false>>>(
+                sycl::nd_range<3>(sycl::range(1, 1, grid) *
+                                      sycl::range(1, 1, threads),
+                                  sycl::range(1, 1, threads)),
+                exp_props, [=](sycl::nd_item<3> item_ct1) {
+                    swilu_quantize_q8_0_kernel<KIND, false>(
+                        gate, up, gate_out, blocks, nullptr, nb);
+                });
+    }
+    /*
+    DPCT1010: SYCL uses exceptions to report errors and does not use the
+    error codes. The cudaGetLastError function call was replaced with 0. You
+    need to rewrite this code.
+    */
+    const dpct::err0 e = 0;
+
+    if (stream == nullptr) dpct::get_current_device().queues_wait_and_throw();
+}
+
+// ===================== every activation image of x in ONE pass =====================
+//
+// The layer start quantized `x` with two or three kernels (Q8_0, Q8_K, bf16) - three reads of the same
+// buffer and three launches, per layer.  One kernel here produces whichever images the caller asks for;
+// every image's bytes are what its standalone kernel produced (the per-block math is shared, and each block
+// reads the same `x` values).  Null pointers skip that image.
+__dpct_inline__ void quantize_images_kernel(const float *__restrict__ x,
+                                            uint8_t *__restrict__ b80,
+                                            uint8_t *__restrict__ bK,
+                                            uint16_t *__restrict__ b16,
+                                            long long n) {
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    const long long i =
+        (long long)item_ct1.get_group(2) * item_ct1.get_local_range(2) +
+        item_ct1.get_local_id(2);
+    const long long nb80 = n / Q8_0_BLOCK;                       // 32-element blocks
+    if (i < nb80) {
+        if (b80 != nullptr) quantize_q8_0_block(x + i * Q8_0_BLOCK, b80 + i * Q8_0_BLOCK_BYTES);
+        if (b16 != nullptr)
+#pragma unroll
+            for (int j = 0; j < Q8_0_BLOCK; ++j)
+                b16[i * Q8_0_BLOCK + j] = bf16_from_f32(x[i * Q8_0_BLOCK + j]);
+    }
+    // q8_K blocks are 256 wide: the thread whose 32-block starts a super-block computes it (256 values in
+    // one thread, exactly as `quantize_q8_K_kernel` did).
+    if (bK != nullptr && (i % (Q8_K_BLOCK / Q8_0_BLOCK)) == 0) {
+        const long long k = i / (Q8_K_BLOCK / Q8_0_BLOCK);
+        if (i < nb80 && k < n / Q8_K_BLOCK) quantize_q8_K_block(x + k * Q8_K_BLOCK, bK + k * Q8_K_BLOCK_BYTES);
+    }
+}
+
 }  // namespace
+
+void swilu_quantize_q8_0(const float* gate, const float* up, float* gate_out, int64_t n, int swilu_kind,
+                         uint8_t* blocks, void* stream) {
+    if (n <= 0) return;
+    if (n % QK8_0 != 0) {
+        std::fprintf(stderr, "swilu_quantize_q8_0: n %lld is not a multiple of %d\n", (long long) n, QK8_0);
+        std::exit(1);
+    }
+    switch (swilu_kind) {
+        case 0: swilu_quantize_q8_0_launch<0>(gate, up, gate_out, n, blocks, nullptr, stream); break;
+        case 1: swilu_quantize_q8_0_launch<1>(gate, up, gate_out, n, blocks, nullptr, stream); break;
+        default: swilu_quantize_q8_0_launch<2>(gate, up, gate_out, n, blocks, nullptr, stream); break;
+    }
+}
+
+void swilu_quantize_q8_0_scaled(const float* gate, const float* up, float* gate_out, int64_t n, int swilu_kind,
+                                uint8_t* blocks, float* scales, void* stream) {
+    if (n <= 0) return;
+    if (n % QK8_0 != 0) {
+        std::fprintf(stderr, "swilu_quantize_q8_0_scaled: n %lld is not a multiple of %d\n", (long long) n, QK8_0);
+        std::exit(1);
+    }
+    if (scales == nullptr) {
+        std::fprintf(stderr, "swilu_quantize_q8_0_scaled: scales is null\n");
+        std::exit(1);
+    }
+    switch (swilu_kind) {
+        case 0: swilu_quantize_q8_0_launch<0>(gate, up, gate_out, n, blocks, scales, stream); break;
+        case 1: swilu_quantize_q8_0_launch<1>(gate, up, gate_out, n, blocks, scales, stream); break;
+        default: swilu_quantize_q8_0_launch<2>(gate, up, gate_out, n, blocks, scales, stream); break;
+    }
+}
+
+void swilu_quantize_q8_K(const float* gate, const float* up, float* gate_out, int64_t n, int swilu_kind,
+                         uint8_t* blocks, void* stream) {
+    if (n <= 0) return;
+    if (n % QK_K != 0) {
+        std::fprintf(stderr, "swilu_quantize_q8_K: n %lld is not a multiple of %d\n", (long long) n, QK_K);
+        std::exit(1);
+    }
+    const long long nb = n / QK_K;
+    const int threads = 64;                                  // 2 warps = 2 blocks of 256 pairs
+    const unsigned grid = (unsigned) ((nb + 1) / 2);
+    switch (swilu_kind) {
+    case 0: {
+        auto exp_props = sycl::ext::oneapi::experimental::properties{
+            sycl::ext::oneapi::experimental::use_root_sync};
+        dpct::has_capability_or_fail(
+            strata::q_of(stream)->get_device(),
+            {sycl::aspect::fp64});
+
+        strata::q_of(stream)
+            ->parallel_for<
+                dpct_kernel_name<class swilu_quantize_q8_K_kernel_23059e,
+                                 dpct_kernel_scalar<0>>>(
+                sycl::nd_range<3>(sycl::range(1, 1, grid) *
+                                      sycl::range(1, 1, threads),
+                                  sycl::range(1, 1, threads)),
+                exp_props, [=](sycl::nd_item<3> item_ct1) {
+                    swilu_quantize_q8_K_kernel<0>(gate, up, gate_out, blocks,
+                                                  nb);
+                });
+    } break;
+    case 1: {
+        auto exp_props = sycl::ext::oneapi::experimental::properties{
+            sycl::ext::oneapi::experimental::use_root_sync};
+        dpct::has_capability_or_fail(
+            strata::q_of(stream)->get_device(),
+            {sycl::aspect::fp64});
+
+        strata::q_of(stream)
+            ->parallel_for<
+                dpct_kernel_name<class swilu_quantize_q8_K_kernel_c211c4,
+                                 dpct_kernel_scalar<1>>>(
+                sycl::nd_range<3>(sycl::range(1, 1, grid) *
+                                      sycl::range(1, 1, threads),
+                                  sycl::range(1, 1, threads)),
+                exp_props, [=](sycl::nd_item<3> item_ct1) {
+                    swilu_quantize_q8_K_kernel<1>(gate, up, gate_out, blocks,
+                                                  nb);
+                });
+    } break;
+    default: {
+        auto exp_props = sycl::ext::oneapi::experimental::properties{
+            sycl::ext::oneapi::experimental::use_root_sync};
+        dpct::has_capability_or_fail(
+            strata::q_of(stream)->get_device(),
+            {sycl::aspect::fp64});
+
+        strata::q_of(stream)
+            ->parallel_for<
+                dpct_kernel_name<class swilu_quantize_q8_K_kernel_46d576,
+                                 dpct_kernel_scalar<2>>>(
+                sycl::nd_range<3>(sycl::range(1, 1, grid) *
+                                      sycl::range(1, 1, threads),
+                                  sycl::range(1, 1, threads)),
+                exp_props, [=](sycl::nd_item<3> item_ct1) {
+                    swilu_quantize_q8_K_kernel<2>(gate, up, gate_out, blocks,
+                                                  nb);
+                });
+    } break;
+    }
+    /*
+    DPCT1010: SYCL uses exceptions to report errors and does not use the
+    error codes. The cudaGetLastError function call was replaced with 0. You
+    need to rewrite this code.
+    */
+    const dpct::err0 e = 0;
+
+    if (stream == nullptr) dpct::get_current_device().queues_wait_and_throw();
+}
 
 void quantize_q8_0(const float* x, uint8_t* blocks, int64_t n, void* stream) {
     if (n <= 0) return;
@@ -454,6 +618,46 @@ void dequant_q8_K(const uint8_t* blocks, float* x, int64_t n, void* stream) {
                                   sycl::range(1, 1, threads)),
                 exp_props, [=](sycl::nd_item<3> item_ct1) {
                     dequant_q8_K_kernel(blocks, x, nb);
+                });
+    }
+    /*
+    DPCT1010: SYCL uses exceptions to report errors and does not use the
+    error codes. The cudaGetLastError function call was replaced with 0. You
+    need to rewrite this code.
+    */
+    const dpct::err0 e = 0;
+
+    if (stream == nullptr) dpct::get_current_device().queues_wait_and_throw();
+}
+
+void quantize_act_images(const float* x, int64_t n, uint8_t* q8_0_blocks, uint8_t* q8_K_blocks,
+                         uint16_t* bf16, void* stream) {
+    if (n <= 0) return;
+    if (q8_0_blocks == nullptr && q8_K_blocks == nullptr && bf16 == nullptr) return;
+    if (n % Q8_0_BLOCK != 0 || (q8_K_blocks != nullptr && n % QK_K != 0)) {
+        std::fprintf(stderr, "quantize_act_images: n %lld must be a multiple of %d (and %d for Q8_K)\n",
+                     (long long) n, Q8_0_BLOCK, QK_K);
+        std::exit(1);
+    }
+    const long long nb = n / Q8_0_BLOCK;
+    const int threads = 128;
+    const unsigned grid = (unsigned) ((nb + threads - 1) / threads);
+    {
+        auto exp_props = sycl::ext::oneapi::experimental::properties{
+            sycl::ext::oneapi::experimental::use_root_sync};
+        dpct::has_capability_or_fail(
+            strata::q_of(stream)->get_device(),
+            {sycl::aspect::fp64});
+
+        strata::q_of(stream)
+            ->parallel_for<
+                dpct_kernel_name<class quantize_images_kernel_8f02b3>>(
+                sycl::nd_range<3>(sycl::range(1, 1, grid) *
+                                      sycl::range(1, 1, threads),
+                                  sycl::range(1, 1, threads)),
+                exp_props, [=](sycl::nd_item<3> item_ct1) {
+                    quantize_images_kernel(x, q8_0_blocks, q8_K_blocks, bf16,
+                                           n);
                 });
     }
     /*

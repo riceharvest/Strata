@@ -4,8 +4,12 @@
 #include <dpct/dpct.hpp>
 #include "strata/sycl_queue.hpp"
 #include "strata/core/mtp.hpp"
+#include "strata/core/pin_budget.hpp"
+#include "strata/kernels/qsa_prompt_attn.hpp"
 #include "strata/core/coupled_draft.hpp"
+#include "strata/core/spec_prob.hpp"
 #include "strata/core/on_device.hpp"
+#include "strata/core/progress.hpp"
 
 #include "strata/core/native_head.hpp"
 #include "strata/core/peer_experts.hpp"
@@ -32,6 +36,7 @@
 #include "strata/kernels/shared_expert.hpp"
 #include "strata/kernels/verify_kernels.hpp"
 #include "strata/kernels/ngram.hpp"
+#include "strata/kernels/gfx_arch.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -43,11 +48,7 @@
 #include <fstream>
 #include <sstream>
 #include <vector>
-#if defined(_WIN32)
-#include <intrin.h>
-#elif defined(__x86_64__)
-#include <immintrin.h>
-#endif
+#include "strata/platform/cpu_relax.hpp"
 
 #ifdef STRATA_NATIVE_EXPERTS
 #include "ggml.h"   // --mtp-q4: the head rows' and projections' formats, dequantized and requantized at load
@@ -149,6 +150,7 @@ MtpDrafter::~MtpDrafter() {
     if (cscratch_) sycl::free(cscratch_, dpct::get_in_order_queue());
     if (h_cparams_) sycl::free(h_cparams_, dpct::get_in_order_queue());
     if (h_chist_) sycl::free(h_chist_, dpct::get_in_order_queue());
+    if (h_q_) strata::host_free_polled(h_q_, dpct::get_in_order_queue());
     if (cs_) dpct::get_current_device().destroy_queue(cs_);
     if (side_) dpct::get_current_device().destroy_queue(side_);
     if (sh_fork_) dpct::destroy_event(sh_fork_);
@@ -167,7 +169,7 @@ MtpDrafter::~MtpDrafter() {
         sycl::free(dvocab_, dpct::get_in_order_queue());
     if (ev_chain_) dpct::destroy_event(ev_chain_);
     for (dpct::event_ptr e : ev_step_) if (e) dpct::destroy_event(e);
-    void* hosts[] = {h_tok_, h_step_, h_pos_, h_row_, h_out_, h_prob_, h_force_};
+    void* hosts[] = {h_tok_, h_step_, h_pos_, h_row_, h_out_, h_prob_, h_force_, h_floor_};
     for (void *h : hosts) if (h) strata::host_free_polled(h, dpct::get_in_order_queue());
 }
 
@@ -274,7 +276,8 @@ bool MtpDrafter::load(const std::string &rt_dir, const ModelGeometry &g,
     if (ple_ss_ == nullptr) ple_ss_ = &ss;
     max_t_ = max_t;
     rt_dir_ = rt_dir;
-    if (max_t < 1 || max_t > strata::kernels::kVerifyMaxT) { err = "mtp: max_t out of range"; return false; }
+    // (the draft layer's kernels - the resident grouping, the grouped experts, the fused reads - are built for the narrow window)
+    if (max_t < 1 || max_t > strata::kernels::kVerifyNarrowT) { err = "mtp: max_t out of range"; return false; }
     if (shared != nullptr) {
         if (shared->device_ != device_ || shared->g_ != &g || shared->dense_ == nullptr ||
             shared->experts_ == nullptr || shared->rt_dir_ != rt_dir) {
@@ -419,6 +422,7 @@ bool MtpDrafter::load(const std::string &rt_dir, const ModelGeometry &g,
 
     // ---- buffers
     window_ = (window > 0 && window < max_cells) ? window : 0;
+    if (floor_on_ && !mapped(64, (void**) &h_floor_, (void**) &m_floor_)) { err = "mtp: the window floor does not fit"; return false; }
     cap_ = (((window_ > 0 ? window_ : max_cells) + 63) / 64) * 64;
     attn_scratch_floats_ = (int64_t) strata::kernels::qsa_decode_attn_scratch_floats(cap_, s);
     const uint64_t T = (uint64_t) max_t, N = (uint64_t) g.n_embd, HC = (uint64_t) g.hc, K = (uint64_t) ss.k;
@@ -450,6 +454,11 @@ bool MtpDrafter::load(const std::string &rt_dir, const ModelGeometry &g,
         logits_ = b.take<float>(T * (uint64_t) g.n_expert); w_ = b.take<float>(T * K); ids_ = b.take<int32_t>(T * K);
         shared_ = b.take<float>(T * N); parts_ = b.take<float>(T * K * N); y_ = b.take<float>(T * N);
         sample_ = b.take<float>(T * N);
+        {
+            const strata::kernels::GrShapes gsh{g.n_embd, g.hc, g.hc_lr};
+            uint8_t* gr_mem = b.take<uint8_t>(strata::kernels::gr_workspace_bytes(gsh));
+            if (gr_mem != nullptr) strata::kernels::gr_workspace_init(gsh, gr_mem, own_gr_);
+        }
         hit_slot_ = b.take<int32_t>(T * K); hit_dst_ = b.take<int32_t>(T * K); hit_count_ = b.take<int32_t>(4);
         grp_ptr_ = b.take<unsigned long long>(T * K); grp_start_ = b.take<int32_t>(T * K + 1);
         grp_counts_ = b.take<int32_t>(4);
@@ -624,6 +633,11 @@ bool MtpDrafter::setup_coupled(std::string& err) try {
         err = "mtp: the coupled draft sampler's buffers do not fit";
         return false;
     }
+    if (spec_prob_env() &&
+        !mapped((size_t) max_t_ * (size_t) kSpecQStride * sizeof(int32_t), (void**) &h_q_, (void**) &m_q_)) {
+        err = "mtp: the draft distributions' buffer does not fit";
+        return false;
+    }
     q.memset(cring_, 0xff, ring).wait();   // -1: no token
     std::fill(h_chist_, h_chist_ + kCoupledHistCap, -1);
     vram_ += sizeof(strata::kernels::SamplerParams) + ring + scratch;
@@ -656,8 +670,15 @@ bool MtpDrafter::setup_coupled(std::string& err) try {
         return false;
     }
     coupled_ok_ = true;
-    std::fprintf(stderr, "strata mtp: coupled draft sampling on (STRATA_SPEC_COUPLED): sampled requests draft with the "
-                         "target's chain and Philox draw over %lld tokens\n", (long long) nv);
+    if (spec_prob_env())
+        std::fprintf(stderr, "strata mtp: probabilistic draft acceptance on (STRATA_SPEC_PROB): sampled requests draft by "
+                             "sampling the draft head's distribution over %lld tokens; %s\n", (long long) nv,
+                     spec_gate_pick()
+                         ? "pick gate: masked mu offers, min(1, p/mu) acceptance and (p-mu)+ rejection/NULL residuals"
+                         : "top gate (compatibility): q offers, min(1, p/q) acceptance and (p-q)+ rejection residuals");
+    else
+        std::fprintf(stderr, "strata mtp: coupled draft sampling on (STRATA_SPEC_COUPLED): sampled requests draft with the "
+                             "target's chain and Philox draw over %lld tokens\n", (long long) nv);
     return true;
 } catch (sycl::exception const& e) {
     err = std::string("mtp: coupled setup: ") + e.what();
@@ -665,7 +686,7 @@ bool MtpDrafter::setup_coupled(std::string& err) try {
 }
 
 void MtpDrafter::set_draft_sampling(const strata::kernels::SamplerParams& sp) {
-    coupled_active_ = coupled_ok_ && !sp.greedy && sp.temperature > 0.0f;
+    coupled_active_ = coupled_ok_ && !sp.greedy && sp.temperature > 0.0f && sp.temperature >= spec_min_temp();
     if (!coupled_active_) return;
     *h_cparams_ = sp;   // read by the next round graph (after the previous one has synced)
     std::fill(h_chist_, h_chist_ + kCoupledHistCap, -1);
@@ -768,7 +789,37 @@ bool MtpDrafter::bind(const WeightTable &wt, const NativeHead *head,
             dvocab_host_.resize((size_t) n_dvocab_);
             std::memcpy(dvocab_host_.data(), raw.data(), raw.size());
             bool planar_gathered = false;
-            if (head->type() == 14 && strata::kernels::native_q6_k_is_planar(head->weights()) && !q4_head_) {
+            const int head_dev = head->device();
+            if (head_dev >= 0 && head_dev != device_) {
+                // the main head is on another card (the drafter on the first stage of a layer split, 0.1.44): the rows are
+                // gathered where the head is and the subset copied over once (SYCL port: through the host - the two
+                // cards' USM allocations live in different contexts)
+                if (head->type() == 14 && strata::kernels::native_q6_k_is_planar(head->weights())) {
+                    err = "mtp: the draft head cannot be gathered from a planar Q6_K head on another card (STRATA_Q6_PLANAR)";
+                    return false;
+                }
+                std::vector<uint8_t> rows_host((size_t) (n_dvocab_ * row_bytes));
+                bool ok_x = true;
+                try {
+                    const OnDevice on_head(head_dev);
+                    sycl::queue& hq = dpct::get_in_order_queue();
+                    uint8_t* tmp = (uint8_t*) sycl::malloc_device(rows_host.size(), hq);
+                    int32_t* dv = (int32_t*) sycl::malloc_device(raw.size(), hq);
+                    ok_x = tmp != nullptr && dv != nullptr;
+                    if (ok_x) {
+                        hq.memcpy(dv, raw.data(), raw.size()).wait();
+                        strata::kernels::gather_rows((const uint8_t*) head->weights(), row_bytes, dv, n_dvocab_, tmp, &hq);
+                        hq.memcpy(rows_host.data(), tmp, rows_host.size()).wait();
+                    }
+                    if (tmp) sycl::free(tmp, hq);
+                    if (dv) sycl::free(dv, hq);
+                } catch (sycl::exception const&) { ok_x = false; }
+                if (ok_x) {
+                    try { dpct::get_in_order_queue().memcpy(dhead_, rows_host.data(), rows_host.size()).wait(); }
+                    catch (sycl::exception const&) { ok_x = false; }
+                }
+                if (!ok_x) { err = "mtp: the draft head's rows could not be copied from the head's card"; return false; }
+            } else if (head->type() == 14 && strata::kernels::native_q6_k_is_planar(head->weights()) && !q4_head_) {
                 // STRATA_Q6_PLANAR: the LM head is stored as planes; the subset is gathered from them, planar
                 void* pd = strata::kernels::native_q6_k_planar_gather(head->weights(), (int) (row_bytes / 210) * 256, dvocab_,
                                                                       n_dvocab_, "MTP draft head");
@@ -778,7 +829,7 @@ bool MtpDrafter::bind(const WeightTable &wt, const NativeHead *head,
                     planar_gathered = true;
                 }
             }
-            if (!planar_gathered)
+            if (!planar_gathered && !(head_dev >= 0 && head_dev != device_))
                 strata::kernels::gather_rows((const uint8_t*) head->weights(), row_bytes, dvocab_, n_dvocab_, dhead_, nullptr);
             dpct::get_current_device().queues_wait_and_throw();
             vram_ += (uint64_t) (n_dvocab_ * row_bytes) + raw.size();
@@ -803,6 +854,100 @@ catch (sycl::exception const &exc) {
             << ", line:" << __LINE__ << std::endl;
   std::exit(1);
 }
+
+// STRATA_MTP_PROFILE=1 (measurement only): GPU stamps between the draft layer's stages in the round graph and in every
+// step graph (each stamp is one more node, so the totals run a little high); the per-stage averages are printed every
+// 300 rounds with STRATA_DRAFT_TIMING's line.  Off: no stamp is recorded and nothing changes.
+namespace {
+constexpr int kMpSlots = 24;
+constexpr int kMpGraphs = 17;   // the round graph (0) and the steps 1..16
+const char* const kMpNames[kMpSlots] = {"-", "embed+fc_emb", "hnorm+fc_hidden+add", "hc-read attn", "k/v+append",
+                                        "q+norm-rope", "attention", "gate+o_proj", "hc-read mlp", "router",
+                                        "experts", "shared", "combine+write", "hc-read mixer", "head gemv",
+                                        "argmax+prob", "select", "", "", "", "", "", "", ""};
+struct MtpProf {
+    bool on = false;
+    unsigned long long* d = nullptr;
+    std::vector<unsigned long long> h;
+    int base = -1;   // the graph being captured (-1: none, no stamps)
+    double sum[2][kMpSlots] = {};
+    int64_t n[2] = {0, 0};
+    MtpProf() {
+        const char* e = std::getenv("STRATA_MTP_PROFILE");
+        on = e != nullptr && e[0] == '1';
+    }
+    void init() {
+        if (!on || d != nullptr) return;
+        d = sycl::malloc_device<unsigned long long>((size_t) kMpSlots * kMpGraphs, dpct::get_in_order_queue());
+        if (d == nullptr) { on = false; return; }
+        dpct::get_in_order_queue().memset(d, 0, (size_t) kMpSlots * kMpGraphs * 8).wait();
+        h.assign((size_t) kMpSlots * kMpGraphs, 0);
+    }
+    void stamp(int i, dpct::queue_ptr cs) const {
+        if (on && d != nullptr && base >= 0) strata::kernels::gpu_stamp(d, base * kMpSlots + i, cs);
+    }
+    void collect(int n_steps_run) {   // after the round's sync: the round graph and steps 1..n_steps_run-1
+        if (!on || d == nullptr) return;
+        try { dpct::get_in_order_queue().memcpy(h.data(), d, h.size() * 8).wait(); }
+        catch (sycl::exception const&) { return; }
+        for (int gi = 0; gi < n_steps_run && gi < kMpGraphs; ++gi) {
+            const unsigned long long* s = h.data() + (size_t) gi * kMpSlots;
+            const int k = gi == 0 ? 0 : 1;
+            unsigned long long prev = s[0];
+            if (prev == 0) continue;
+            for (int i = 1; i < kMpSlots; ++i) {
+                if (s[i] == 0 || s[i] < prev) continue;
+                sum[k][i] += (double) (s[i] - prev);
+                prev = s[i];
+            }
+            ++n[k];
+        }
+    }
+    void report() {
+        for (int k = 0; k < 2; ++k) {
+            if (n[k] == 0) continue;
+            std::string out;
+            char b[96];
+            double tot = 0;
+            for (int i = 1; i < kMpSlots; ++i) {
+                if (sum[k][i] <= 0) continue;
+                tot += sum[k][i];
+                std::snprintf(b, sizeof b, " %s %.3f", kMpNames[i], sum[k][i] / 1e6 / (double) n[k]);
+                out += b;
+            }
+            std::fprintf(stderr, "strata mtp profile (%s, ms per graph over %lld):%s | total %.3f\n", k == 0 ? "round" : "step",
+                         (long long) n[k], out.c_str(), tot / 1e6 / (double) n[k]);
+            for (double& x : sum[k]) x = 0;
+            n[k] = 0;
+        }
+    }
+};
+MtpProf g_mp;
+
+// STRATA_VERIFY_NODES=1 also lists the draft graphs' nodes (counts by node type: SYCL graph nodes carry no kernel names)
+void mtp_list_nodes(dpct::experimental::command_graph_ptr graph, const char* what) {
+    if (std::getenv("STRATA_VERIFY_NODES") == nullptr || graph == nullptr) return;
+    size_t nn = 0;
+    dpct::experimental::get_nodes(graph, nullptr, &nn);
+    std::vector<dpct::experimental::node_ptr> nodes(nn);
+    dpct::experimental::get_nodes(graph, nodes.data(), &nn);
+    std::vector<std::pair<std::string, int>> kinds;
+    for (dpct::experimental::node_ptr nd : nodes) {
+        const sycl::ext::oneapi::experimental::node_type ty = nd->get_type();
+        std::string name = "type" + std::to_string((int) ty);
+        if (ty == sycl::ext::oneapi::experimental::node_type::kernel) name = "kernel";
+        else if (ty == sycl::ext::oneapi::experimental::node_type::memcpy) name = "memcpy";
+        else if (ty == sycl::ext::oneapi::experimental::node_type::memset) name = "memset";
+        bool found = false;
+        for (auto& k : kinds)
+            if (k.first == name) { ++k.second; found = true; break; }
+        if (!found) kinds.push_back({name, 1});
+    }
+    std::fprintf(stderr, "strata mtp: the %s graph has %zu nodes:", what, nn);
+    for (auto& k : kinds) std::fprintf(stderr, "\n %4d x %.110s", k.second, k.first.c_str());
+    std::fprintf(stderr, "\n");
+}
+}  // namespace
 
 // The layer for T rows.  full = false stops after the K/V append (the prompt only needs the cache).
 bool MtpDrafter::record_forward(int T, int step_row0, dpct::queue_ptr cs,
@@ -832,6 +977,7 @@ bool MtpDrafter::record_front(int T, int row0, dpct::queue_ptr cs,
         // ---- the two input branches
         const WeightRef* we = wt_->find("token_embd.weight");
         if (!we) { err = "mtp: token_embd.weight is missing"; return false; }
+        g_mp.stamp(0, cs);
         if (const NativeEmbed* ne = native_embed()) {   // plan v0.3 P6: the GGUF-form table
             ne->gather_dev(tok_, T, emb_, cs);
         } else {
@@ -844,6 +990,7 @@ bool MtpDrafter::record_front(int T, int row0, dpct::queue_ptr cs,
         native_qsa_rms_norm_weighted(emb_, f32("pre_fc_norm_embedding.weight"), en_, (int) N, T, EPS, cs);
         native_quantize_q8_1(en_, xq_, (int) N, T, cs);
         native_mmvq(wt_fc_embedding, wp_fc_embedding, xq_, e2_, (int) N, (int) N, T, cs);
+        g_mp.stamp(1, cs);
         if (hnorm_stream_)   // --mtp-hnorm stream: one RMS per stream, each scaled by its slice of the weight
             native_qsa_rms_norm_grouped(Rin_, f32("pre_fc_norm_hidden.weight"), hn_, (int) N, (int) HC, (int) (T * HC), EPS, cs);
         else
@@ -854,6 +1001,7 @@ bool MtpDrafter::record_front(int T, int row0, dpct::queue_ptr cs,
             native_mmvq(wt_fc_hidden, wp_fc_hidden, xq_, h2_ + (size_t) c0 * N, (int) N, (int) N, nc, cs);
         }
         add_streams_broadcast(h2_, e2_, R_, N, (int) HC, T, cs);
+        g_mp.stamp(2, cs);
         // ---- the attention hyper-connection
         {
             FusedGrArgs fa[kFusedGrMaxT];
@@ -868,6 +1016,7 @@ bool MtpDrafter::record_front(int T, int row0, dpct::queue_ptr cs,
             }
             fused_gr_read_multi(fa, T, xn_, cs);
         }
+        g_mp.stamp(3, cs);
         // ---- attention: K/V into the layer's own cache
         native_quantize_q8_1(mixed_, xq_, (int) N, T, cs);
         native_mmvq(wt_k_proj, wp_k_proj, xq_, kcur_, (int) N, (int) (NKV * HD), T, cs);
@@ -915,6 +1064,7 @@ bool MtpDrafter::record_front(int T, int row0, dpct::queue_ptr cs,
                     kv_append_step(st_.k_pool, st_.v_pool, st_.page_table, step + t * 4, kcur_ + t * NKV * HD,
                                    vcur_ + t * NKV * HD, s, cs, &st_.host);
             }
+        g_mp.stamp(4, cs);
     } catch (const std::exception& e) {
         err = std::string("mtp: ") + e.what();
         return false;
@@ -971,13 +1121,21 @@ bool MtpDrafter::record_rest(int step_row, dpct::queue_ptr cs,
             norm_rope(qcur_, f32("self_attn.q_norm.weight"), (int) (T * NH), (int) HD, pos, cs);
         }
         if (st_.kv_rot) fwht256_inplace_cuda(qcur_, (int64_t) T * NH, cs);
+        g_mp.stamp(5, cs);
         const QsaAttnPools pools = qsa_attn_pools(st_);
-        if (window_ > 0) window_ids(const_cast<int32_t*>(step), T, (int) window_, ident_, cap_, cs);
+        if (floor_on_ && m_floor_ != nullptr)   // KVA: the window (or every cell) from the first real draft cell on
+            window_ids_floor(const_cast<int32_t*>(step), T, window_ > 0 ? (int) window_ : 0x7fffffff, ident_, cap_, m_floor_, cs);
+        else if (window_ > 0) window_ids(const_cast<int32_t*>(step), T, (int) window_, ident_, cap_, cs);
+        // STRATA_QSA_SPLIT_ATTN=1: the draft layer's attention over its window, split the same way
+        static const bool split_attn = [] { const char* v = std::getenv("STRATA_QSA_SPLIT_ATTN"); return v != nullptr && std::atoi(v) != 0; }();
+        if (!(split_attn && qsa_decode_attn_split(qcur_, pools, ident_, step, cap_, s, attn_scratch_, (uint64_t) attn_scratch_floats_, attn_, T, cs)))
         qsa_decode_attn_batch(qcur_, pools, ident_, step, cap_, s, attn_scratch_, attn_, T, cs);
         if (st_.kv_rot) fwht256_inplace_cuda(attn_, (int64_t) T * NH, cs);
+        g_mp.stamp(6, cs);
         native_qsa_gate_apply(attn_, qfull_, attn32_, (int) (T * NH), (int) HD, cs);
         native_quantize_q8_1(attn32_, xq_, (int) (NH * HD), T, cs);
         native_mmvq(wt_o_proj, wp_o_proj, xq_, bo_, (int) (NH * HD), (int) N, T, cs);
+        g_mp.stamp(7, cs);
         // ---- the MLP hyper-connection (the attention write folded in)
         {
             FusedGrArgs fa[kFusedGrMaxT];
@@ -993,6 +1151,7 @@ bool MtpDrafter::record_rest(int step_row, dpct::queue_ptr cs,
             }
             fused_gr_read_multi(fa, T, xn_, cs);
         }
+        g_mp.stamp(8, cs);
         // ---- MoE: router, the 512 resident experts, the shared expert (on a branch beside them on CUDA), the
         // combine, the write
         NativeSharedWeights nsw;
@@ -1008,7 +1167,8 @@ bool MtpDrafter::record_rest(int step_row, dpct::queue_ptr cs,
         }();
         static const bool head_mix_multi_on = [] {
 #if defined(STRATA_USE_HIP)
-            return false;
+            const char* v = std::getenv("STRATA_HEAD_MIX_MULTI");   // HIP: opt-in (=1)
+            return v != nullptr && std::atoi(v) != 0;
 #else
             const char* v = std::getenv("STRATA_HEAD_MIX_MULTI");
             return v == nullptr || std::atoi(v) != 0;
@@ -1072,11 +1232,18 @@ bool MtpDrafter::record_rest(int step_row, dpct::queue_ptr cs,
             else router_top10(logits_ + t * g.n_expert, 1, (int) g.n_expert, (int) K, ids_ + t * K, w_ + t * K, cs);
         }
         }
+        if (rr_res_ != nullptr && rr_margin_ > 0.0f && g.n_expert == 512 && K == 10) {
+            try {
+                native_route_resident(logits_, ids_, w_, rr_res_, T, rr_margin_, rr_lo_, rr_hi_, nullptr, cs);
+            } catch (const std::exception& e) { err = std::string("mtp route-resident: ") + e.what(); return false; }
+        }
+        g_mp.stamp(9, cs);
         moe_group_resident(ids_, (int) (T * K), (int) K, experts_, (int64_t) strata::kernels::cpu::BLOB, grp_ptr_,
                            grp_start_, grp_counts_, hit_dst_, hit_slot_, cs);
         quantize_q8_0_scaled(mixed_, hit_xq_, hit_xs_, (int64_t) T * N, cs);
         moe_grouped_s2(grp_ptr_, grp_start_, grp_counts_, hit_dst_, hit_slot_, (int64_t) T * K, (int64_t) T * K, hit_xq_,
                        hit_xs_, hit_scratch_, parts_, cs);
+        g_mp.stamp(10, cs);
         if (branch_on) {
             if (DPCT_CHECK_ERROR(cs->ext_oneapi_submit_barrier({*sh_join_})) !=
                 0) {
@@ -1085,6 +1252,7 @@ bool MtpDrafter::record_rest(int step_row, dpct::queue_ptr cs,
         } else {
             shared_rows();
         }
+        g_mp.stamp(11, cs);
         static const bool no_multi_gr = [] {   // #783 PR-g: STRATA_NO_MULTI_GR=1 keeps the per-token GR calls
             const char* v = std::getenv("STRATA_NO_MULTI_GR");
             return v != nullptr && v[0] != '\0' && v[0] != '0';
@@ -1105,6 +1273,7 @@ bool MtpDrafter::record_rest(int step_row, dpct::queue_ptr cs,
         // its own, so doing them after the loop changes nothing)
         if (!fuse_head_gr && !no_multi_gr)
             gr_write_multi(R_, y_, inj2_, gs, R_, T, cs);
+        g_mp.stamp(12, cs);
         // ---- the final mixer and the main model's head
         if (fuse_head_gr) {
             FusedGrArgs fa[kFusedGrMaxT];
@@ -1134,19 +1303,26 @@ bool MtpDrafter::record_rest(int step_row, dpct::queue_ptr cs,
             for (int t = 0; t < T; ++t)
                 gr_read(R_ + (size_t) t * HC * N, f32("hyper_connection_mixer.hc_norm.weight"),
                         bf16("hyper_connection_mixer.input_mix_weight_down.weight"),
-                        bf16("hyper_connection_mixer.input_mix_weight_up.weight"), nullptr, EPS, gs, ss.block.gr,
+                        bf16("hyper_connection_mixer.input_mix_weight_up.weight"), nullptr, EPS, gs, own_gr_,
                         sample_ + t * N, dummy_inj_, cs);
         }
+        g_mp.stamp(13, cs);
         native_quantize_q8_1(sample_, xq_, (int) N, T, cs);
         const bool sub = dhead_ != nullptr;
         const int64_t nv = sub ? n_dvocab_ : n_vocab_;
         native_mmvq(sub ? dhead_type_ : head_->type(), sub ? dhead_ : head_->weights(), xq_, head_logits_, (int) N,
                     (int) nv, T, cs);
+        g_mp.stamp(14, cs);
         if (coupled_rec_) {
             // coupled draft sampling: the target's chain and Philox draw for the row that will verify this draft
             // (counter = this cell + 1, from its step record), penalties over the ring; T == 1 (full layer)
-            coupled_draft_sample(head_logits_, (int) nv, sub ? dvocab_ : nullptr, sub ? dinv_ : nullptr, (int) n_vocab_,
-                                 cparams_, cring_, kCoupledHistCap, coupled_j_, step, cscratch_, out_ids_, probs_, cs);
+            if (m_q_ != nullptr)   // STRATA_SPEC_PROB: a draw from q with its own stream, and q's list for the verifier
+                spec_draft_sample(head_logits_, (int) nv, sub ? dvocab_ : nullptr, sub ? dinv_ : nullptr, (int) n_vocab_,
+                                  cparams_, cring_, kCoupledHistCap, coupled_j_, step, cscratch_, out_ids_, probs_, m_q_,
+                                  spec_gate_pick(), spec_draft_temp_scale(), cs);
+            else
+                coupled_draft_sample(head_logits_, (int) nv, sub ? dvocab_ : nullptr, sub ? dinv_ : nullptr, (int) n_vocab_,
+                                     cparams_, cring_, kCoupledHistCap, coupled_j_, step, cscratch_, out_ids_, probs_, cs);
             return true;
         }
         if (argmax_rows_wanted()) {
@@ -1160,6 +1336,7 @@ bool MtpDrafter::record_rest(int step_row, dpct::queue_ptr cs,
         if (multi_block_head_ops()) row_top_prob_split(head_logits_, T, (int) nv, out_ids_, probs_, top_scratch_, cs);
         else row_top_prob(head_logits_, T, (int) nv, out_ids_, probs_, cs);
         if (sub) map_ids(out_ids_, dvocab_, T, cs);
+        g_mp.stamp(15, cs);
     } catch (const std::exception& e) {
         err = std::string("mtp: ") + e.what();
         return false;
@@ -1178,11 +1355,14 @@ bool finish_capture(dpct::queue_ptr cs, bool ok,
         if (graph) delete (graph);
         return false;
     }
-    if (ce != 0 ||
-        DPCT_CHECK_ERROR(
-            exec = new sycl::ext::oneapi::experimental::command_graph<
-                sycl::ext::oneapi::experimental::graph_state::executable>(
-                graph->finalize())) != 0) {
+    dpct::experimental::command_graph_exec_ptr got = nullptr;   // (a failed finalize leaves nothing in the member)
+    const dpct::err0 ie =
+        ce != 0 ? ce
+                : DPCT_CHECK_ERROR(
+                      got = new sycl::ext::oneapi::experimental::command_graph<
+                          sycl::ext::oneapi::experimental::graph_state::executable>(
+                          graph->finalize()));
+    if (ie != 0) {
         if (graph) delete (graph);
         /*
         DPCT1009: SYCL reports errors using exceptions and does not use
@@ -1190,9 +1370,11 @@ bool finish_capture(dpct::queue_ptr cs, bool ok,
         real error-handling function.
         */
         err = std::string("mtp: ") + what +
-              " capture: " + dpct::get_error_string_dummy(ce);
+              " capture: " + dpct::get_error_string_dummy(ie);   // the status that failed
         return false;
     }
+    exec = got;
+    mtp_list_nodes(graph, what);
     delete (graph);
     // an explicit upload: the first launch's implicit one blocked behind a device-side spin (verify.cpp)
     /*
@@ -1246,9 +1428,11 @@ bool MtpDrafter::capture_round(int T, bool coupled, std::string &err) try {
     if (exec) return true;
     using namespace strata::kernels;
     const int64_t HCN = g_->hc * g_->n_embd;
+    g_mp.init();   // (its allocation before the capture)
     if (DPCT_CHECK_ERROR(dpct::experimental::begin_recording(cs_)) != 0) {
         err = "mtp: begin capture"; return false;
     }
+    g_mp.base = 0;
     bool ok = true;
     // coupled: the request's chain and the penalty history's base, for this round's drafts
     if (coupled) coupled_draft_stage(m_cparams_, m_chist_, cparams_, cring_, kCoupledHistCap, cs_);
@@ -1283,6 +1467,8 @@ bool MtpDrafter::capture_round(int T, bool coupled, std::string &err) try {
         coupled_rec_ = false;
     }
     if (ok) mtp_select(R_, HCN, out_ids_, row_ + 1, Rin_, tok_, m_out_, 0, cs_, probs_, m_prob_);
+    if (ok) g_mp.stamp(16, cs_);
+    g_mp.base = -1;
     if (ok && force_on_ && !coupled) force_token(tok_, m_force_, 0, cs_);   // chain_launch: step 1's input
     return finish_capture(cs_, ok, exec, coupled ? "round (coupled)" : "round", err);
 }
@@ -1300,6 +1486,7 @@ bool MtpDrafter::capture_step(int j, bool coupled, std::string &err) try {
     using namespace strata::kernels;
     const int64_t HCN = g_->hc * g_->n_embd;
     const int row = max_t_ + j - 1;
+    g_mp.init();
     if (DPCT_CHECK_ERROR(dpct::experimental::begin_recording(cs_)) != 0) {
         err = "mtp: begin capture"; return false;
     }
@@ -1313,9 +1500,12 @@ bool MtpDrafter::capture_step(int j, bool coupled, std::string &err) try {
 #endif
     coupled_rec_ = coupled;
     coupled_j_ = j;
+    g_mp.base = j < kMpGraphs ? j : -1;
     bool ok = record_forward(1, row, cs_, err);
     coupled_rec_ = false;
     if (ok) mtp_select(R_, HCN, out_ids_, row_ + 1, Rin_, tok_, m_out_, j, cs_, probs_, m_prob_);
+    if (ok) g_mp.stamp(16, cs_);
+    g_mp.base = -1;
     if (ok && force_on_ && !coupled) force_token(tok_, m_force_, j, cs_);   // chain_launch: step j+1's input
     return finish_capture(cs_, ok, exec, coupled ? "step (coupled)" : "step", err);
 }
@@ -1360,13 +1550,54 @@ catch (sycl::exception const &exc) {
   std::exit(1);
 }
 
+// STRATA_MTP_PREFILL_SYNC: the prompt pass's per-group loop (see MtpDrafter::prefill); HIP's default
+static bool prefill_per_group_sync() {
+    static const bool v = [] {
+        if (const char* e = std::getenv("STRATA_MTP_PREFILL_SYNC")) return std::atoi(e) != 0;
+#if defined(STRATA_USE_HIP)
+        return true;
+#else
+        return false;
+#endif
+    }();
+    return v;
+}
+
+bool MtpDrafter::reserve_prefill(int64_t n, std::string& err) {
+    const OnDevice on_device(device_);
+    if (prefill_per_group_sync()) {
+        for (int T = 1; T <= max_t_; ++T)
+            if (!capture_prefill(T, err)) return false;
+        return true;
+    }
+    if (!prepare_prefill(err)) return false;
+    const int64_t per_row = 1 + 4 + g_->n_head;
+    if (n <= 0) return true;
+    // the records' pinned upload slots too (#1996's ring grows a slot at its first larger upload: a pinned free and
+    // allocation, which take the driver's lock)
+    if (!pf_ring_.reserve((size_t) (n * per_row) * sizeof(int32_t)))
+        std::fprintf(stderr, "strata mtp: the prompt records' pinned upload slots could not be reserved (they grow at "
+                             "first use)\n");
+    if (pf_cap_ >= n * per_row) return true;
+    if (pf_dev_) sycl::free(pf_dev_, dpct::get_in_order_queue());
+    pf_dev_ = nullptr;
+    pf_cap_ = 0;
+    if (DPCT_CHECK_ERROR(pf_dev_ = sycl::malloc_device<int32_t>((size_t) (n * per_row), dpct::get_in_order_queue())) != 0 ||
+        pf_dev_ == nullptr) {
+        err = "mtp prefill: the input records do not fit";
+        return false;
+    }
+    pf_cap_ = n * per_row;
+    return true;
+}
+
 bool MtpDrafter::prefill(const float* R_rows, const int32_t* next_tokens, int64_t n, int64_t cell0, std::string& err,
                          bool sync) {
     const OnDevice on_device(device_);
     const Clock::time_point t0 = Clock::now();
     const int64_t HCN = g_->hc * g_->n_embd;
     // cells the window can never reach again need no K/V
-    const int64_t first_needed = (window_ > 0 && prompt_len_ > 0) ? prompt_len_ - window_ - 64 : 0;
+    const int64_t first_needed = this->first_needed();
     // E-4: every group's token / step / position records uploaded at once; each group is then device copies and a
     // graph on the one stream, with a single sync at the end (a group of <= max_t rows used to be staged in mapped
     // memory and synced before the next: ~5,500 host round trips on a 32K prompt).  The same work in the same
@@ -1377,14 +1608,7 @@ bool MtpDrafter::prefill(const float* R_rows, const int32_t* next_tokens, int64_
     // in hipGraphLaunch or the final sync until the watchdog ends the engine.  R9700, full IQ3_XXS, --kv-resident
     // 32768, mixed load (chats, 32K and 7K prompts, deep follow-ups): E-4 hung in the first round on 2 of 2 tries,
     // the old loop ran 30 of 30 rounds clean, prompt speed unchanged.
-    static const bool per_group_sync = [] {
-        if (const char* v = std::getenv("STRATA_MTP_PREFILL_SYNC")) return std::atoi(v) != 0;
-#if defined(STRATA_USE_HIP)
-        return true;
-#else
-        return false;
-#endif
-    }();
+    const bool per_group_sync = prefill_per_group_sync();
     const int64_t NHp = g_->n_head, per_row = 1 + 4 + NHp;
     if (!per_group_sync && n > 0) {
         if (pf_cap_ < n * per_row) {
@@ -1412,14 +1636,7 @@ bool MtpDrafter::prefill(const float* R_rows, const int32_t* next_tokens, int64_
             stp[i * 4 + 3] = (int32_t) (cell + 1);
             for (int64_t h = 0; h < NHp; ++h) ps[i * NHp + h] = (int32_t) cell;
         }
-        /*
-        DPCT1124: cudaMemcpyAsync is migrated to asynchronous memcpy API.
-        While the origin API might be synchronous, it depends on the type of
-        operand memory, so you may need to call wait() on event return by memcpy
-        API to ensure synchronization behavior.
-        */
-        if (DPCT_CHECK_ERROR(cs_->memcpy(pf_dev_, rec.data(),
-                                         rec.size() * sizeof(int32_t))) != 0) {
+        if (pf_ring_.h2d(pf_dev_, rec.data(), rec.size() * sizeof(int32_t), cs_) != 0) {
             err = "mtp prefill: the input records upload failed";
             return false;
         }
@@ -1547,8 +1764,53 @@ bool MtpDrafter::prefill(const float* R_rows, const int32_t* next_tokens, int64_
     return true;
 }
 
+// STRATA_DRAFT_TIMING=1: where a draft round's time goes, from event pairs around each graph launch (GPU time of the round
+// graph and of each step, and the idle gap the host's decision leaves between two steps) and the host's own wall time.
+namespace {
+struct DraftTiming {
+    bool on = false;
+    dpct::event_ptr eb[16] = {}, ea[16] = {};   // SYCL port: barrier events on the drafter's (profiling) queue
+    double round_ms = 0, step_ms = 0, gap_ms = 0, wall_ms = 0, tail_ms = 0;
+    double pre_ms = 0, launch_ms = 0, ple_ms = 0, wait0_ms = 0, waitj_ms = 0;   // host: staging, graph launch calls, PLE prefetch, spins
+    int64_t rounds = 0, steps = 0;
+    DraftTiming() {
+        const char* e = std::getenv("STRATA_DRAFT_TIMING");
+        on = e != nullptr && e[0] == '1';
+    }
+    void init() {
+        if (!on || eb[0] != nullptr) return;
+        for (int i = 0; i < 16; ++i) {
+            eb[i] = new sycl::event();
+            ea[i] = new sycl::event();
+        }
+    }
+    // cudaEventElapsedTime: from a's start to b's end (both barrier events, so points); false without profiling info
+    static bool elapsed(float& ms, dpct::event_ptr a, dpct::event_ptr b) {
+        try {
+            ms = (float) ((double) (b->get_profiling_info<sycl::info::event_profiling::command_end>() -
+                                    a->get_profiling_info<sycl::info::event_profiling::command_start>()) /
+                          1000000.0);
+            return true;
+        } catch (...) { return false; }
+    }
+    void report() const {
+        if (rounds == 0) return;
+        const double r = (double) rounds;
+        std::fprintf(stderr, "strata mtp draft timing: %lld rounds, %.2f steps/round: wall %.3f ms = round graph %.3f + steps %.3f GPU "
+                             "(%.3f per step) + host gaps between graphs %.3f + tail %.3f (per round)\n",
+                     (long long) rounds, (double) steps / r, wall_ms / r, round_ms / r, step_ms / r,
+                     steps > 0 ? step_ms / (double) steps : 0.0, gap_ms / r, tail_ms / r);
+        std::fprintf(stderr, "strata mtp draft timing (host, per round): staging %.3f, graph launch calls %.3f, PLE prefetch %.3f, "
+                             "wait for draft 0 %.3f, waits for the steps %.3f\n",
+                     pre_ms / r, launch_ms / r, ple_ms / r, wait0_ms / r, waitj_ms / r);
+    }
+};
+DraftTiming g_dt;
+}  // namespace
+
 bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* drafts, std::string& err,
-                       float* probs, float min_p, int* n_drafts) {
+                       float* probs, float min_p, int* n_drafts, DraftResult* result) {
+    if (result) { *result = {}; if (n_drafts) *n_drafts = 0; }
     const OnDevice on_device(device_);
     if (T < 1 || T > max_t_ || a < 0 || a >= T) { err = "mtp: draft arguments out of range"; return false; }
     if (chain_live_) { err = "mtp: a pipelined chain is still in flight"; return false; }
@@ -1557,7 +1819,9 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
     if (!mtp_catchup_all()) T = a + 1;
     const bool cp = coupled_active_;   // coupled draft sampling for this request: its own graphs
     if (!capture_round(T, cp, err)) return false;
-    const int max_steps = std::min(max_t_ - 1, max_drafts_);
+    // Draft j writes its K/V at cell p + a + j, and the K/V ends at max_cells (its page table has no page past it):
+    // near the context's end the round drafts only the cells that exist
+    const int max_steps = (int) std::min<int64_t>(std::min(max_t_ - 1, max_drafts_), st_.max_cells - (p + a));
     for (int j = 1; j < max_steps; ++j)
         if (!capture_step(j, cp, err)) return false;
     const Clock::time_point t0 = Clock::now();
@@ -1586,8 +1850,12 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
     SessionState* const pss = ple_ss_ ? ple_ss_ : ss_;
     const bool do_ple = pss != nullptr && pss->ple.ready() && pss->ple.table != nullptr;
     int32_t ple_prev[2] = {do_ple ? pss->ple_prev[0] : 0, do_ple ? pss->ple_prev[1] : 0};
+    const bool dth = g_dt.on;
+    auto hms = [](Clock::time_point a0) { return std::chrono::duration<double, std::milli>(Clock::now() - a0).count(); };
     auto prefetch_ple = [&](int32_t tok) {
         if (!do_ple || tok < 0) return;
+        const Clock::time_point tp = Clock::now();
+        struct PleT { bool on; double& acc; Clock::time_point t; ~PleT() { if (on) acc += std::chrono::duration<double, std::milli>(Clock::now() - t).count(); } } ple_t{dth, g_dt.ple_ms, tp};
         uint32_t rows16[strata::kernels::PLE_N_HEADS];
         strata::kernels::ngram_rows(&tok, ple_prev, 1, pss->ple.consts, rows16);
         ple_prev[0] = ple_prev[1];
@@ -1596,7 +1864,7 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
     };
 
     int n = 0;
-    if (min_p <= 0.0f && max_steps > 0) {
+    if (min_p <= 0.0f && !chain_rule_ && max_steps > 0) {
         if (DPCT_CHECK_ERROR((cs_)->ext_oneapi_graph(
                 *(cp ? round_exec_c_[T] : round_exec_[T]))) != 0) {
             /*
@@ -1632,15 +1900,17 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
         }
         (void)DPCT_CHECK_ERROR(((cs_)->ext_oneapi_empty()));
         prefetch_ple(tokens[a]);
+        progress_at("mtp draft: waiting for the GPU");   // #2065
         for (int j = 0; j + 1 < max_steps; ++j) {
             uint32_t spins = 0;
             while (((volatile int32_t*) h_out_)[j] < 0) {
 #if defined(_WIN32) || defined(__x86_64__)
-                _mm_pause();
+                strata_cpu_pause();
 #endif
                 if ((++spins & 1023u) == 0 &&
                     ((cs_)->ext_oneapi_empty() ? 0 : 1) != 1) break;   /* SYCL port: DPCT_CHECK_ERROR of ext_oneapi_empty() was always 0, so the wait gave up after 1024 spins and read a draft the GPU had not written */
             }
+            strata_load_fence();   // the token was seen: its probability is read after it (a no-op on x86)
             drafts[j] = ((volatile int32_t*) h_out_)[j];
             if (probs) probs[j] = ((volatile float*) h_prob_)[j];
             prefetch_ple(drafts[j]);
@@ -1665,6 +1935,11 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
         prefetch_ple(drafts[last]);
         n = max_steps;
     } else if (max_steps > 0) {
+        g_dt.init();
+        const bool dt = g_dt.on;
+        if (dt) g_dt.pre_ms += hms(t0);
+        if (dt) dpct::sync_barrier(g_dt.eb[0], cs_);
+        Clock::time_point tl = Clock::now();
         if (DPCT_CHECK_ERROR((cs_)->ext_oneapi_graph(
                 *(cp ? round_exec_c_[T] : round_exec_[T]))) != 0) {
             /*
@@ -1680,18 +1955,22 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
             err = std::string("mtp draft: ") + dpct::get_error_string_dummy(0);
             return false;
         }
+        if (dt) g_dt.launch_ms += hms(tl);
+        if (dt) dpct::sync_barrier(g_dt.ea[0], cs_);
         (void)DPCT_CHECK_ERROR(((cs_)->ext_oneapi_empty()));
         prefetch_ple(tokens[a]);
+        progress_at("mtp draft: waiting for the GPU");   // #2065: a stall here read as "decode", the verify window before it
         auto wait_step = [&](int j) {
             try {
         uint32_t spins = 0;
             while (((volatile int32_t*) h_out_)[j] < 0) {
 #if defined(_WIN32) || defined(__x86_64__)
-                _mm_pause();
+                strata_cpu_pause();
 #endif
                 if ((++spins & 1023u) == 0 &&
                     ((cs_)->ext_oneapi_empty() ? 0 : 1) != 1) break;   /* SYCL port: DPCT_CHECK_ERROR of ext_oneapi_empty() was always 0, so the wait gave up after 1024 spins and read a draft the GPU had not written */
             }
+            strata_load_fence();
         }
         catch (sycl::exception const &exc) {
           std::cerr << exc.what() << "Exception caught at file:" << __FILE__
@@ -1699,12 +1978,16 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
           std::exit(1);
         }
         };
+        tl = Clock::now();
         wait_step(0);
+        if (dt) g_dt.wait0_ms += hms(tl);
         drafts[0] = ((volatile int32_t*) h_out_)[0];
         float pj = ((volatile float*) h_prob_)[0];
         if (probs) probs[0] = pj;
         n = 1;
-        for (int j = 1; j < max_steps && pj >= min_p; ++j) {
+        for (int j = 1; j < max_steps && (chain_rule_ ? chain_rule_(j - 1, pj) : pj >= min_p); ++j) {
+            if (dt) dpct::sync_barrier(g_dt.eb[j], cs_);
+            tl = Clock::now();
             if (DPCT_CHECK_ERROR((cs_)->ext_oneapi_graph(
                     *(cp ? step_exec_c_[j] : step_exec_[j]))) != 0) {
                 /*
@@ -1721,15 +2004,21 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
                 err = std::string("mtp draft step: ") + dpct::get_error_string_dummy(0);
                 return false;
             }
+            if (dt) g_dt.launch_ms += hms(tl);
+            if (dt) dpct::sync_barrier(g_dt.ea[j], cs_);
             (void)DPCT_CHECK_ERROR(((cs_)->ext_oneapi_empty()));
             prefetch_ple(drafts[j - 1]);
+            tl = Clock::now();
             wait_step(j);
+            if (dt) g_dt.waitj_ms += hms(tl);
             drafts[j] = ((volatile int32_t*) h_out_)[j];
             pj = ((volatile float*) h_prob_)[j];
             if (probs) probs[j] = pj;
             ++n;
         }
+        if (chain_rule_ && n >= max_steps) (void) chain_rule_(n - 1, pj);   // the last step of a full chain
         prefetch_ple(drafts[n - 1]);
+        const Clock::time_point t_pre_sync = Clock::now();
         if (DPCT_CHECK_ERROR(cs_->wait()) != 0) {
             /*
             DPCT1009: SYCL reports errors using exceptions and does not use
@@ -1744,9 +2033,28 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
             err = std::string("mtp draft: ") + dpct::get_error_string_dummy(0);
             return false;
         }
+        if (dt) {
+            float ms = 0;
+            double r = 0, s = 0, gp = 0;
+            if (DraftTiming::elapsed(ms, g_dt.eb[0], g_dt.ea[0])) r = ms;
+            for (int j = 1; j < n; ++j) {
+                if (DraftTiming::elapsed(ms, g_dt.eb[j], g_dt.ea[j])) s += ms;
+                if (DraftTiming::elapsed(ms, g_dt.ea[j - 1], g_dt.eb[j])) gp += ms;
+            }
+            g_dt.round_ms += r; g_dt.step_ms += s; g_dt.gap_ms += gp;
+            g_dt.steps += n - 1; ++g_dt.rounds;
+            g_dt.wall_ms += ms_since(t0);
+            g_dt.tail_ms += std::chrono::duration<double, std::milli>(Clock::now() - t_pre_sync).count();
+            if (g_dt.rounds % 300 == 0) g_dt.report();
+        }
+        if (g_mp.on) {
+            g_mp.collect(n);
+            if (g_mp.n[0] % 300 == 0) g_mp.report();
+        }
     }
     for (int j = n; j < max_t_ - 1; ++j) { drafts[j] = 0; if (probs) probs[j] = 0.0f; }
     if (n_drafts) *n_drafts = n;
+    if (result) *result = {n, max_steps};
     ms_draft += ms_since(t0);
     ++rounds;
     return true;
@@ -1754,6 +2062,8 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
 
 bool MtpDrafter::stage_source_R(int T, std::string &err) try {
     if (src_R_ == nullptr || src_R_ == window_R_) return true;
+    const Clock::time_point t_src = Clock::now();
+    struct SrcTime { MtpDrafter& d; Clock::time_point t; ~SrcTime() { d.ms_src += ms_since(t); ++d.n_src; } } src_time{*this, t_src};
     /*
     DPCT1124: cudaMemcpyAsync is migrated to asynchronous memcpy API. While
     the origin API might be synchronous, it depends on the type of operand
@@ -1970,7 +2280,8 @@ catch (sycl::exception const &exc) {
 
 bool MtpDrafter::draft_first(int T, const float *R_row, int32_t token,
                              int64_t cell, int32_t *drafts, std::string &err,
-                             float *probs, float min_p, int *n_drafts) try {
+                             float *probs, float min_p, int *n_drafts, DraftResult *result) try {
+    if (result) { *result = {}; if (n_drafts) *n_drafts = 0; }
     const OnDevice on_device(device_);
     // row 0 is the real pair; rows 1.. repeat it and only write cells the next round overwrites
     const int64_t HCN = g_->hc * g_->n_embd;
@@ -1982,7 +2293,7 @@ bool MtpDrafter::draft_first(int T, const float *R_row, int32_t token,
             return false;
         }
     std::vector<int32_t> toks((size_t) T, token);
-    return draft(T, toks.data(), cell, 0, drafts, err, probs, min_p, n_drafts);
+    return draft(T, toks.data(), cell, 0, drafts, err, probs, min_p, n_drafts, result);
 }
 catch (sycl::exception const &exc) {
   std::cerr << exc.what() << "Exception caught at file:" << __FILE__

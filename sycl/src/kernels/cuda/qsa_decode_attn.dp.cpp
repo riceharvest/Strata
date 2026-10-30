@@ -359,6 +359,39 @@ attn_chunk_kernel(const float *__restrict__ q, QsaAttnPools p,
     for (int h = 0; h < G; ++h) part_acc[((size_t) slot * G + h) * HD + t] = acc[h];
 }
 
+// The same blocks for queries of different slots: query blockIdx.z reads its own slot's pools, everything else is
+// attn_chunk_kernel's batched form (qsa_decode_attn_slots).
+template <int KV_MODE, bool LANE_CELL, int RS = 0>
+__dpct_inline__ void attn_chunk_slots_kernel(
+    const float *__restrict__ q, QsaAttnSlotPools ps,
+    const int32_t *__restrict__ ids, const int32_t *__restrict__ step,
+    int n_kv_heads, int page_size, float scale, float *__restrict__ part_acc,
+    float *__restrict__ part_m, float *__restrict__ part_l, int n_chunks,
+    int cap, long long scratch_stride) {
+    attn_chunk_kernel<KV_MODE, LANE_CELL, RS>(
+        q,
+        ps.p[sycl::ext::oneapi::this_work_item::get_nd_item<3>().get_group(0)],
+        ids, step, n_kv_heads, page_size, scale, part_acc, part_m, part_l,
+        n_chunks, cap, scratch_stride);
+}
+
+// Batch windows: query blockIdx.z attends over its own slot's pools (rows.p[z]); the default kernel otherwise.
+template <int KV_MODE, int RS = 0>
+__dpct_inline__ void
+attn_chunk_rows_kernel(const float *__restrict__ q, QsaAttnPoolsRows rows,
+                       const int32_t *__restrict__ ids,
+                       const int32_t *__restrict__ step, int n_kv_heads,
+                       int page_size, float scale, float *__restrict__ part_acc,
+                       float *__restrict__ part_m, float *__restrict__ part_l,
+                       int n_chunks, int cap, long long scratch_stride) {
+    attn_chunk_kernel<KV_MODE, false, RS>(
+        q,
+        rows.p[sycl::ext::oneapi::this_work_item::get_nd_item<3>().get_group(
+            0)],
+        ids, step, n_kv_heads, page_size, scale, part_acc, part_m, part_l,
+        n_chunks, cap, scratch_stride);
+}
+
 // PR #540 (sskver): the same attention with fewer shuffles and less shared-memory traffic, bit for bit the kernel
 // above (same operands, same order); +7% prompt speed on a V100, where this kernel reads every prompt chunk.  It
 // uses more registers (80 vs 38 on sm_70), so it runs on cards below sm_75 only, and exists only in the experimental
@@ -601,6 +634,108 @@ __dpct_inline__ void attn_merge_kernel(const float *__restrict__ part_acc,
     attn[(size_t) h * HD + d] = L > 0.0f ? acc / L : 0.0f;
 }
 
+// attn_merge_kernel's arithmetic in the same chunk order, with two changes that leave every output bit as it was
+// (the Daily's 3effa9d5, from Hardin22; qsa_merge_daily_parity compares the two kernels on the same partials, all four
+// KV formats):
+//
+// (1) Bounded by the width.  The chunk kernel writes m = -FLT_MAX, l = 0 for every chunk with c0 >= step[kStepWidth]
+//     (its `n_here <= 0` exit) and the merge skips exactly those, so it can stop at n_act = ceil(width / CHUNK):
+//     fmaxf with -FLT_MAX never changes M, and a skipped chunk never touches L or acc.  The drafter's merge walks its
+//     whole capacity (--mtp-window 32768: 512 chunks) at every context, where a short context fills one or two.
+// (2) Loads batched.  attn_merge_kernel loads part_l / part_acc behind its `m == -FLT_MAX` branch, so the compiler
+//     issues each chunk's l and acc loads inside that chunk's branch: a few dependent L2 round trips per chunk.  Here
+//     the m, l and acc of U chunks are loaded first, guarded only by the chunk index, then consumed in chunk order.
+//     The skip is a select on the loaded m instead of a branch, so the loads cannot move back behind it.  The values
+//     selected are the very fmaf's attn_merge_kernel computes (same operands, same order), and a skipped chunk leaves
+//     L and acc as they were, as its `continue` does.
+constexpr int kMergeU = 16;
+
+template <int U, bool TAIL>
+__dpct_inline__ void merge_max_block(const float *__restrict__ pm, int c0,
+                                     int n_act, float &M) {
+    float mm[U];
+#pragma unroll
+    for (int u = 0; u < U; ++u) mm[u] = (!TAIL || c0 + u < n_act) ? pm[(size_t) (c0 + u) * G] : -FLT_MAX;
+#pragma unroll
+    for (int u = 0; u < U; ++u)
+        if (!TAIL || c0 + u < n_act) M = sycl::fmax(M, mm[u]);
+}
+
+template <int U, bool TAIL>
+/*
+DPCT1110: The total declared local variable size in device function
+merge_sum_block exceeds 128 bytes and may cause high register pressure. Consult
+with your hardware vendor to find the total register size available and adjust
+the code, or use smaller sub-group size to avoid high register pressure.
+*/
+__dpct_inline__ void merge_sum_block(const float *__restrict__ pm,
+                                     const float *__restrict__ pl,
+                                     const float *__restrict__ pa, int c0,
+                                     int n_act, float M, float &L, float &acc) {
+    float mm[U], ll[U], aa[U];
+#pragma unroll
+    for (int u = 0; u < U; ++u) {
+        const bool in = !TAIL || c0 + u < n_act;
+        mm[u] = in ? pm[(size_t) (c0 + u) * G] : -FLT_MAX;
+        ll[u] = in ? pl[(size_t) (c0 + u) * G] : 0.0f;
+        aa[u] = in ? pa[(size_t) (c0 + u) * G * HD] : 0.0f;
+    }
+#pragma unroll
+    for (int u = 0; u < U; ++u) {
+        const float w = sycl::native::exp(mm[u] - M);
+        const float L_next = sycl::fma(ll[u], (float)w, L);
+        const float acc_next = sycl::fma(aa[u], (float)w, acc);
+        const bool live = !(mm[u] == -FLT_MAX);   // attn_merge_kernel: `if (m == -FLT_MAX) continue;`
+        L = live ? L_next : L;
+        acc = live ? acc_next : acc;
+    }
+}
+
+template <int U>
+__dpct_inline__ void
+attn_merge_v2_kernel(const float *__restrict__ part_acc,
+                     const float *__restrict__ part_m,
+                     const float *__restrict__ part_l, int n_chunks,
+                     const int32_t *__restrict__ steps,
+                     float *__restrict__ attn, long long scratch_stride = 0) {
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    part_acc += (size_t)item_ct1.get_group(1) * (size_t)scratch_stride;
+    part_m += (size_t)item_ct1.get_group(1) * (size_t)scratch_stride;
+    part_l += (size_t)item_ct1.get_group(1) * (size_t)scratch_stride;
+    attn += (size_t)item_ct1.get_group(1) *
+            (size_t)item_ct1.get_group_range(2) * HD;
+    // the step record the chunk kernel read for this query (attn_chunk_kernel: step + blockIdx.z * kStepCount)
+    /*
+    DPCT1098: The '*' expression is used instead of the __ldg call. These
+    two expressions do not provide the exact same functionality. Check the
+    generated code for potential precision and/or performance issues.
+    */
+    const int width =
+        *(steps + (size_t)item_ct1.get_group(1) * kStepCount + kStepWidth);
+    const int n_act =
+        width > 0 ? sycl::min(n_chunks, (width - 1) / CHUNK + 1) : 0;
+    const int h = item_ct1.get_group(2); // global query head
+    const int kvh = h / G, hl = h % G;
+    const int d = item_ct1.get_local_id(2);
+    // chunk c of this head: part_m / part_l [(kvh * n_chunks + c) * G + hl], part_acc [that * HD + d]
+    const size_t base = (size_t) kvh * (size_t) n_chunks * G + (size_t) hl;
+    const float* pm = part_m + base;
+    const float* pl = part_l + base;
+    const float* pa = part_acc + base * HD + (size_t) d;
+    const int n_full = n_act - n_act % U;
+    float M = -FLT_MAX;
+#pragma unroll
+    for (int c0 = 0; c0 < n_full; c0 += U)
+        merge_max_block<U, false>(pm, c0, n_act, M);
+    if (n_full < n_act) merge_max_block<U, true>(pm, n_full, n_act, M);
+    float L = 0.0f, acc = 0.0f;
+#pragma unroll
+    for (int c0 = 0; c0 < n_full; c0 += U)
+        merge_sum_block<U, false>(pm, pl, pa, c0, n_act, M, L, acc);
+    if (n_full < n_act) merge_sum_block<U, true>(pm, pl, pa, n_full, n_act, M, L, acc);
+    attn[(size_t) h * HD + d] = L > 0.0f ? acc / L : 0.0f;
+}
+
 #if defined(STRATA_EXPERIMENTAL_SM60)
 // the current device is below sm_75 (per device: a layer split can mix cards); STRATA_ATTN_PRE75=0 turns PR #540's
 // kernel off (A/B)
@@ -790,16 +925,67 @@ void launch_percell(dpct::queue_ptr st, const float* q, const QsaAttnPools& pool
                      });
 }
 
-}  // namespace
 
-void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
-                           int64_t cap, const QsaShapes& s, float* scratch, float* attn, int64_t n_q, void* stream) {
-    if (n_q <= 0) return;
-    if (s.head_dim != HD || s.n_head != (int64_t) G * s.n_head_kv || cap <= 0 || !scratch || !ids || !steps ||
-        !pools.page_table || n_q > 65535) {
-        std::fprintf(stderr, "qsa_decode_attn_batch: unsupported geometry or missing buffers\n");
-        std::exit(1);
+// 0 fp16, 1 int8, 2 q4_0, 3 int8 K with q4_0 V
+int attn_kv_mode(const QsaAttnPools& p) {
+    return p.k_q4 != nullptr ? 2 : (p.k_q != nullptr && p.v_q4 != nullptr ? 3 : (p.k_q != nullptr ? 1 : 0));
+}
+
+// STRATA_ATTN_LANECELL: -1 unset, else the value (0 forces the warp kernel, anything else the lane-cell one)
+int attn_lane_cell_env() {
+    static const int v = [] {
+        const char* e = std::getenv("STRATA_ATTN_LANECELL");
+        return e != nullptr && e[0] != '\0' ? std::atoi(e) : -1;
+    }();
+    return v;
+}
+
+// STRATA_ATTN_MERGE_V2: 1 merges with attn_merge_v2_kernel, 0 with attn_merge_kernel (bitwise the same output; v2 stops
+// at the query's width instead of walking the whole capacity, which is what a long context's decode wants).  Opt-in here.
+int attn_merge_v2() {
+    static const int env = [] {
+        const char* v = std::getenv("STRATA_ATTN_MERGE_V2");
+        return v != nullptr && *v != '\0' ? (std::atoi(v) != 0 ? 1 : 0) : -1;
+    }();
+    return env >= 0 ? env : 0;
+}
+
+// the merge of `n_q` queries' partials: v2 = 0 attn_merge_kernel, 1 attn_merge_v2_kernel (bitwise the same output)
+void launch_merge(int v2, const float *part_acc, const float *part_m,
+                  const float *part_l, int n_chunks, const int32_t *steps,
+                  float *attn, long long stride, unsigned n_head, unsigned n_q,
+                  dpct::queue_ptr st) {
+    if (v2)
+    {
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
+
+        st->parallel_for<dpct_kernel_name<class attn_merge_v2_kernel_8570e9,
+                                          dpct_kernel_scalar<kMergeU>>>(
+            sycl::nd_range<3>(sycl::range(1, n_q, n_head) *
+                                  sycl::range(1, 1, HD),
+                              sycl::range(1, 1, HD)),
+            exp_props, [=](sycl::nd_item<3> item_ct1) {
+                attn_merge_v2_kernel<kMergeU>(part_acc, part_m, part_l,
+                                              n_chunks, steps, attn, stride);
+            });
+    } else {
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
+
+        st->parallel_for<dpct_kernel_name<class attn_merge_kernel_338175>>(
+            sycl::nd_range<3>(sycl::range(1, n_q, n_head) *
+                                  sycl::range(1, 1, HD),
+                              sycl::range(1, 1, HD)),
+            exp_props, [=](sycl::nd_item<3> item_ct1) {
+                attn_merge_kernel(part_acc, part_m, part_l, n_chunks, attn,
+                                  stride);
+            });
     }
+}
+
+// qsa_decode_attn_batch's chunk pass: `n_q` queries' partials into `scratch` (one stride each).  `kernel` < 0 is the
+// environment's choice (lane cell, STRATA_ATTN_RS); >= 0 is attn_chunk_kernel (the parity harness: never the environment).
+void launch_chunks_batch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
+                         int64_t cap, const QsaShapes& s, float* scratch, int64_t n_q, dpct::queue_ptr st, int kernel) {
     const int kv_mode = pools.k_q4 != nullptr ? 2 : (pools.k_q != nullptr && pools.v_q4 != nullptr ? 3
                         : (pools.k_q != nullptr ? 1 : 0));
     const int n_chunks = (int) ((cap + CHUNK - 1) / CHUNK);
@@ -811,7 +997,6 @@ void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int3
     const float scale = 1.0f / sqrtf((float) HD);
     const dpct::dim3 grid((unsigned)n_chunks, (unsigned)s.n_head_kv,
                           (unsigned)n_q);
-    dpct::queue_ptr st = strata::q_of(stream);
     // S25: the score phase one cell per thread (bit-identical scores, no shuffle reductions).  Prompt batches take
     // it by default: on 2x Arc Pro B65 it reads a 4,106-token prompt 5.2% faster, 8,191 tokens 5.2% and 16,380
     // tokens 4.8%, with the same tokens; the decode window's few queries per call are 1.4% slower with it (56.6-57.0
@@ -824,9 +1009,9 @@ void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int3
         const char* v = std::getenv("STRATA_ATTN_LANECELL");
         return v != nullptr && v[0] != '\0' ? std::atoi(v) : -1;
     }();
-    const bool lane_cell = lane_cell_env >= 0
+    const bool lane_cell = kernel < 0 && (lane_cell_env >= 0
         ? lane_cell_env != 0
-        : (n_q >= 16 && strata::intel_gpu_gen(st->get_device()) == strata::IntelGpuGen::Battlemage);
+        : (n_q >= 16 && strata::intel_gpu_gen(st->get_device()) == strata::IntelGpuGen::Battlemage));
 #define STRATA_ATTN_LC(M)                                                      \
     {                                                                          \
         auto exp_props = sycl::ext::oneapi::experimental::properties{};                   \
@@ -903,7 +1088,8 @@ void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int3
     // 151-b70: STRATA_ATTN_RS=2 (default): the probabilities in [cell][head] order and the value phase reading a cell's 12 as three vectors - the same
     // bits (first-token logits md5 equal at 4K and 16K), +0.8..0.9% prompt tok/s on the B70; =1 adds a 16-shuffle reduce-scatter for the scores
     // (bit-exact too, but -1.5% here: the score phase is not shuffle bound); =0 the layout before
-    static const int rs_on = [] { const char* v = std::getenv("STRATA_ATTN_RS"); return v ? std::atoi(v) : 2; }();
+    static const int rs_env = [] { const char* v = std::getenv("STRATA_ATTN_RS"); return v ? std::atoi(v) : 2; }();
+    const int rs_on = kernel < 0 ? rs_env : 0;   // (the parity harness names its kernel: never the environment)
     if (lane_cell) {
         if (kv_mode == 3) { STRATA_ATTN_LC(3); }
         else if (kv_mode == 2) { STRATA_ATTN_LC(2); }
@@ -982,19 +1168,216 @@ void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int3
                                      part_l, n_chunks, (int)cap, stride);
             });
     }
-    {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{};
+}
 
-        st->parallel_for<dpct_kernel_name<class attn_merge_kernel_338175>>(
-            sycl::nd_range<3>(
-                sycl::range(1, (unsigned)n_q, (unsigned)s.n_head) *
-                    sycl::range(1, 1, HD),
-                sycl::range(1, 1, HD)),
-            exp_props, [=](sycl::nd_item<3> item_ct1) {
-                attn_merge_kernel(part_acc, part_m, part_l, n_chunks, attn,
-                                  stride);
-            });
+// qsa_decode_attn_batch's merge pass over the partials launch_chunks_batch wrote; `v2` names the merge kernel
+void launch_merge_batch(const int32_t *steps, int64_t cap, const QsaShapes &s,
+                        const float *scratch, float *attn, int64_t n_q, int v2,
+                        dpct::queue_ptr st) {
+    const int n_chunks = (int) ((cap + CHUNK - 1) / CHUNK);
+    const long long stride = (long long) qsa_decode_attn_scratch_floats(cap, s);
+    const float* part_acc = scratch;
+    const float* part_m = scratch + (size_t) n_chunks * s.n_head * HD;
+    const float* part_l = part_m + (size_t) n_chunks * s.n_head;
+    launch_merge(v2, part_acc, part_m, part_l, n_chunks, steps, attn, stride, (unsigned) s.n_head, (unsigned) n_q, st);
+}
+
+}  // namespace
+
+void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
+                           int64_t cap, const QsaShapes& s, float* scratch, float* attn, int64_t n_q, void* stream) {
+    if (n_q <= 0) return;
+    if (s.head_dim != HD || s.n_head != (int64_t) G * s.n_head_kv || cap <= 0 || !scratch || !ids || !steps ||
+        !pools.page_table || n_q > 65535) {
+        std::fprintf(stderr, "qsa_decode_attn_batch: unsupported geometry or missing buffers\n");
+        std::exit(1);
     }
+    dpct::queue_ptr st = strata::q_of(stream);
+    launch_chunks_batch(q, pools, ids, steps, cap, s, scratch, n_q, st, -1);
+    launch_merge_batch(steps, cap, s, scratch, attn, n_q, attn_merge_v2(), st);
+    /*
+    DPCT1010: SYCL uses exceptions to report errors and does not use the
+    error codes. The cudaGetLastError function call was replaced with 0. You
+    need to rewrite this code.
+    */
+    const dpct::err0 e = 0;
+}
+
+bool qsa_decode_attn_slots(const float* q, const QsaAttnSlotPools& pools, const int32_t* ids, const int32_t* steps,
+                           int64_t cap, const QsaShapes& s, float* scratch, float* attn, int64_t n_q, void* stream) {
+    if (n_q <= 0) return true;
+    if (n_q > kQsaAttnMaxSlots) return false;
+    if (s.head_dim != HD || s.n_head != (int64_t) G * s.n_head_kv || cap <= 0 || !scratch || !ids || !steps) {
+        std::fprintf(stderr, "qsa_decode_attn_slots: unsupported geometry or missing buffers\n");
+        std::exit(1);
+    }
+    const int kv_mode = attn_kv_mode(pools.p[0]);
+    for (int64_t z = 0; z < n_q; ++z) {
+        if (!pools.p[z].page_table) {
+            std::fprintf(stderr, "qsa_decode_attn_slots: missing page table\n");
+            std::exit(1);
+        }
+        if (attn_kv_mode(pools.p[z]) != kv_mode) return false;
+    }
+    // what qsa_decode_attn_batch picks for one query: the lane-cell scores only when the environment asks (n_q < 16),
+    // else the warp kernel in the layout STRATA_ATTN_RS names (the same bits either way)
+    const bool lane_cell = attn_lane_cell_env() > 0;
+    static const int rs_env = [] { const char* v = std::getenv("STRATA_ATTN_RS"); return v ? std::atoi(v) : 2; }();
+    const bool rs2 = rs_env == 2;
+    const int n_chunks = (int) ((cap + CHUNK - 1) / CHUNK);
+    const long long stride = (long long) qsa_decode_attn_scratch_floats(cap, s);
+    float* part_acc = scratch;
+    float* part_m = scratch + (size_t) n_chunks * s.n_head * HD;
+    float* part_l = part_m + (size_t) n_chunks * s.n_head;
+    const float scale = 1.0f / sqrtf((float) HD);
+    const dpct::dim3 grid((unsigned)n_chunks, (unsigned)s.n_head_kv,
+                          (unsigned)n_q);
+    dpct::queue_ptr st = strata::q_of(stream);
+#define STRATA_ATTN_SLOTS(M, LC, RSV)                                          \
+    {                                                                          \
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};        \
+        dpct::has_capability_or_fail(st->get_device(), {sycl::aspect::fp16});  \
+                                                                               \
+        st->submit([&](sycl::handler &cgh) {                                   \
+            auto q_ct0 = q;                                                    \
+            QsaAttnSlotPools pools_ct1 = pools;                                \
+            auto ids_ct2 = ids;                                                \
+            auto steps_ct3 = steps;                                            \
+            auto s_n_head_kv_ct4 = (int)s.n_head_kv;                           \
+            auto s_page_size_ct5 = (int)s.page_size;                           \
+            auto scale_ct6 = scale;                                            \
+            auto part_acc_ct7 = part_acc;                                      \
+            auto part_m_ct8 = part_m;                                          \
+            auto part_l_ct9 = part_l;                                          \
+            auto n_chunks_ct10 = n_chunks;                                     \
+            auto cap_ct11 = (int)cap;                                          \
+            auto stride_ct12 = stride;                                         \
+                                                                               \
+            cgh.parallel_for<dpct_kernel_name<                                 \
+                class attn_chunk_slots_kernel_9e16b6, dpct_kernel_scalar<M>,   \
+                dpct_kernel_scalar<LC>, dpct_kernel_scalar<RSV>>>(             \
+                sycl::nd_range<3>(grid * sycl::range(1, 1, THREADS),           \
+                                  sycl::range(1, 1, THREADS)),                 \
+                exp_props,                                                     \
+                [=](sycl::nd_item<3> item_ct1)                                 \
+                    [[sycl::reqd_sub_group_size(32)]] {                        \
+                        attn_chunk_slots_kernel<M, LC, RSV>(                   \
+                            q_ct0, pools_ct1, ids_ct2, steps_ct3,              \
+                            s_n_head_kv_ct4, s_page_size_ct5, scale_ct6,       \
+                            part_acc_ct7, part_m_ct8, part_l_ct9,              \
+                            n_chunks_ct10, cap_ct11, stride_ct12);             \
+                    });                                                        \
+        });                                                                    \
+    }
+    if (lane_cell) {
+        if (kv_mode == 3) STRATA_ATTN_SLOTS(3, true, 0)
+        else if (kv_mode == 2) STRATA_ATTN_SLOTS(2, true, 0)
+        else if (kv_mode == 1) STRATA_ATTN_SLOTS(1, true, 0)
+        else STRATA_ATTN_SLOTS(0, true, 0)
+    } else if (rs2) {
+        if (kv_mode == 3) STRATA_ATTN_SLOTS(3, false, 2)
+        else if (kv_mode == 2) STRATA_ATTN_SLOTS(2, false, 2)
+        else if (kv_mode == 1) STRATA_ATTN_SLOTS(1, false, 2)
+        else STRATA_ATTN_SLOTS(0, false, 2)
+    } else {
+        if (kv_mode == 3) STRATA_ATTN_SLOTS(3, false, 0)
+        else if (kv_mode == 2) STRATA_ATTN_SLOTS(2, false, 0)
+        else if (kv_mode == 1) STRATA_ATTN_SLOTS(1, false, 0)
+        else STRATA_ATTN_SLOTS(0, false, 0)
+    }
+#undef STRATA_ATTN_SLOTS
+    launch_merge(attn_merge_v2(), part_acc, part_m, part_l, n_chunks, steps, attn, stride, (unsigned) s.n_head,
+                 (unsigned) n_q, st);
+    /*
+    DPCT1010: SYCL uses exceptions to report errors and does not use the
+    error codes. The cudaGetLastError function call was replaced with 0. You
+    need to rewrite this code.
+    */
+    const dpct::err0 e = 0;
+
+    return true;
+}
+
+void qsa_decode_attn_batch_rows(const float* q, const QsaAttnPoolsRows& rows, const int32_t* ids, const int32_t* steps,
+                                int64_t cap, const QsaShapes& s, float* scratch, float* attn, int64_t n_q, void* stream) {
+    if (n_q <= 0) return;
+    const QsaAttnPools& pools = rows.p[0];
+    if (rows.n != n_q || n_q > kAttnRowsMax || s.head_dim != HD || s.n_head != (int64_t) G * s.n_head_kv || cap <= 0 ||
+        !scratch || !ids || !steps) {
+        std::fprintf(stderr, "qsa_decode_attn_batch_rows: unsupported geometry or missing buffers\n");
+        std::exit(1);
+    }
+    const int kv_mode = attn_kv_mode(pools);
+    const int n_chunks = (int) ((cap + CHUNK - 1) / CHUNK);
+    const long long stride = (long long) qsa_decode_attn_scratch_floats(cap, s);
+    float* part_acc = scratch;
+    float* part_m = scratch + (size_t) n_chunks * s.n_head * HD;
+    float* part_l = part_m + (size_t) n_chunks * s.n_head;
+    const float scale = 1.0f / sqrtf((float) HD);
+    const dpct::dim3 grid((unsigned)n_chunks, (unsigned)s.n_head_kv,
+                          (unsigned)n_q);
+    dpct::queue_ptr st = strata::q_of(stream);
+    // The warp kernel is what qsa_decode_attn_batch runs for one query unless the lane-cell scores are asked for by the
+    // environment: then each row goes through that call, one launch per row.
+    if (attn_lane_cell_env() > 0) {
+        for (int64_t r = 0; r < n_q; ++r)
+            qsa_decode_attn_batch(q + (size_t) r * s.n_head * HD, rows.p[r], ids + (size_t) r * cap,
+                                  steps + (size_t) r * kStepCount, cap, s, scratch + (size_t) r * stride,
+                                  attn + (size_t) r * s.n_head * HD, 1, stream);
+        return;
+    }
+    static const int rs_env = [] { const char* v = std::getenv("STRATA_ATTN_RS"); return v ? std::atoi(v) : 2; }();
+    const bool rs2 = rs_env == 2;
+#define STRATA_ATTN_ROWS(M, RSV)                                               \
+    {                                                                          \
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};        \
+        dpct::has_capability_or_fail(st->get_device(), {sycl::aspect::fp16});  \
+                                                                               \
+        st->submit([&](sycl::handler &cgh) {                                   \
+            auto q_ct0 = q;                                                    \
+            QsaAttnPoolsRows rows_ct1 = rows;                                  \
+            auto ids_ct2 = ids;                                                \
+            auto steps_ct3 = steps;                                            \
+            auto s_n_head_kv_ct4 = (int)s.n_head_kv;                           \
+            auto s_page_size_ct5 = (int)s.page_size;                           \
+            auto scale_ct6 = scale;                                            \
+            auto part_acc_ct7 = part_acc;                                      \
+            auto part_m_ct8 = part_m;                                          \
+            auto part_l_ct9 = part_l;                                          \
+            auto n_chunks_ct10 = n_chunks;                                     \
+            auto cap_ct11 = (int)cap;                                          \
+            auto stride_ct12 = stride;                                         \
+                                                                               \
+            cgh.parallel_for<dpct_kernel_name<                                 \
+                class attn_chunk_rows_kernel_e71e11, dpct_kernel_scalar<M>,    \
+                dpct_kernel_scalar<RSV>>>(                                     \
+                sycl::nd_range<3>(grid * sycl::range(1, 1, THREADS),           \
+                                  sycl::range(1, 1, THREADS)),                 \
+                exp_props,                                                     \
+                [=](sycl::nd_item<3> item_ct1)                                 \
+                    [[sycl::reqd_sub_group_size(32)]] {                        \
+                        attn_chunk_rows_kernel<M, RSV>(                        \
+                            q_ct0, rows_ct1, ids_ct2, steps_ct3,               \
+                            s_n_head_kv_ct4, s_page_size_ct5, scale_ct6,       \
+                            part_acc_ct7, part_m_ct8, part_l_ct9,              \
+                            n_chunks_ct10, cap_ct11, stride_ct12);             \
+                    });                                                        \
+        });                                                                    \
+    }
+    if (rs2) {
+        if (kv_mode == 3) STRATA_ATTN_ROWS(3, 2)
+        else if (kv_mode == 2) STRATA_ATTN_ROWS(2, 2)
+        else if (kv_mode == 1) STRATA_ATTN_ROWS(1, 2)
+        else STRATA_ATTN_ROWS(0, 2)
+    } else {
+        if (kv_mode == 3) STRATA_ATTN_ROWS(3, 0)
+        else if (kv_mode == 2) STRATA_ATTN_ROWS(2, 0)
+        else if (kv_mode == 1) STRATA_ATTN_ROWS(1, 0)
+        else STRATA_ATTN_ROWS(0, 0)
+    }
+#undef STRATA_ATTN_ROWS
+    launch_merge(attn_merge_v2(), part_acc, part_m, part_l, n_chunks, steps, attn, stride, (unsigned) s.n_head,
+                 (unsigned) n_q, st);
     /*
     DPCT1010: SYCL uses exceptions to report errors and does not use the
     error codes. The cudaGetLastError function call was replaced with 0. You
@@ -1090,17 +1473,7 @@ void qsa_decode_attn_step(const float* q, const QsaAttnPools& pools, const int32
                                      part_l, n_chunks, 0, 0);
             });
     }
-    {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{};
-
-        st->parallel_for<dpct_kernel_name<class attn_merge_kernel_c055e7>>(
-            sycl::nd_range<3>(sycl::range(1, 1, (unsigned)s.n_head) *
-                                  sycl::range(1, 1, HD),
-                              sycl::range(1, 1, HD)),
-            exp_props, [=](sycl::nd_item<3> item_ct1) {
-                attn_merge_kernel(part_acc, part_m, part_l, n_chunks, attn, 0);
-            });
-    }
+    launch_merge(attn_merge_v2(), part_acc, part_m, part_l, n_chunks, step, attn, 0, (unsigned) s.n_head, 1u, st);
     /*
     DPCT1010: SYCL uses exceptions to report errors and does not use the
     error codes. The cudaGetLastError function call was replaced with 0. You
@@ -1132,5 +1505,30 @@ void qsa_prompt_attn_percell(const float* q, const QsaAttnPools& pools, const in
                                        sycl::range<3>(1, 1, HD)),
                      [=](sycl::nd_item<3>) { attn_merge_kernel(pa, pm, pl, nc, attn, stride); });
 }
+
+// qsa_merge_daily_parity: qsa_decode_attn_batch's two passes apart, the chunk kernel and the merge named by the
+// arguments (never the environment).  The engine never calls these.  `daily_chunk` 1 (the Daily's pre-sm_75 kernel) has
+// no SYCL counterpart: it runs attn_chunk_kernel too.
+void qsa_decode_attn_chunks_only(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
+                                 int64_t cap, const QsaShapes& s, float* scratch, int64_t n_q, int daily_chunk,
+                                 void* stream) {
+    if (n_q <= 0 || n_q > 65535 || s.head_dim != HD || s.n_head != (int64_t) G * s.n_head_kv || cap <= 0 || !scratch ||
+        !q || !ids || !steps || !pools.page_table || (daily_chunk != 0 && daily_chunk != 1)) {
+        std::fprintf(stderr, "qsa_decode_attn_chunks_only: unsupported geometry or missing buffers\n");
+        std::exit(1);
+    }
+    launch_chunks_batch(q, pools, ids, steps, cap, s, scratch, n_q, strata::q_of(stream), daily_chunk);
+}
+
+void qsa_decode_attn_merge_only(const int32_t* steps, int64_t cap, const QsaShapes& s, const float* scratch,
+                                float* attn, int64_t n_q, int v2, void* stream) {
+    if (n_q <= 0 || n_q > 65535 || s.head_dim != HD || s.n_head != (int64_t) G * s.n_head_kv || cap <= 0 || !scratch ||
+        (v2 != 0 && v2 != 1) || !steps || !attn) {
+        std::fprintf(stderr, "qsa_decode_attn_merge_only: unsupported geometry or missing buffers\n");
+        std::exit(1);
+    }
+    launch_merge_batch(steps, cap, s, scratch, attn, n_q, v2, strata::q_of(stream));
+}
+
 
 }  // namespace strata::kernels
