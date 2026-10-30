@@ -50,6 +50,7 @@
 #include "strata/kernels/qsa_pattn.hpp"
 #include "strata/kernels/qsa_prompt_attn.hpp"
 #include "strata/kernels/qsa_select.hpp"
+#include "strata/kernels/qsa_select_xmx.hpp"
 #include "strata/prefill/gemm.hpp"
 #include "strata/prefill/moe_fused.hpp"
 #include "strata/prefill/moe_ws.hpp"
@@ -5197,6 +5198,32 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                         break;
                     }
                     pt.mark(kPfQsaSel, cs);
+                    // SYCL port (Battlemage): the block scores on XMX with the relu-sum fused (qsa_select_xmx.hpp: FP16
+                    // hi + lo splits, FP32-level, not bitwise), the chunk's keys split once here into the attention
+                    // scratch (free until this layer's attention, same queue). A chunk whose split keys do not fit
+                    // there (--max-context past ~200K, a small STRATA_ATTN_BATCH) keeps the GEMM tiles below.
+                    // STRATA_SELECT_XMX=0, or STRATA_SELECT_GEMM / STRATA_SELECT_OLD set: off.
+                    static const bool sel_xmx_off = [] {
+                        const char* v = std::getenv("STRATA_SELECT_XMX");
+                        return (v != nullptr && v[0] == '0') || std::getenv("STRATA_SELECT_GEMM") != nullptr;
+                    }();
+                    strata::kernels::QsaSelectXmx sel_x;
+                    bool sel_xmx = false;
+                    if (!sel_xmx_off && std::getenv("STRATA_SELECT_OLD") == nullptr && m.attn_scratch != nullptr && T > 0) {
+                        sel_x.scratch = m.attn_scratch;
+                        sel_x.key_blocks = (int64_t) m.steps_host[(size_t) ((T - 1) * strata::kernels::kStepCount +
+                                                                            strata::kernels::kStepNBid)] + 1;
+                        sel_x.max_q = m.sel_batch;
+                        const uint64_t have = (uint64_t) m.attn_batch * strata::kernels::qsa_decode_attn_scratch_floats(m.cap, s) * 4;
+                        try {
+                            sel_xmx = strata::kernels::qsa_select_xmx_bytes(sel_x.key_blocks, sel_x.max_q) <= have &&
+                                      strata::kernels::qsa_select_xmx_keys(sel_x, st.idx_pooled, s, m.cs);
+                        } catch (const std::exception& ex) {
+                            static bool said = false;
+                            if (!said) std::fprintf(stderr, "prefill: the XMX block scores failed (%s); the GEMM tiles instead\n", ex.what());
+                            said = true;
+                        }
+                    }
                     for (int64_t t0 = 0; t0 < T; t0 += m.sel_batch) {
                         const int64_t nb = std::min(m.sel_batch, T - t0);
                         const int32_t* steps0 = m.steps_dev + t0 * strata::kernels::kStepCount;
@@ -5216,7 +5243,18 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                         const int64_t sel_tile = std::min<int64_t>(8192, (int64_t) ((uint64_t) m.attn_batch *
                             strata::kernels::qsa_decode_attn_scratch_floats(m.cap, s) / (uint64_t) (nb * 4)));
                         bool sel_done = false;
-                        if (sel_gemm && !old_sel && m.attn_scratch != nullptr && s.idx_dim == 128 && s.idx_n_head == 4 &&
+                        if (sel_xmx) {
+                            try {
+                                sel_done = strata::kernels::qsa_block_scores_xmx(sel_x, st.idx_dead, m.q_idx + t0 * 512, steps0, nb,
+                                                                                 m.max_blocks, active, m.sel_scores, m.cs);
+                            } catch (const std::exception& ex) {
+                                static bool said = false;
+                                if (!said) std::fprintf(stderr, "prefill: the XMX block scores failed (%s); the GEMM tiles instead\n", ex.what());
+                                said = true;
+                            }
+                            sel_xmx = sel_done;   // the GEMM tiles below reuse the scratch the split keys are in
+                        }
+                        if (!sel_done && sel_gemm && !old_sel && m.attn_scratch != nullptr && s.idx_dim == 128 && s.idx_n_head == 4 &&
                             sel_tile >= 256) {
                             try {
                                 for (int64_t b0 = 0; b0 < active; b0 += sel_tile) {

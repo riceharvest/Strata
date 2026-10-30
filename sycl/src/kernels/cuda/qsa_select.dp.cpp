@@ -2823,7 +2823,268 @@ __dpct_inline__ void block_topk_multi_emit_kernel(const float *__restrict__ scor
     }
 }
 #endif  // SYCL port of STRATA_SELECT_LONG's kernels
+
+// ---- SYCL port (Battlemage): the prompt path's top-k from about one read of the scores.  On the B70 the 1,024-thread
+// register kernel (sub-group 32) took 80 ms of a 16,384-query chunk at 118K and block_topk_kernel 36 ms: four radix passes
+// over every key, the first of which puts nearly all of them in one or two bins of the top byte (sign + 7 exponent bits) -
+// SLM atomics on one address.  Here a work-group of TC_T threads (sub-group 16) per query:
+//   1. a lower bound LB from TC_LINES runs of 16 consecutive blocks spread over the query's blocks (one coalesced load a
+//      run): the k-th largest of those keys rounded down to a 16-bit bin (two 8-bit radix passes from their highest
+//      differing bit), k set for ~3x the blocks the width needs;
+//   2. every block's key read once: sub-group s counts the blocks with key >= LB in its contiguous run of blocks;
+//   3. the runs read again (from cache) and the candidates written in ascending block order into local memory;
+//   4. block_topk_kernel's radix select over the candidates (the digits start at the highest bit in which the smallest
+//      and the largest candidate key differ, so the first pass spreads) and its emit.
+// IDENTICAL IDS to block_topk_kernel: when the candidates hold at least `width` cells, the width-th largest cell key thr
+// (the reference's threshold) is >= LB, so every block at or above thr is a candidate; thr, `above` (cells with a larger
+// key) and the emit (all cells above thr, then the first width - above cells at thr in ascending block order) depend only
+// on those blocks. A query whose candidates hold too few cells or more than TC_CAP blocks runs step 4 over all of its
+// blocks from memory instead (block_topk_kernel's algorithm, same ids). NaN keys are 0 (order_key) as there.
+constexpr int TC_T = 512, TC_SG = 16, TC_NSG = TC_T / TC_SG, TC_CAP = 4096, TC_LINES = 128, TC_U = 8;
+
+struct TopkCandSmem {
+    uint32_t key[TC_CAP];
+    int32_t blk[TC_CAP];
+    int hist[256];
+    int cnt[TC_NSG];
+    int cells[TC_NSG];
+    int misc[4];
+};
+
+// radix select + emit over n entries (key_of(j), blk_of(j)) in ascending block order, thread t taking a contiguous run;
+// every key is >= lo_key, and those not above hi_key share its bits above the highest bit in which lo_key and hi_key
+// differ; keys above that range count as `above` from the start (their <= 3 cells never hold the threshold).
+// block_topk_kernel's rule.
+template <typename KeyOf, typename BlkOf>
+inline void cand_select_emit(sycl::nd_item<1> it, TopkCandSmem& sm, int64_t n, KeyOf key_of, BlkOf blk_of, int64_t n_kv,
+                             int64_t n_bid, int64_t width, uint32_t lo_key, uint32_t hi_key, int32_t* out) {
+    const auto grp = it.get_group();
+    const int t = (int) it.get_local_id(0);
+    auto weight = [&](int64_t b) -> int { return b < n_bid ? R : (int) (n_kv - n_bid * R); };
+    const int64_t per = (n + TC_T - 1) / TC_T, j0 = (int64_t) t * per, j1 = j0 + per < n ? j0 + per : n;
+    const uint32_t diff = lo_key ^ hi_key;
+    int hi = diff == 0 ? 0 : 32 - (int) sycl::clz(diff);   // bits that can differ among the keys
+    uint32_t prefix = hi >= 32 ? 0u : (hi_key >> hi) << hi;
+    int above = 0;   // cells of keys above the range (the tail block's +1e9): above every key in it
+    if (hi < 32) {
+        int pre = 0;
+        for (int64_t j = j0; j < j1; ++j) {
+            const int w = weight(blk_of(j));
+            if (w > 0 && key_of(j) >> hi > prefix >> hi) pre += w;
+        }
+        above = sycl::reduce_over_group(grp, pre, sycl::plus<int>());
+    }
+    while (hi > 0) {
+        const int lo = hi > 8 ? hi - 8 : 0, nbin = 1 << (hi - lo);
+        for (int i = t; i < 256; i += TC_T) sm.hist[i] = 0;
+        sycl::group_barrier(grp);
+        for (int64_t j = j0; j < j1; ++j) {
+            const int w = weight(blk_of(j));
+            if (w == 0) continue;
+            const uint32_t k = key_of(j);
+            if ((uint64_t) k >> hi == (uint64_t) prefix >> hi)
+                sycl::atomic_ref<int, sycl::memory_order::relaxed, sycl::memory_scope::work_group,
+                                 sycl::access::address_space::local_space>(sm.hist[(k >> lo) & (uint32_t) (nbin - 1)]) += w;
+        }
+        sycl::group_barrier(grp);
+        // the digit: the first bin from the top whose cells with the count above reach `width` (bin 0 when none of the
+        // others does) - a suffix sum over the bins, one per thread
+        const int v = t < nbin ? sm.hist[nbin - 1 - t] : 0;
+        const int inc = sycl::inclusive_scan_over_group(grp, v, sycl::plus<int>());
+        if (t < nbin && above + inc - v < width && (above + inc >= width || t == nbin - 1)) {
+            sm.misc[0] = nbin - 1 - t;
+            sm.misc[1] = above + inc - v;
+        }
+        sycl::group_barrier(grp);
+        prefix |= (uint32_t) sm.misc[0] << lo;
+        above = sm.misc[1];
+        sycl::group_barrier(grp);
+        hi = lo;
+    }
+    const uint32_t thr = prefix;
+    const int64_t eq_budget = width - above;
+    int gt = 0, eq = 0;
+    for (int64_t j = j0; j < j1; ++j) {
+        const int w = weight(blk_of(j));
+        if (w == 0) continue;
+        const uint32_t k = key_of(j);
+        if (k > thr) gt += w;
+        else if (k == thr) eq += w;
+    }
+    const int eq_before = sycl::exclusive_scan_over_group(grp, eq, sycl::plus<int>());
+    int64_t my_eq = eq_budget - eq_before;
+    if (my_eq < 0) my_eq = 0;
+    if (my_eq > eq) my_eq = eq;
+    int64_t wpos = sycl::exclusive_scan_over_group(grp, gt + (int) my_eq, sycl::plus<int>());
+    int64_t eq_left = my_eq;
+    for (int64_t j = j0; j < j1; ++j) {
+        const int64_t b = blk_of(j);
+        const int w = weight(b);
+        if (w == 0) continue;
+        const uint32_t k = key_of(j);
+        if (k > thr) {
+            for (int c = 0; c < w; ++c) out[wpos++] = (int32_t) (b * R + c);
+        } else if (k == thr) {
+            for (int c = 0; c < w && eq_left > 0; ++c, --eq_left) out[wpos++] = (int32_t) (b * R + c);
+        }
+    }
+}
+
+void block_topk_cand_kernel(sycl::nd_item<1> it, TopkCandSmem& sm, const float* __restrict__ scores,
+                            const int32_t* __restrict__ steps, int64_t max_blocks, int64_t cap, int32_t* __restrict__ ids) {
+    const auto grp = it.get_group();
+    const auto sg = it.get_sub_group();
+    const int64_t qi = (int64_t) it.get_group(0);
+    const int32_t* st = steps + qi * kStepCount;
+    const int64_t n_kv = st[kStepNKv], n_bid = st[kStepNBid], width = st[kStepWidth];
+    int32_t* out = ids + qi * cap;
+    const int t = (int) it.get_local_id(0), lane = (int) sg.get_local_id()[0], sgi = (int) sg.get_group_id()[0];
+    if (n_kv <= width) {
+        for (int64_t j = t; j < n_kv; j += TC_T) out[j] = (int32_t) j;
+        return;
+    }
+    const float* sc = scores + qi * max_blocks;
+    const int64_t nb = n_bid + 1;
+    auto weight = [&](int64_t b) -> int { return b < n_bid ? R : (int) (n_kv - n_bid * R); };
+    // 1. LB: none when every block fits the candidate buffer
+    uint32_t lb = 0;
+    if (nb > TC_CAP) {
+        // line j (sub-group j % TC_NSG, lane l: block j * stride + l) in stretch j of n_bid / TC_LINES blocks (>= 32)
+        constexpr int PER = TC_LINES / TC_NSG;
+        const int64_t stride = n_bid / TC_LINES;
+        const int ns = TC_LINES * TC_SG;
+        const int k = (int) sycl::max<int64_t>(1, 3 * (width / R) * (int64_t) ns / n_bid);
+        uint32_t sk[PER];
+        uint32_t orv = 0;
+        const uint32_t ref = order_key(sc[0]);
+#pragma unroll
+        for (int u = 0; u < PER; ++u) sk[u] = order_key(sc[(int64_t) (u * TC_NSG + sgi) * stride + lane]);
+#pragma unroll
+        for (int u = 0; u < PER; ++u) orv |= sk[u] ^ ref;
+        orv = sycl::reduce_over_group(grp, orv, sycl::bit_or<uint32_t>());
+        int hi = orv == 0 ? 0 : 32 - (int) sycl::clz(orv);
+        uint32_t prefix = hi >= 32 ? 0u : (ref >> hi) << hi;
+        int above = 0;
+        for (int pass = 0; pass < 2 && hi > 0; ++pass) {
+            const int lo = hi > 8 ? hi - 8 : 0, nbin = 1 << (hi - lo);
+            for (int i = t; i < 256; i += TC_T) sm.hist[i] = 0;
+            sycl::group_barrier(grp);
+#pragma unroll
+            for (int u = 0; u < PER; ++u)
+                if ((uint64_t) sk[u] >> hi == (uint64_t) prefix >> hi)
+                    sycl::atomic_ref<int, sycl::memory_order::relaxed, sycl::memory_scope::work_group,
+                                     sycl::access::address_space::local_space>(sm.hist[(sk[u] >> lo) & (uint32_t) (nbin - 1)]) += 1;
+            sycl::group_barrier(grp);
+            const int v = t < nbin ? sm.hist[nbin - 1 - t] : 0;
+            const int inc = sycl::inclusive_scan_over_group(grp, v, sycl::plus<int>());
+            if (t < nbin && above + inc - v < k && (above + inc >= k || t == nbin - 1)) {
+                sm.misc[0] = nbin - 1 - t;
+                sm.misc[1] = above + inc - v;
+            }
+            sycl::group_barrier(grp);
+            prefix |= (uint32_t) sm.misc[0] << lo;
+            above = sm.misc[1];
+            sycl::group_barrier(grp);
+            hi = lo;
+        }
+        lb = prefix;   // the lower edge of the bin holding the k-th largest sample: <= that sample
+    }
+    // 2. count the candidates of each sub-group's run (16 consecutive blocks a load: coalesced)
+    const int64_t run = ((nb + TC_NSG - 1) / TC_NSG + TC_SG - 1) / TC_SG * TC_SG;
+    const int64_t r0 = (int64_t) sgi * run, r1 = r0 + run < nb ? r0 + run : nb;
+    int my_b = 0, my_c = 0;
+    uint32_t my_max = 0, my_min = 0xffffffffu;
+    for (int64_t b0 = r0; b0 < r1; b0 += TC_SG * TC_U) {   // TC_U loads in flight a lane
+        uint32_t k[TC_U];
+#pragma unroll
+        for (int u = 0; u < TC_U; ++u) {
+            const int64_t b = b0 + u * TC_SG + lane;
+            k[u] = b < r1 ? order_key(sc[b]) : 0u;
+        }
+#pragma unroll
+        for (int u = 0; u < TC_U; ++u) {
+            const int64_t b = b0 + u * TC_SG + lane;
+            const int w = b < r1 ? weight(b) : 0;
+            if (w > 0 && k[u] >= lb) {
+                ++my_b;
+                my_c += w;
+                my_min = sycl::min(my_min, k[u]);
+                if (b < n_bid) my_max = sycl::max(my_max, k[u]);   // the tail's +1e9 would widen the first digit's range
+            }
+        }
+    }
+    const int sb = sycl::reduce_over_group(sg, my_b, sycl::plus<int>()), scl = sycl::reduce_over_group(sg, my_c, sycl::plus<int>());
+    if (lane == 0) { sm.cnt[sgi] = sb; sm.cells[sgi] = scl; }
+    const uint32_t kmax = sycl::reduce_over_group(grp, my_max, sycl::maximum<uint32_t>()),
+                   kmin = sycl::reduce_over_group(grp, my_min, sycl::minimum<uint32_t>());   // >= LB
+    sycl::group_barrier(grp);
+    int total_b = 0, total_c = 0, off = 0;
+    for (int i = 0; i < TC_NSG; ++i) {
+        if (i == sgi) off = total_b;
+        total_b += sm.cnt[i];
+        total_c += sm.cells[i];
+    }
+    if (total_c < width || total_b > TC_CAP) {   // LB too high, or too many candidates: every block from memory
+        cand_select_emit(it, sm, nb, [&](int64_t j) { return order_key(sc[j]); }, [](int64_t j) { return j; }, n_kv, n_bid,
+                         width, 0u, 0xffffffffu, out);
+        return;
+    }
+    // 3. the candidates in ascending block order
+    for (int64_t b0 = r0; b0 < r1; b0 += TC_SG * TC_U) {
+        uint32_t k[TC_U];
+#pragma unroll
+        for (int u = 0; u < TC_U; ++u) {
+            const int64_t b = b0 + u * TC_SG + lane;
+            k[u] = b < r1 ? order_key(sc[b]) : 0u;
+        }
+#pragma unroll
+        for (int u = 0; u < TC_U; ++u) {
+            const int64_t b = b0 + u * TC_SG + lane;
+            const bool c = b < r1 && weight(b) > 0 && k[u] >= lb;
+            uint32_t bits = 0;   // the lanes with a candidate; a lane's slot is the count below it
+            sycl::ext::oneapi::group_ballot(sg, c).extract_bits(bits);
+            if (c) {
+                const int pos = off + (int) sycl::popcount(bits & ((1u << lane) - 1u));
+                sm.key[pos] = k[u];
+                sm.blk[pos] = (int32_t) b;
+            }
+            off += (int) sycl::popcount(bits);
+        }
+    }
+    sycl::group_barrier(grp);
+    // 4. the select and the emit over the candidates
+    cand_select_emit(it, sm, total_b, [&](int64_t j) { return sm.key[j]; }, [&](int64_t j) { return (int64_t) sm.blk[j]; },
+                     n_kv, n_bid, width, kmin, kmax, out);
+}
 }  // namespace
+
+// STRATA_TOPK_CAND: 0 off, 1 on for any SYCL GPU; unset: on for a Battlemage GPU (bmg-g21 / bmg-g31, by architecture id)
+static bool topk_cand_on(dpct::queue_ptr q) {
+    static const int env = [] { const char* v = std::getenv("STRATA_TOPK_CAND"); return v ? (std::atoi(v) != 0 ? 1 : 0) : -1; }();
+    if (env >= 0) return env != 0;
+    static int bmg = -1;
+    if (bmg < 0) {
+        namespace ex = sycl::ext::oneapi::experimental;
+        const sycl::device d = q->get_device();
+        bool b = false;
+        if (d.is_gpu()) {
+            const auto a = d.get_info<ex::info::device::architecture>();
+            b = a == ex::architecture::intel_gpu_bmg_g21 || a == ex::architecture::intel_gpu_bmg_g31;
+        }
+        bmg = b ? 1 : 0;
+    }
+    return bmg == 1;
+}
+
+static void qsa_block_topk_cand(const float* scores, const int32_t* steps, int64_t nq, int64_t max_blocks, int64_t cap,
+                                int32_t* ids, dpct::queue_ptr q) {
+    q->submit([&](sycl::handler& h) {
+        sycl::local_accessor<TopkCandSmem, 0> sm(h);
+        h.parallel_for(sycl::nd_range<1>((size_t) nq * TC_T, TC_T), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
+            block_topk_cand_kernel(it, sm, scores, steps, max_blocks, cap, ids);
+        });
+    });
+}
 
 // SYCL port: the prompt path's block scores as oneMKL GEMM tiles (prefill.cpp): S[q * IDX_HEADS + h][b - b0] is
 // pooled[b] . q_idx[q][h] for the blocks [b0, b0 + nb); this turns them into scores[q][b] - relu per indexer head,
@@ -4966,6 +5227,13 @@ void qsa_block_topk(const float* scores, const int32_t* steps, int64_t nq, int64
     // reading them from memory; the same ids. STRATA_TOPK_OLD=1: the original kernel
     static const bool old = std::getenv("STRATA_TOPK_OLD") != nullptr;
     if (nq <= 0) return;
+    // SYCL port: the prompt path (a call with an active-block count) on Battlemage - block_topk_cand_kernel, the same
+    // ids. Decode calls pass no count and keep the dispatch below. STRATA_TOPK_CAND=0: off.
+    if (active_blocks > 0 && !old && s.idx_block == R && cap >= qsa_selection_width(kTopkMaxCells, s) &&
+        topk_cand_on(strata::q_of(stream))) {
+        qsa_block_topk_cand(scores, steps, nq, max_blocks, cap, ids, strata::q_of(stream));
+        return;
+    }
 #if !defined(__HIPCC__)
     // sm_90+: a cluster of CL_N CTAs per query for the calls of a few queries (decode windows); the same ids.
     // STRATA_QSA_CLUSTER=0: the one-CTA kernels below
