@@ -173,8 +173,16 @@ bool prompt_run(const int64_t* tokens, int64_t n, int64_t pos0, const float* con
 namespace {
 // STRATA_PLE_COMPACT=1 (opt-in): the prompt chunk's PLE rows go up raw and are dequantized on the device (IQ4_NL tables
 // held in memory); the same floats as the host dequant, 7x fewer bytes over PCIe
+// SYCL port: refused - on one Arc Pro B70 a prompt with it stalled in its third chunk (2026-10-30, an 8K prompt), and with
+// STRATA_PLE_COPY_STREAM in the first chunk of a 118K one.  The PLE rows go up as floats, as before.
 bool ple_compact_on() {
-    static const bool on = [] { const char* v = std::getenv("STRATA_PLE_COMPACT"); return v != nullptr && v[0] == '1'; }();
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_PLE_COMPACT");
+        if (v != nullptr && v[0] == '1')
+            std::fprintf(stderr, "strata prefill: STRATA_PLE_COMPACT=1 is not supported by the SYCL engine (it stalls on the Arc); "
+                                 "the PLE rows go up as floats\n");
+        return false;
+    }();
     return on;
 }
 // STRATA_PLE_COPY_STREAM=1 (opt-in, with PLE_COMPACT): the raw rows go up on a stream of their own instead of the compute
@@ -9426,7 +9434,18 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
     // layer-major prefill: OPT-IN on this backend - only STRATA_PREFILL_LAYER_MAJOR=1 turns it on (upstream turns it on by
     // default for a CUDA layer split; the B70 defaults are decided by one measurement)
     (void) lm_hip;
-    if (hand_in_ == nullptr && impl_ && lm_env_explicit() && std::atoi(lm_env_text()) != 0) {
+    // SYCL port: refused. Its only run on an Arc Pro B70 (Flash-Next IQ2_XS, a 118K prompt, 2026-10-30, with
+    // STRATA_PLE_COMPACT / STRATA_DEQUANT_SIDE also on, which stall by themselves) stalled at layer 11; on SYCL it would take
+    // the FP16 expert path, not the int8 ESIMD / XMX prompt kernels.  The chunk-major path below is the one that runs here.
+    if (lm_env_explicit() && std::atoi(lm_env_text()) != 0) {
+        static bool told = false;
+        if (!told) {
+            told = true;
+            std::fprintf(stderr, "strata prefill: STRATA_PREFILL_LAYER_MAJOR=1 is not supported by the SYCL engine (it stalls on the "
+                                 "Arc); the prompt is read chunk by chunk\n");
+        }
+    }
+    if (false && hand_in_ == nullptr && impl_ && lm_env_explicit() && std::atoi(lm_env_text()) != 0) {
         const bool by_default = !lm_env_explicit();
         for (Prefill* p = this; p != nullptr; p = p->next_) p->lm_by_default_ = by_default;
         std::string why;

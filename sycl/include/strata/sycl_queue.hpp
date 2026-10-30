@@ -181,6 +181,11 @@ inline void apply_b70_defaults() {
         {"STRATA_VERIFY_DEVICE_PLAN", "1"},
         {"STRATA_VERIFY_NO_HOST", "1"},
         {"STRATA_STAGER_THREADS", stager},
+        // 0.1.54 (2026-10-30, Flash-Next IQ2_XS, a 118K prompt, ~298 tokens): the long-context decode top-k and the
+        // cost-aware MTP window bring decode back to 48.6 tok/s from 42.6 (b70 before the merge: 47.4 / 50.2), the
+        // greedy answers byte-identical
+        {"STRATA_SELECT_LONG", "1"},
+        {"STRATA_SPEC_COST", "1"},
     };
     std::string applied;
     for (const auto& [k, v] : defaults) {

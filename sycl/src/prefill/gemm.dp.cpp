@@ -666,6 +666,17 @@ catch (sycl::exception const &exc) {
 bool gemm_dequant_side() {
 #if defined(__HIPCC__)
     return false;
+#elif defined(SYCL_LANGUAGE_VERSION)
+    // SYCL port: refused - on one Arc Pro B70 a prompt with it stalled at layer 5 of its first chunk (2026-10-30); the
+    // dequant stays on the compute queue
+    static const bool told = [] {
+        const char* v = std::getenv("STRATA_DEQUANT_SIDE");
+        if (v && v[0] == '1')
+            std::fprintf(stderr, "strata prefill: STRATA_DEQUANT_SIDE=1 is not supported by the SYCL engine (it stalls on the Arc)\n");
+        return true;
+    }();
+    (void) told;
+    return false;
 #else
     static const bool on = [] { const char* v = std::getenv("STRATA_DEQUANT_SIDE"); return v && v[0] == '1'; }();
     return on;
