@@ -228,8 +228,7 @@ void native_quantize_q8_1_kernel_wrapper(const float *x_, Q81Block *y_,
     unsigned int localMemSize = dpct::kernel_launcher::_local_mem_size;
     sycl::nd_range<3> nr = dpct::kernel_launcher::_nr;
 
-    auto exp_props = sycl::ext::oneapi::experimental::properties{
-        sycl::ext::oneapi::experimental::use_root_sync};
+    auto exp_props = sycl::ext::oneapi::experimental::properties{};
     dpct::has_capability_or_fail(queue.get_device(), {sycl::aspect::fp16});
 
     queue.parallel_for<dpct_kernel_name<class native_quantize_q8_1_kernel_>>(
@@ -2758,8 +2757,7 @@ bool b6_launch(const typename F::Block *w, const Q81Block *x, float *y,
             needed.
             */
         {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};
             dpct::has_capability_or_fail(s->get_device(), {sycl::aspect::fp16});
 
             s->parallel_for<dpct_kernel_name<class b6_mmvq_rows_kernel_8661e9,
@@ -2781,8 +2779,7 @@ bool b6_launch(const typename F::Block *w, const Q81Block *x, float *y,
             needed.
             */
         {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};
             dpct::has_capability_or_fail(s->get_device(), {sycl::aspect::fp16});
 
             s->parallel_for<dpct_kernel_name<class b6_mmvq_rows_kernel_eead8b,
@@ -2804,8 +2801,7 @@ bool b6_launch(const typename F::Block *w, const Q81Block *x, float *y,
         needed.
         */
         {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};
             dpct::has_capability_or_fail(s->get_device(), {sycl::aspect::fp16});
 
             s->parallel_for<dpct_kernel_name<class b6_mmvq_rows_kernel_35a7e5,
@@ -3706,8 +3702,7 @@ void launch_il_one(unsigned blocks, const typename I::F::Block *w,
         case 6: {
             iq4nl_values.init(*s);
 
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};
             dpct::has_capability_or_fail(s->get_device(), {sycl::aspect::fp16});
 
             s->submit([&](sycl::handler &cgh) {
@@ -3733,8 +3728,7 @@ void launch_il_one(unsigned blocks, const typename I::F::Block *w,
         case 2: {
             iq4nl_values.init(*s);
 
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};
             dpct::has_capability_or_fail(s->get_device(), {sycl::aspect::fp16});
 
             s->submit([&](sycl::handler &cgh) {
@@ -3760,8 +3754,7 @@ void launch_il_one(unsigned blocks, const typename I::F::Block *w,
         case 3: {
             iq4nl_values.init(*s);
 
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};
             dpct::has_capability_or_fail(s->get_device(), {sycl::aspect::fp16});
 
             s->submit([&](sycl::handler &cgh) {
@@ -3787,8 +3780,7 @@ void launch_il_one(unsigned blocks, const typename I::F::Block *w,
         case 4: {
             iq4nl_values.init(*s);
 
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};
             dpct::has_capability_or_fail(s->get_device(), {sycl::aspect::fp16});
 
             s->submit([&](sycl::handler &cgh) {
@@ -3814,8 +3806,7 @@ void launch_il_one(unsigned blocks, const typename I::F::Block *w,
         case 5: {
             iq4nl_values.init(*s);
 
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};
             dpct::has_capability_or_fail(s->get_device(), {sycl::aspect::fp16});
 
             s->submit([&](sycl::handler &cgh) {
@@ -3844,8 +3835,7 @@ void launch_il_one(unsigned blocks, const typename I::F::Block *w,
     {
         iq4nl_values.init(*s);
 
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
         dpct::has_capability_or_fail(s->get_device(), {sycl::aspect::fp16});
 
         s->submit([&](sycl::handler &cgh) {
@@ -4858,8 +4848,7 @@ bool q8_sm60_pack_impl(const void *weights, int n_in, int n_out,
     auto* qs = static_cast<int8_t*>(packed);
     auto *d = reinterpret_cast<sycl::half *>(qs + std::size_t(n_in) * n_out);
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
         dpct::has_capability_or_fail(dpct::get_in_order_queue().get_device(),
                                      {sycl::aspect::fp16});
 
@@ -5551,8 +5540,7 @@ void native_q2_0_mmvq(const void* weights, const void* x_q8_1, float* y,
         const unsigned blocks = unsigned((warps + WARPS - 1) / WARPS);
         switch (ncols) {
         case 1: {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
             s->parallel_for<dpct_kernel_name<class q2_0_warp_rows_kernel_c47bbf,
                                              dpct_kernel_scalar<1>>>(
@@ -5566,8 +5554,7 @@ void native_q2_0_mmvq(const void* weights, const void* x_q8_1, float* y,
                     });
         } break;
         case 2: {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
             s->parallel_for<dpct_kernel_name<class q2_0_warp_rows_kernel_c1ce32,
                                              dpct_kernel_scalar<2>>>(
@@ -5581,8 +5568,7 @@ void native_q2_0_mmvq(const void* weights, const void* x_q8_1, float* y,
                     });
         } break;
         case 3: {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
             s->parallel_for<dpct_kernel_name<class q2_0_warp_rows_kernel_94a56d,
                                              dpct_kernel_scalar<3>>>(
@@ -5596,8 +5582,7 @@ void native_q2_0_mmvq(const void* weights, const void* x_q8_1, float* y,
                     });
         } break;
         default: {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
             s->parallel_for<dpct_kernel_name<class q2_0_warp_rows_kernel_11229e,
                                              dpct_kernel_scalar<4>>>(
@@ -6220,8 +6205,7 @@ void native_quantize_q8_1_il(const float* x, void* x_q8_1, void* x_il, int n_in,
     const Q81IlParts parts = q8_1_il_parts(x_il, n_in, ncols);
     const int n_total = n_in * ncols;
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
         dpct::has_capability_or_fail(
             ((sycl::queue *)(strata::q_of(stream)))
                 ->get_device(),
@@ -6259,8 +6243,7 @@ void native_q8_1_interleave(const void* x_q8_1, void* x_il, int n_in, int ncols,
     const Q81IlParts parts = q8_1_il_parts(x_il, n_in, ncols);
     const int n_total = nb * 8 * ncols;
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         ((sycl::queue *)(strata::q_of(stream)))
             ->parallel_for<

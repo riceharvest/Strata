@@ -415,7 +415,16 @@ bool geometry(int type, int& block_elems, int& block_bytes) {
     }
 }
 
-template <typename T>
+// SYCL port: Coop false is dequant_f16_plain's form - the same kernels as ordinary launches.  dpct marked these launches
+// use_root_sync (a cooperative launch: every work-group resident at once; none of these kernels has a grid barrier).
+// Every kernel name below carries Coop, so the two forms name different kernels.
+template <bool Coop> auto dq_props() {
+    if constexpr (Coop)
+        return sycl::ext::oneapi::experimental::properties{};
+    else
+        return sycl::ext::oneapi::experimental::properties{};
+}
+template <typename T, bool Coop = true>
 void launch(int type, const void *blocks, int64_t row0, int64_t rows,
             int64_t cols, T *out, void *stream, int64_t ld = 0) try {
     int be = 0, bb = 0;
@@ -432,11 +441,10 @@ void launch(int type, const void *blocks, int64_t row0, int64_t rows,
     if (type == 8 && ld == cols && (reinterpret_cast<uintptr_t>(blocks) & 1) == 0 &&
         (reinterpret_cast<uintptr_t>(out) & 15) == 0) {   // contiguous rows only (the kernel writes out + g * 32)
         {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
+            auto exp_props = dq_props<Coop>();
 
             st->parallel_for<
-                dpct_kernel_name<class dequant_q8_0_kernel_2f8e0c, T>>(
+                dpct_kernel_name<class dequant_q8_0_kernel_2f8e0c, T, dpct_kernel_scalar<Coop>>>(
                 sycl::nd_range<3>(
                     sycl::range(1, 1, (unsigned)((4 * total + 255) / 256)) *
                         sycl::range(1, 1, 256),
@@ -477,7 +485,8 @@ void launch(int type, const void *blocks, int64_t row0, int64_t rows,
             auto out_ct6 = out;                                                \
                                                                                \
             cgh.parallel_for<dpct_kernel_name<                                 \
-                class dequant_wide_kernel_7b8d17, dpct_kernel_scalar<TY>, T>>( \
+                class dequant_wide_kernel_7b8d17, dpct_kernel_scalar<TY>, T,   \
+                dpct_kernel_scalar<Coop>>>(                                    \
                 sycl::nd_range<3>(sycl::range(1, 1, wgrid) *                   \
                                       sycl::range(1, 1, 256),                  \
                                   sycl::range(1, 1, 256)),                     \
@@ -529,8 +538,7 @@ void launch(int type, const void *blocks, int64_t row0, int64_t rows,
     if (!vec) 0;
 #define STRATA_DQ(TY)                                                          \
     if (vec) {                                                                 \
-        auto exp_props = sycl::ext::oneapi::experimental::properties{          \
-            sycl::ext::oneapi::experimental::use_root_sync};                   \
+        auto exp_props = dq_props<Coop>();                                     \
                                                                                \
         st->submit([&](sycl::handler &cgh) {                                   \
             auto p_ct0 = p;                                                    \
@@ -543,7 +551,8 @@ void launch(int type, const void *blocks, int64_t row0, int64_t rows,
                                                                                \
             cgh.parallel_for<dpct_kernel_name<class dequant_kernel_ec9311,     \
                                               dpct_kernel_scalar<TY>, T,       \
-                                              dpct_kernel_scalar<true>>>(      \
+                                              dpct_kernel_scalar<true>,        \
+                                              dpct_kernel_scalar<Coop>>>(      \
                 sycl::nd_range<3>(sycl::range(1, 1, grid) *                    \
                                       sycl::range(1, 1, 256),                  \
                                   sycl::range(1, 1, 256)),                     \
@@ -554,8 +563,7 @@ void launch(int type, const void *blocks, int64_t row0, int64_t rows,
                 });                                                            \
         });                                                                    \
     } else {                                                                   \
-        auto exp_props = sycl::ext::oneapi::experimental::properties{          \
-            sycl::ext::oneapi::experimental::use_root_sync};                   \
+        auto exp_props = dq_props<Coop>();                                     \
                                                                                \
         st->submit([&](sycl::handler &cgh) {                                   \
             auto p_ct0 = p;                                                    \
@@ -568,7 +576,8 @@ void launch(int type, const void *blocks, int64_t row0, int64_t rows,
                                                                                \
             cgh.parallel_for<dpct_kernel_name<class dequant_kernel_ec9311,     \
                                               dpct_kernel_scalar<TY>, T,       \
-                                              dpct_kernel_scalar<false>>>(     \
+                                              dpct_kernel_scalar<false>,       \
+                                              dpct_kernel_scalar<Coop>>>(      \
                 sycl::nd_range<3>(sycl::range(1, 1, grid) *                    \
                                       sycl::range(1, 1, 256),                  \
                                   sycl::range(1, 1, 256)),                     \
@@ -639,6 +648,20 @@ void dequant_f16(int ggml_type, const void* blocks, int64_t row0, int64_t rows, 
         return;
     }
     launch<H16>(ggml_type, blocks, row0, rows, cols, reinterpret_cast<H16*>(out), stream);
+}
+
+// SYCL port (no upstream header: declared where it is used, gemm.dp.cpp): dequant_f16 as ordinary launches, for the
+// STRATA_DEQUANT_SIDE side queue.  The same kernels and bits; only the cooperative launch flag is gone.  The side queue is
+// a second compute-engine queue; with it an Arc Pro B70's prompt stalled (2026-10-30), its ordering the same fork/join
+// as the MTP draft's side queue, which runs and has no cooperative kernel.  (iq_dequant_f16 has none either.)
+void dequant_f16_plain(int ggml_type, const void* blocks, int64_t row0, int64_t rows, int64_t cols, uint16_t* out,
+                       void* stream) {
+    if (iq_only(ggml_type)) {
+        iq_dequant_f16(ggml_type, (const uint8_t*) blocks + (size_t) row0 * iq_row_bytes(ggml_type, cols), rows * cols,
+                       out, stream);
+        return;
+    }
+    launch<H16, false>(ggml_type, blocks, row0, rows, cols, reinterpret_cast<H16*>(out), stream);
 }
 
 bool dequant_f16_ld(int ggml_type, const void* blocks, int64_t row0, int64_t rows, int64_t cols, int64_t ld,

@@ -292,8 +292,7 @@ void native_gr_post_multi(const float* residual, const float* block_out, const f
     check_pointer(residual); check_pointer(block_out); check_pointer(inject); check_pointer(output);
     if (n_tok < 1) return;
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         ((sycl::queue *)(strata::q_of(stream)))
             ->submit([&](sycl::handler &cgh) {

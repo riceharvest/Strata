@@ -582,8 +582,7 @@ void native_ple_postops_batch_snap(float* key, float* hidden, const float* value
     Adjust the work-group size if needed.
     */
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         st->submit([&](sycl::handler &cgh) {
             auto N_ct3 = N;
@@ -607,8 +606,7 @@ void native_ple_postops_batch_snap(float* key, float* hidden, const float* value
     Adjust the work-group size if needed.
     */
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         st->submit([&](sycl::handler &cgh) {
             auto N_ct3 = N;
@@ -632,8 +630,7 @@ void native_ple_postops_batch_snap(float* key, float* hidden, const float* value
     Adjust the work-group size if needed.
     */
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         st->submit([&](sycl::handler &cgh) {
             auto std_sqrt_float_N_ct3 = 1.0f / std::sqrt(float(N));
@@ -651,8 +648,7 @@ void native_ple_postops_batch_snap(float* key, float* hidden, const float* value
         });
     }
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         st->parallel_for<dpct_kernel_name<class broadcast_batch_kernel_24ebb0>>(
             sycl::nd_range<3>(sycl::range(1, 1, blocks) *
@@ -668,8 +664,7 @@ void native_ple_postops_batch_snap(float* key, float* hidden, const float* value
     Adjust the work-group size if needed.
     */
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         st->submit([&](sycl::handler &cgh) {
             auto N_ct3 = N;
@@ -688,8 +683,7 @@ void native_ple_postops_batch_snap(float* key, float* hidden, const float* value
         });
     }
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         st->parallel_for<
             dpct_kernel_name<class conv_residual_batch_kernel_3906ff>>(
@@ -702,8 +696,7 @@ void native_ple_postops_batch_snap(float* key, float* hidden, const float* value
             });
     }
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         st->parallel_for<
             dpct_kernel_name<class history_batch_snap_kernel_c2a4cc>>(

@@ -537,8 +537,7 @@ void copy_rows_from_mapped_after(const uint32_t* flag, uint32_t value, float* ds
         std::exit(1);
     }
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         strata::q_of(stream)
             ->submit([&](sycl::handler &cgh) {

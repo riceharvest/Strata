@@ -74,6 +74,12 @@
 #include <hip/hip_fp16.h>
 #endif
 
+namespace strata::kernels {
+// SYCL port (dequant_bf16.dp.cpp; not in the upstream header): dequant_f16 as ordinary, not cooperative, launches
+void dequant_f16_plain(int ggml_type, const void* blocks, int64_t row0, int64_t rows, int64_t cols, uint16_t* out,
+                       void* stream);
+}  // namespace strata::kernels
+
 namespace strata::prefill {
 namespace {
 #if defined(__HIPCC__)
@@ -667,12 +673,15 @@ bool gemm_dequant_side() {
 #if defined(__HIPCC__)
     return false;
 #elif defined(SYCL_LANGUAGE_VERSION)
-    // SYCL port: refused - on one Arc Pro B70 a prompt with it stalled at layer 5 of its first chunk (2026-10-30); the
-    // dequant stays on the compute queue
+    // SYCL port: refused.  On one Arc Pro B70 (2026-10-30) a prompt with it stalled at a different layer each run under the
+    // Level Zero v2 adapter (8K: layer 5 of the first chunk, twice; 118K: layers 41 and 24) and ran under the v1 adapter
+    // (SYCL_UR_USE_LEVEL_ZERO_V2=0) and with STRATA_PREFILL_SYNC=1: the two compute queues' waits on each other's events.
+    // The card has one compute engine, so the side queue's dequant could not overlap the GEMMs there anyway.
     static const bool told = [] {
         const char* v = std::getenv("STRATA_DEQUANT_SIDE");
         if (v && v[0] == '1')
-            std::fprintf(stderr, "strata prefill: STRATA_DEQUANT_SIDE=1 is not supported by the SYCL engine (it stalls on the Arc)\n");
+            std::fprintf(stderr, "strata prefill: STRATA_DEQUANT_SIDE=1 is not supported by the SYCL engine (it stalls under the "
+                                 "Level Zero v2 adapter, and one compute engine leaves nothing to overlap)\n");
         return true;
     }();
     (void) told;
@@ -1518,7 +1527,8 @@ void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float*
         (void)DPCT_CHECK_ERROR(strata::q_of(side_stream_)
                                    ->ext_oneapi_submit_barrier({*(
                                        dpct::event_ptr)side_free_[side_cur_]}));
-        strata::kernels::dequant_f16(ggml_type, W_blocks, 0, N, K, s, side_stream_);
+        // SYCL port: ordinary launches on the side queue (dequant_f16_plain, dequant_bf16.dp.cpp), not dpct's cooperative ones
+        strata::kernels::dequant_f16_plain(ggml_type, W_blocks, 0, N, K, s, side_stream_);
         /*
         DPCT1024: The original code returned the error code that was
         further consumed by the program logic. This original code was replaced

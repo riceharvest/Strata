@@ -240,8 +240,7 @@ void bf16_gemv_pair(const uint16_t* x, const uint16_t* w1, float* y1, int64_t n_
     const long long n_out = n_out1 > n_out2 ? n_out1 : n_out2;
     const unsigned grid = (unsigned) ((n_out + warps - 1) / warps);
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         strata::q_of(stream)
             ->parallel_for<

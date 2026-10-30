@@ -276,8 +276,7 @@ void swilu_quantize_q8_0_launch(const float* gate, const float* up, float* gate_
     const unsigned grid = (unsigned) ((nb + 3) / 4);
     if (scales != nullptr)
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
         dpct::has_capability_or_fail(
             strata::q_of(stream)->get_device(),
             {sycl::aspect::fp64});
@@ -294,8 +293,7 @@ void swilu_quantize_q8_0_launch(const float* gate, const float* up, float* gate_
                                                            blocks, scales, nb);
                 });
     } else {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
         dpct::has_capability_or_fail(
             strata::q_of(stream)->get_device(),
             {sycl::aspect::fp64});
@@ -399,8 +397,7 @@ void swilu_quantize_q8_K(const float* gate, const float* up, float* gate_out, in
     const unsigned grid = (unsigned) ((nb + 1) / 2);
     switch (swilu_kind) {
     case 0: {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
         dpct::has_capability_or_fail(
             strata::q_of(stream)->get_device(),
             {sycl::aspect::fp64});
@@ -418,8 +415,7 @@ void swilu_quantize_q8_K(const float* gate, const float* up, float* gate_out, in
                 });
     } break;
     case 1: {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
         dpct::has_capability_or_fail(
             strata::q_of(stream)->get_device(),
             {sycl::aspect::fp64});
@@ -437,8 +433,7 @@ void swilu_quantize_q8_K(const float* gate, const float* up, float* gate_out, in
                 });
     } break;
     default: {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
         dpct::has_capability_or_fail(
             strata::q_of(stream)->get_device(),
             {sycl::aspect::fp64});
@@ -643,8 +638,7 @@ void quantize_act_images(const float* x, int64_t n, uint8_t* q8_0_blocks, uint8_
     const int threads = 128;
     const unsigned grid = (unsigned) ((nb + threads - 1) / threads);
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
         dpct::has_capability_or_fail(
             strata::q_of(stream)->get_device(),
             {sycl::aspect::fp64});

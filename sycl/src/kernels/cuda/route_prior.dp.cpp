@@ -125,8 +125,7 @@ void route_prior_top10(const float* logits, const int32_t* res_layer, float lamb
                              int n_tok, void* stream) {
     if (n_tok <= 0) return;
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         strata::q_of(stream)
             ->parallel_for<dpct_kernel_name<class route_prior_k_78dd37>>(

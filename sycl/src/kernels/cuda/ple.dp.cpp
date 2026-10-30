@@ -726,8 +726,9 @@ void ple_iq4nl_dequant(const uint8_t* raw, int64_t rows, float* out, void* strea
     const int64_t n = rows * PLE_HEAD_DIM;
     if (n <= 0) return;
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        // SYCL port: an ordinary launch.  dpct marks it use_root_sync (a cooperative launch, every work-group resident at
+        // once) although the kernel has no grid barrier; the port strips that everywhere (7863276d)
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         strata::q_of(stream)
             ->parallel_for<

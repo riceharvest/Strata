@@ -2404,8 +2404,7 @@ void launch(bool ws, unsigned grid, const WideBatch &b, const NativeGeom &g,
                 iq3s_grid.init(*s);
                 kvalues_iq4nl.init(*s);
 
-                auto exp_props = sycl::ext::oneapi::experimental::properties{
-                    sycl::ext::oneapi::experimental::use_root_sync};
+                auto exp_props = sycl::ext::oneapi::experimental::properties{};
                 dpct::has_capability_or_fail(s->get_device(),
                                              {sycl::aspect::fp16});
 
@@ -2449,8 +2448,7 @@ void launch(bool ws, unsigned grid, const WideBatch &b, const NativeGeom &g,
                 iq3s_grid.init(*s);
                 kvalues_iq4nl.init(*s);
 
-                auto exp_props = sycl::ext::oneapi::experimental::properties{
-                    sycl::ext::oneapi::experimental::use_root_sync};
+                auto exp_props = sycl::ext::oneapi::experimental::properties{};
                 dpct::has_capability_or_fail(s->get_device(),
                                              {sycl::aspect::fp16});
 
@@ -2500,8 +2498,7 @@ void launch(bool ws, unsigned grid, const WideBatch &b, const NativeGeom &g,
                 iq3s_grid.init(*s);
                 kvalues_iq4nl.init(*s);
 
-                auto exp_props = sycl::ext::oneapi::experimental::properties{
-                    sycl::ext::oneapi::experimental::use_root_sync};
+                auto exp_props = sycl::ext::oneapi::experimental::properties{};
                 dpct::has_capability_or_fail(s->get_device(),
                                              {sycl::aspect::fp16});
 

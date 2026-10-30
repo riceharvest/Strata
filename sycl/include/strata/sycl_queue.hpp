@@ -186,6 +186,16 @@ inline void apply_b70_defaults() {
         // greedy answers byte-identical
         {"STRATA_SELECT_LONG", "1"},
         {"STRATA_SPEC_COST", "1"},
+        // `--prefill auto` may take chunks up to 16,384 tokens (118K prompt: GPU timeline 78.6 s at 4,096, 68.5 s at
+        // 16,384; 32,768 is no faster and borrows twice the cache)
+        {"STRATA_PREFILL_AUTO_MAX", "16384"},
+        // the port's own B70 decode kernels, measured but left opt-in until now (docs/INTEL.md): IQ_DECODE_FAST is bitwise
+        // the default expert kernels (+7.7% decode on 2x B70), MMVQ_KREG +19.5% (another summation order); on one B70 at a
+        // 118K prompt the two together decode 63.0 / 63.3 tok/s against 60.2 / 60.4 (2026-10-30).  HC_Q8: the Q8_0
+        // hyper-connection read in the decode window, -5.3% per window on 2x B70 (the BF16 copy stays for the prompt).
+        {"STRATA_IQ_DECODE_FAST", "1"},
+        {"STRATA_MMVQ_KREG", "1"},
+        {"STRATA_HC_Q8", "1"},
     };
     std::string applied;
     for (const auto& [k, v] : defaults) {

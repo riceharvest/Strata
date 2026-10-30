@@ -261,15 +261,17 @@ PREFILL_BMG_MIN_GB = 24.0   # a Battlemage card with this much VRAM runs the pro
 
 def recommended_prefill(vram_gb: float, ctx: int, driver: str = "xe", devid: str = "") -> tuple:
     """(chunk size, one plain line saying why or "").  4096 everywhere (to_sycl's old rule), except a Battlemage card (xe
-    driver, not an A-series) with 24 GB or more and a context over 32K, where the prompt borrows cache slots: 8192.
+    driver, not an A-series) with 24 GB or more and a context over 32K, where the prompt borrows cache slots: 16384.
     Measured on the Arc Pro B70 (IQ3_S, 128K context, setup's flags, 2 interleaved rounds): a 16K prompt 1,222 -> 1,347-1,362
     tok/s (+10-11%), a 32K prompt 1,187 -> 1,361-1,383 (+15-16%), the same 32 greedy tokens, the same 11,795 cache slots (the
     lent slots are refilled after the prompt), decode after it unchanged (38 tok/s).  With the 32K context (own prompt
     buffers) a bigger chunk takes 1,400 cache slots from the decode (-9..-16% decode for +20% prompt), so that stays 4096."""
     bmg = driver != "i915" and devid not in ALCHEMIST_IDS and devid in INTEL_ARC
     if bmg and vram_gb >= PREFILL_BMG_MIN_GB and ctx > 32768:
-        return 8192, ("prompt reading: chunks of 8,192 tokens on this Arc (the prompt borrows cache slots, so decode keeps all "
-                      "of them): 10-16% faster on 16K-32K prompts than 4,096 (change --prefill in the config to pick another)")
+        # 2026-10-30, Arc Pro B70, Flash-Next IQ2_XS, a 118K prompt, GPU timeline: 4,096 78.6 s, 8,192 74.6 s, 16,384 68.5 s
+        # (1,688 tok/s), 32,768 66.7 s (1,689 tok/s, but it borrows 12.25 GiB of cache instead of 6.26): 16,384
+        return 16384, ("prompt reading: chunks of 16,384 tokens on this Arc (the prompt borrows cache slots, so decode keeps all "
+                       "of them): about 13% faster on a 118K prompt than 4,096 (change --prefill in the config to pick another)")
     return 4096, ""
 
 
@@ -535,7 +537,7 @@ def install(argv) -> None:
             S.warn(f"{model} on this Arc computes the experts the card does not hold on the CPU (about {need} GB of "
                    f"weights; this PC has {real_ram:.0f} GB of RAM): the start will be slow or fail - a smaller model "
                    "(--model) fits better (docs/INTEL.md)")
-        if flag(cfg["args"], "--prefill") == "8192":
+        if flag(cfg["args"], "--prefill") == "16384":
             why = recommended_prefill(sel["vram_gb"], int(flag(cfg["args"], "--max-context") or 32768), sel["driver"],
                                       sel.get("devid", ""))[1]
             if why:

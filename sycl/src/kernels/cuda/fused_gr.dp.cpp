@@ -2613,7 +2613,9 @@ static bool fused_gr_read_multi_slice(const FusedGrArgs* a, int n_tok, float* xn
         if (req_wd != nullptr && a[0].s_down != nullptr) { m.a[t].w_down = req_wd; m.a[t].s_down = nullptr; }
         if (req_wu != nullptr && a[0].s_up != nullptr) { m.a[t].w_up = req_wu; m.a[t].s_up = nullptr; }
         const FusedGrArgs& x = a[t];
-        if (!x.R || !x.w_norm || !x.w_down || !x.w_up || !x.lo || !x.rs || !x.mixed || (x.w_inject && !x.inject_out) ||
+        // STRATA_HC_Q8 without a BF16 copy (native_dense's hc_bf16_view): the Q8_0 projections alone are a valid read
+        if (!x.R || !x.w_norm || (!x.w_down && !x.q8_down) || (!x.w_up && !x.q8_up) || !x.lo || !x.rs || !x.mixed ||
+            (x.w_inject && !x.inject_out) ||
             (x.apply && (!x.bo_prev || !x.inj_prev || !x.R_out)) || x.w_down != a[0].w_down || x.w_up != a[0].w_up ||
             x.w_inject != a[0].w_inject || x.w_norm != a[0].w_norm) {
             std::fprintf(stderr, "fused_gr_read_multi: invalid arguments for token %d\n", t);
@@ -2624,6 +2626,10 @@ static bool fused_gr_read_multi_slice(const FusedGrArgs* a, int n_tok, float* xn
     m.T = n_tok;
     // STRATA_HC_Q8=1: the Q8_0 projections native_dense loaded (null otherwise: the BF16 read below, as before)
     if (a[0].q8_down != nullptr && a[0].q8_up != nullptr && gr_q8::read(m, st)) return false;
+    if (m.a[0].w_down == nullptr || m.a[0].w_up == nullptr) {   // a Q8_0-only projection the Q8_0 read did not take
+        std::fprintf(stderr, "fused_gr_read_multi: the Q8_0 read declined and there is no BF16 copy (STRATA_HC_Q8)\n");
+        std::exit(1);
+    }
     // STRATA_GR_FUSED=1: the two-kernel BF16 read above (another summation order - opt-in; unset: the reads below)
     if (gr_fused::on() && gr_fused::read(m, st)) return false;
     // STRATA_GR_V3=1: the two-kernel read above (another summation order - opt-in)

@@ -546,8 +546,7 @@ void native_qsa_indexer_append_steps_layers(const float* raw0, int64_t raw_strid
     const dpct::queue_ptr st = strata::q_of(stream);
     if (rt.cos != nullptr)
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         st->submit([&](sycl::handler &cgh) {
             auto mrope_table_ct15 = mrope_table();
@@ -569,8 +568,7 @@ void native_qsa_indexer_append_steps_layers(const float* raw0, int64_t raw_strid
                     });
         });
     } else {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         st->submit([&](sycl::handler &cgh) {
             auto mrope_table_ct15 = mrope_table();

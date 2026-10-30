@@ -173,20 +173,16 @@ bool prompt_run(const int64_t* tokens, int64_t n, int64_t pos0, const float* con
 namespace {
 // STRATA_PLE_COMPACT=1 (opt-in): the prompt chunk's PLE rows go up raw and are dequantized on the device (IQ4_NL tables
 // held in memory); the same floats as the host dequant, 7x fewer bytes over PCIe
-// SYCL port: refused - on one Arc Pro B70 a prompt with it stalled in its third chunk (2026-10-30, an 8K prompt), and with
-// STRATA_PLE_COPY_STREAM in the first chunk of a 118K one.  The PLE rows go up as floats, as before.
+// SYCL port: the raw rows come from the mapped table only (PleTable::gather_raw_iq4nl); with --ple-io direct, the B70's
+// default, the table is not mapped and every chunk goes up as floats (said once, ple_gather)
 bool ple_compact_on() {
-    static const bool on = [] {
-        const char* v = std::getenv("STRATA_PLE_COMPACT");
-        if (v != nullptr && v[0] == '1')
-            std::fprintf(stderr, "strata prefill: STRATA_PLE_COMPACT=1 is not supported by the SYCL engine (it stalls on the Arc); "
-                                 "the PLE rows go up as floats\n");
-        return false;
-    }();
+    static const bool on = [] { const char* v = std::getenv("STRATA_PLE_COMPACT"); return v != nullptr && v[0] == '1'; }();
     return on;
 }
 // STRATA_PLE_COPY_STREAM=1 (opt-in, with PLE_COMPACT): the raw rows go up on a stream of their own instead of the compute
 // stream, which otherwise idles for the DMA (4.7 MB a 3K chunk = 2.9 ms on a Gen2 x4 link); the same bytes and kernels
+// SYCL port: that queue is the GPU's copy engine (make_copy_engine_queue): under the Level Zero v2 adapter a queue of
+// its own is another compute-engine queue, whose DMA does not overlap the compute queue's kernels
 bool ple_copy_stream_on() {
     static const bool on = [] { const char* v = std::getenv("STRATA_PLE_COPY_STREAM"); return v != nullptr && v[0] == '1'; }();
     return on;
@@ -797,10 +793,21 @@ struct Stager {
                 int k = 1;
                 const int j = claim(seen, batch, k);
                 if (j < 0) { active.fetch_sub(1, std::memory_order_acq_rel); break; }
-                for (int i = j; i < j + k; ++i) {
-                    // The copies run ahead of the DMAs, so most of these threads spend most of a prompt waiting here: sleep
-                    // (atomic wait), not a yield spin - 32 spinners took every core (Linux; see stager_sleep for Windows).
+                // A claimed run is copied in pieces: the jobs whose buffers are free now go up together (one copy_blobs
+                // request), and a job that must wait for its buffer first releases the ones before it.  Holding the whole
+                // run until its last buffer is free hung a routed-only prompt chunk on the B70 (2026-10-30, the
+                // STRATA_PREFILL_STREAM_AHEAD schedule with runs of 8): the launching thread waited for an early job of
+                // the run, and a late job's buffer was freed only by a DMA that thread queues after it.
+                auto can_go = [&](int i) {
+                    if (i >= kRing && (issued.load(std::memory_order_acquire) <= i - kRing ||
+                                       !ready[(size_t) (i - kRing)].load(std::memory_order_acquire)))
+                        return false;
+                    return buffer_free(i % kRing);
+                };
+                auto wait_go = [&](int i) {
                     if (i >= kRing) {   // job i - kRing's DMA from this buffer is queued
+                        // The copies run ahead of the DMAs, so most of these threads spend most of a prompt waiting here:
+                        // sleep (atomic wait), not a yield spin - 32 spinners took every core (Linux; see stager_sleep).
 #if defined(STRATA_ATOMIC_WAIT)
                         if (stager_sleep())
                             for (int x; (x = issued.load(std::memory_order_acquire)) <= i - kRing;) issued.wait(x);
@@ -816,30 +823,41 @@ struct Stager {
                     // the buffer, which nothing else waits for when a chunk ends without a sync (no MTP) or the DMA
                     // was a ring entry the routing skipped (no sequence number was ever wanted for it)
                     while (!buffer_free(i % kRing)) std::this_thread::yield();
-                }
-                int32_t rl[kMaxBatch], re[kMaxBatch];
-                uint8_t* rd[kMaxBatch];
-                size_t nr = 0;
-                core::ExpertSource* from = nullptr;
-                for (int i = j; i < j + k; ++i) {
-                    if (skipped[(size_t) i].load(std::memory_order_acquire)) continue;   // nothing will read it: no copy
-                    const Job& jb = jobs[(size_t) i];
-                    if (jb.gsrc != nullptr) {
-                        if (!jb.gsrc->read_into(jb.l, jb.e, buf[i % kRing], jb.bytes)) {
-                            std::fprintf(stderr, "prefill: reading expert %d of layer %d from the GGUF failed\n", jb.e, jb.l);
-                            std::memset(buf[i % kRing], 0, jb.bytes);
+                };
+                int p0 = j;   // jobs [p0, i) are cleared to copy and not yet released
+                auto flush = [&](int p1) {
+                    int32_t rl[kMaxBatch], re[kMaxBatch];
+                    uint8_t* rd[kMaxBatch];
+                    size_t nr = 0;
+                    core::ExpertSource* from = nullptr;
+                    for (int i = p0; i < p1; ++i) {
+                        if (skipped[(size_t) i].load(std::memory_order_acquire)) continue;   // nothing will read it: no copy
+                        const Job& jb = jobs[(size_t) i];
+                        if (jb.gsrc != nullptr) {
+                            if (!jb.gsrc->read_into(jb.l, jb.e, buf[i % kRing], jb.bytes)) {
+                                std::fprintf(stderr, "prefill: reading expert %d of layer %d from the GGUF failed\n", jb.e, jb.l);
+                                std::memset(buf[i % kRing], 0, jb.bytes);
+                            }
+                            continue;
                         }
-                        continue;
+                        if (jb.from == nullptr) { std::memcpy(buf[i % kRing], jb.src, jb.bytes); continue; }
+                        from = jb.from;
+                        rl[nr] = jb.l; re[nr] = jb.e; rd[nr] = buf[i % kRing]; ++nr;
                     }
-                    if (jb.from == nullptr) { std::memcpy(buf[i % kRing], jb.src, jb.bytes); continue; }
-                    from = jb.from;
-                    rl[nr] = jb.l; re[nr] = jb.e; rd[nr] = buf[i % kRing]; ++nr;
+                    if (nr > 0 && !from->copy_blobs(rl, re, rd, nr)) {
+                        std::fprintf(stderr, "prefill: the expert source could not copy experts %d.. of layer %d\n", re[0], rl[0]);
+                        std::abort();
+                    }
+                    for (int i = p0; i < p1; ++i) ready[(size_t) i].store(1, std::memory_order_release);
+                    p0 = p1;
+                };
+                for (int i = j; i < j + k; ++i) {
+                    if (!can_go(i)) {
+                        flush(i);
+                        wait_go(i);
+                    }
                 }
-                if (nr > 0 && !from->copy_blobs(rl, re, rd, nr)) {
-                    std::fprintf(stderr, "prefill: the expert source could not copy experts %d.. of layer %d\n", re[0], rl[0]);
-                    std::abort();
-                }
-                for (int i = j; i < j + k; ++i) ready[(size_t) i].store(1, std::memory_order_release);
+                flush(j + k);
                 active.fetch_sub(1, std::memory_order_acq_rel);
             }
         }
@@ -1362,6 +1380,9 @@ struct Prefill::Impl {
     uint8_t* ple_raw_dev = nullptr;          // their device copy (the chunk's 16 rows a token)
     dpct::queue_ptr ple_copy = nullptr;      // STRATA_PLE_COPY_STREAM: the raw rows' upload stream (null: on cs)
     dpct::event_ptr ple_raw_free = nullptr;  // cs has dequantized ple_raw_dev: the next chunk's upload may overwrite it
+    // SYCL port, STRATA_PLE_COPY_STREAM: page-locked, per buffer, the sequence number the copy engine copies into
+    // ple_done_seq (a copy-engine queue runs no fill); a slot is rewritten only after its copy is polled done
+    uint64_t* ple_seq_src = nullptr;
     float* ple_norm = nullptr;
     uint8_t* region = nullptr;               // the attention/MoE scratch region (idle while the PLE block runs)
     uint64_t region_bytes = 0;
@@ -1691,8 +1712,10 @@ void Prefill::release() {
     if (impl_->copy) dpct::get_current_device().destroy_queue(impl_->copy);
     if (impl_->kv_copy) dpct::get_current_device().destroy_queue(
         impl_->kv_copy);
-    if (impl_->ple_copy)(void) DPCT_CHECK_ERROR(
+    // (STRATA_PLE_COPY_STREAM's queue is the shared copy-engine one, never freed: copy_queue.hpp)
+    if (impl_->ple_copy && !strata::is_copy_engine_queue(impl_->ple_copy))(void) DPCT_CHECK_ERROR(
         dpct::get_current_device().destroy_queue(impl_->ple_copy));
+    if (impl_->ple_seq_src) { sycl::free(impl_->ple_seq_src, dpct::get_in_order_queue()); impl_->ple_seq_src = nullptr; }
     if (impl_->ple_raw_free)(void)
         DPCT_CHECK_ERROR(dpct::destroy_event(impl_->ple_raw_free));
     if (impl_->kv_released) dpct::destroy_event(impl_->kv_released);
@@ -2260,29 +2283,20 @@ bool Prefill::init(const core::WeightTable &wt, const core::ModelGeometry &g,
     }
     // STRATA_PLE_COPY_STREAM: a stream of its own, not the expert copy stream - that one may hold a ring of blobs and
     // waits on their slots' release, so a wait on it could idle the compute stream for longer than the DMA itself
+    // SYCL port: the GPU's copy engine, which is that expert copy queue (one per device, copy_queue.hpp): a queue of its
+    // own would be a second compute-engine queue under the Level Zero v2 adapter, its DMA no overlap at all.  Here the
+    // upload may wait behind the blobs queued before it, whose waits are all on compute-queue work queued earlier, so no
+    // cycle.  No copy engine (another card, STRATA_COPY_ENGINE=0): the rows go up on the compute queue.
     if (ple_copy_stream_on() && m.ple_raw_dev != nullptr &&
-        /*
-        DPCT1025: The SYCL queue is created ignoring the flag and priority
-        options.
-        */
-        ((!m.ple_copy &&
-          DPCT_CHECK_ERROR(m.ple_copy = dpct::get_current_device().create_queue(
-                               true)) != 0) ||
+        ((!m.ple_copy && (m.ple_copy = strata::make_copy_engine_queue("the prompt path's PLE rows")) == nullptr) ||
+         (!m.ple_seq_src &&
+          (m.ple_seq_src = sycl::malloc_host<uint64_t>(2, dpct::get_in_order_queue())) == nullptr) ||
          (!m.ple_raw_free &&
           DPCT_CHECK_ERROR(m.ple_raw_free = new sycl::event()) != 0))) {
         // an optional optimization: the raw rows go up on the compute stream as with STRATA_PLE_COMPACT alone
-        if (m.ple_copy) {
-            (void)DPCT_CHECK_ERROR(
-                dpct::get_current_device().destroy_queue(m.ple_copy));
-            m.ple_copy = nullptr;
-        }
-        /*
-        DPCT1010: SYCL uses exceptions to report errors and does not use
-        the error codes. The cudaGetLastError function call was replaced with 0.
-        You need to rewrite this code.
-        */
-        (void)0;
-        std::fprintf(stderr, "prefill: STRATA_PLE_COPY_STREAM=1: the upload stream could not be created, the PLE rows go up on the compute stream\n");
+        m.ple_copy = nullptr;   // (the copy-engine queue is shared and never freed)
+        std::fprintf(stderr, "prefill: STRATA_PLE_COPY_STREAM=1: no copy-engine queue (or its page-locked words) for the upload, "
+                             "the PLE rows go up on the compute stream\n");
     }
     if (ss.qsa_states[ss.qsa_primary()].kv_mode == 1) {   // KV streaming: the staging pool's identity page table
         const int64_t pages = ss.qsa_states[ss.qsa_primary()].n_pages;
@@ -3953,6 +3967,12 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
             m.ple_compact[buf] = true;
             return true;
         }
+        if (ple_compact_on()) {   // SYCL port: say once that the switch changed nothing (the float rows, as without it)
+            static std::atomic<bool> said{false};
+            if (!said.exchange(true))
+                std::fprintf(stderr, "strata prefill: STRATA_PLE_COMPACT=1 not taken: the PLE table is not mapped IQ4_NL rows (--ple-io "
+                                     "direct reads it row by row), or a buffer is not pinned; the PLE rows go up as floats\n");
+        }
         m.ple_compact[buf] = false;
         return ss.ple.table->gather_batch(m.ple_rows[buf].data(), (size_t) T, m.ple_emb_host[buf], e);
     };
@@ -4220,7 +4240,9 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                 consuming the error code.
                 */
                 DPCT_CHECK_ERROR((m.ple_want[ple_buf] = ++m.ple_seq,
-                                  ple_up->fill<uint64_t>(m.ple_done_seq + ple_buf, m.ple_want[ple_buf], 1))) != 0 ||
+                                  ple_side ? (m.ple_seq_src[ple_buf] = m.ple_want[ple_buf],   // the copy engine: a copy, no fill
+                                              ple_up->memcpy(m.ple_done_seq + ple_buf, m.ple_seq_src + ple_buf, sizeof(uint64_t)))
+                                           : ple_up->fill<uint64_t>(m.ple_done_seq + ple_buf, m.ple_want[ple_buf], 1))) != 0 ||
                 DPCT_CHECK_ERROR(
                     dpct::sync_barrier(m.ple_copied[ple_buf], ple_up)) != 0 ||
                 (ple_side && DPCT_CHECK_ERROR((m.cs)->ext_oneapi_submit_barrier(
@@ -9434,18 +9456,11 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
     // layer-major prefill: OPT-IN on this backend - only STRATA_PREFILL_LAYER_MAJOR=1 turns it on (upstream turns it on by
     // default for a CUDA layer split; the B70 defaults are decided by one measurement)
     (void) lm_hip;
-    // SYCL port: refused. Its only run on an Arc Pro B70 (Flash-Next IQ2_XS, a 118K prompt, 2026-10-30, with
-    // STRATA_PLE_COMPACT / STRATA_DEQUANT_SIDE also on, which stall by themselves) stalled at layer 11; on SYCL it would take
-    // the FP16 expert path, not the int8 ESIMD / XMX prompt kernels.  The chunk-major path below is the one that runs here.
-    if (lm_env_explicit() && std::atoi(lm_env_text()) != 0) {
-        static bool told = false;
-        if (!told) {
-            told = true;
-            std::fprintf(stderr, "strata prefill: STRATA_PREFILL_LAYER_MAJOR=1 is not supported by the SYCL engine (it stalls on the "
-                                 "Arc); the prompt is read chunk by chunk\n");
-        }
-    }
-    if (false && hand_in_ == nullptr && impl_ && lm_env_explicit() && std::atoi(lm_env_text()) != 0) {
+    // SYCL port: its one run on an Arc Pro B70 (2026-10-30, a 118K prompt) had STRATA_DEQUANT_SIDE on as well and stopped in
+    // cs->wait() at layer 11, the compute queue never finishing; its own queue order (the residual rows up and down on the
+    // copy engine, the stager's pass/skip) has no cycle.  On SYCL its experts take the FP16 path, not the int8 ESIMD / XMX
+    // prompt kernels.
+    if (hand_in_ == nullptr && impl_ && lm_env_explicit() && std::atoi(lm_env_text()) != 0) {
         const bool by_default = !lm_env_explicit();
         for (Prefill* p = this; p != nullptr; p = p->next_) p->lm_by_default_ = by_default;
         std::string why;

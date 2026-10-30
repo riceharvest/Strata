@@ -215,8 +215,7 @@ void bf16_f32_mmvf_multi_kernel_wrapper(const float *x_, int64_t ldx,
     unsigned int localMemSize = dpct::kernel_launcher::_local_mem_size;
     sycl::nd_range<3> nr = dpct::kernel_launcher::_nr;
 
-    auto exp_props = sycl::ext::oneapi::experimental::properties{
-        sycl::ext::oneapi::experimental::use_root_sync};
+    auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
     queue.parallel_for<dpct_kernel_name<class bf16_f32_mmvf_multi_kernel_>>(
         nr, exp_props,

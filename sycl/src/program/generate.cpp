@@ -4803,8 +4803,13 @@ int main(int argc, char **argv) try {
         if (native_pack) skip.insert("token_embd.weight");
         // STRATA_HC_Q8=1 (single GPU): the layers' hyper-connection down / up projections live only as Q8_0 (NativeDense
         // quantizes them from the pack file), so their bf16 copy is not loaded
+        // SYCL port: the bf16 copies stay (the port's STRATA_HC_Q8 reads Q8_0 in the decode window and the BF16 copy in
+        // the prompt path).  With them dropped, the prompt path's hc_bf16_view dequant made a 118K prompt's logits NaN
+        // on the B70 (2026-10-30, both tries); 0.63 GiB more VRAM for Flash-Next.
+#if !defined(SYCL_LANGUAGE_VERSION)
         if (!o.native_dense_gguf.empty() && !multi_gpu && strata::core::NativeDense::hc_q8_requested())
             strata::core::NativeDense::add_hc_skip(o.pack, skip);
+#endif
     }
     // Layer split: every GPU holds only the dense weights of ITS layers (the PLE tensors stay everywhere).
     // Without this each card keeps a full copy (~3.4 GB for the Coder) that its stage never reads - VRAM the
