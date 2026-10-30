@@ -467,10 +467,26 @@ inline bool f16x_on(void* cs, int gu_type, int d_type, int64_t n_ff, int64_t n_e
 // the next groups' experts while one computes. With STAGE + a group (24 slots) a copy waited for the slot of the copy 24
 // back, which a group releases only after its down product: the copies and the expert products ran one after the
 // other (a 16K chunk's MoE half took about their sum). 64 slots: ~96 MB more of the prompt path's loan.
+// STRATA_PREFILL_PREFETCH=0: the routed-only walk copies a layer's experts only after its routing (prefetch_layer in the
+// chunk loop: the copies of a large chunk's layer issued at the layer's start, during its attention / GDN half)
+inline bool prefetch_on() {
+    static const bool v = [] {
+        const char* e = std::getenv("STRATA_PREFILL_PREFETCH");
+        if (e != nullptr) return e[0] != '0';
+        return strata::prefill::i8::any_battlemage();
+    }();
+    return v;
+}
+// below this many tokens a chunk routes too few experts for a blind copy of all of them to pay
+inline int64_t prefetch_min_t() {
+    static const int64_t v = [] { const char* e = std::getenv("STRATA_PREFILL_PREFETCH_MIN_T"); return e ? (int64_t) std::atoll(e) : (int64_t) 4096; }();
+    return v;
+}
+// (352 with the prefetch: a layer's ~340 non-resident experts of the IQ2_XS pack, ~530 MB of the loan)
 inline int stage_ahead() {
     static const int v = [] {
         const char* e = std::getenv("STRATA_PREFILL_STAGE_AHEAD");
-        const int n = e ? std::atoi(e) : 64;
+        const int n = e ? std::atoi(e) : (prefetch_on() ? 352 : 64);
         return std::max(0, std::min(n, RING_MAX - STAGE - strata::prefill::xmx::kMaxGroup));
     }();
     return v;
@@ -4847,7 +4863,64 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
           std::exit(1);
         }
         };
+        // B70 (STRATA_PREFILL_PREFETCH, default on on Battlemage): a large chunk routes every expert of every layer (16K
+        // tokens x 10 of 512), so the routed-only walk's copies of a layer's non-resident experts are issued at the
+        // layer's start, in expert id order (the walk's order), into ring slots [0, pf_used): they move during the
+        // attention / GDN half instead of after the routing. The walk takes a prefetched slot instead of copying; one the
+        // routing did not pick is never read. Only the lowest-id run of DMA-able experts is prefetched, so every copy
+        // the walk still makes is for a later id and lands in slots past the prefetched ones (no slot is overwritten
+        // before its expert is read). The copies are issued from a worker thread (~110 us of host time each, ~340 a
+        // layer: on the launching thread they held back the layer's GPU work), joined at the start of the MoE half; the
+        // copy queue waits once per releasing group, not once per slot.
+        std::vector<int> pf_slot;
+        int pf_used = 0;
+        double pf_ms = 0.0;
+        int64_t pf_dma = 0;
+        std::future<void> pf_task;
+        auto pf_join = [&]() {
+            if (!pf_task.valid()) return;
+            pf_task.get();   // (rethrows what the worker threw)
+            stats_.ms_experts_host += pf_ms;
+            stats_.experts_dma += pf_dma;
+            pf_ms = 0.0;
+            pf_dma = 0;
+        };
+        const bool pf_on = prefetch_on() && !stream_all && !kva_approx && m.pp == nullptr && core::peer_portable() == false &&
+                           (int64_t) T >= prefetch_min_t() && m.src != nullptr && m.cache != nullptr && m.host_res != nullptr &&
+                           ws::mode() == 0 && stage_slots() > STAGE + strata::prefill::xmx::kMaxGroup;
+        auto prefetch_layer = [&](int64_t l) {
+            pf_used = 0;
+            pf_slot.assign((size_t) m.g->n_expert, -1);
+            if (!pf_on || (mmq_plan().any && mmq_plan().layer[(size_t) l])) return;
+            const int cap = stage_slots() - STAGE - strata::prefill::xmx::kMaxGroup;
+            const size_t bytes = (size_t) lay0.blob_bytes(l);
+            const auto th = Clock::now();
+            int waited = -1;   // the releasing slot whose event the copy queue last waited for
+            for (int32_t e = 0; e < m.g->n_expert && pf_used < cap; ++e) {
+                if (m.host_res[(size_t) l * m.g->n_expert + e] >= 0) continue;   // resident
+                const uint8_t* b = m.src->pinned(l, e) ? m.src->blob(l, e) : nullptr;   // (the mirror's: a table read)
+                if (!dma_direct(m.src, l, e, b) || b == nullptr) break;           // the stager's: the walk copies it and all after
+                const int sl = pf_used++;
+                if (m.stage_live[sl] && m.used_of[sl] != waited) {
+                    m.copy->ext_oneapi_submit_barrier({*m.used[m.used_of[sl]]});
+                    waited = m.used_of[sl];
+                }
+                m.copy->memcpy(m.stage_dev[sl], b, bytes);
+                dpct::sync_barrier(m.copied[sl], m.copy);
+                m.stage_live[sl] = true;
+                pf_slot[(size_t) e] = sl;
+                ++pf_dma;
+            }
+            pf_ms += ms_since(th);
+        };
+        struct PfGuard {   // an early return waits for the worker before what it uses goes out of scope
+            std::future<void>& f;
+            ~PfGuard() { if (f.valid()) f.wait(); }
+        } pf_guard{pf_task};
         for (int64_t l = LB; l < LE; ++l) {
+            pf_join();
+            if (pf_on) pf_task = std::async(std::launch::async, [&prefetch_layer, l] { prefetch_layer(l); });
+            else prefetch_layer(l);   // (clears the layer's slots)
             core::progress_beat();   // the serve watchdog: a prompt chunk of 8192 tokens is still moving
             if (l > LB) pf_step("reading the prompt (batched, step sync): the experts and the rest of layer", l - 1);
             core::progress_at("reading the prompt (batched): layer", l, p0);   // #251: a stall names layer and chunk
@@ -5489,6 +5562,7 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                     if (!kv_prefetch_after(l + 1, qsa_index)) return false;
                 } else {
                     // ======================= MoE =======================
+                    pf_join();   // this layer's prefetched copies are issued (prefetch_layer): their slots are the walk's
                     const core::WeightRef *wr = need(v, "ffn_gate_inp.weight", err),
                                           *wgi = need(v, "ffn_gate_inp_shexp.weight", err),
                                           *wsg = need(v, "ffn_gate_shexp.weight", err),
@@ -6795,7 +6869,8 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                         const bool gg_now = group_gather || group_resident;
                         const int stage_n = group_resident ? STAGE_GRP : stage_slots();   // port: the held groups' extra slots (STRATA_PF_XMX=2 / int8)
                         // Stage ahead: the copy stream moves blobs host -> device while the compute stream works.
-                        int stage_next = 0;
+                        // (past the slots this layer's prefetch filled: prefetch_layer)
+                        int stage_next = group_resident ? 0 : pf_used % stage_n;
                         std::vector<int> stage_of(order.size(), -1);
                         // the unpinned ones are copied to pinned buffers by the stager's threads, in this order
                         std::vector<int> job_of(order.size(), -1);
@@ -6843,6 +6918,12 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                         const int32_t e = order[j];
                             const bool resident = m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0;
                             if (resident) return true;
+                            if (!group_resident && !pf_slot.empty() && pf_slot[(size_t) e] >= 0) {   // copied at the layer's start
+                                stage_of[j] = pf_slot[(size_t) e];
+                                pf_slot[(size_t) e] = -1;
+                                ++stats_.experts_streamed;
+                                return true;
+                            }
                             const int sl = stage_next;
                             stage_next = (stage_next + 1) % stage_n;
                             const auto th = Clock::now();
