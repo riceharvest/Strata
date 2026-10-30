@@ -463,10 +463,22 @@ inline bool f16x_on(void* cs, int gu_type, int d_type, int64_t n_ff, int64_t n_e
            strata::prefill::i8::f16_handles(gu_type, d_type, (int) n_ff, (int) n_embd, cs);
 }
 // ring sizing happens before any queue is at hand: room for the int8 groups whenever the choice could be on
+// B70: the routed-only walk's held groups get STRATA_PREFILL_STAGE_AHEAD (64) more slots, so the copy engine moves
+// the next groups' experts while one computes. With STAGE + a group (24 slots) a copy waited for the slot of the copy 24
+// back, which a group releases only after its down product: the copies and the expert products ran one after the
+// other (a 16K chunk's MoE half took about their sum). 64 slots: ~96 MB more of the prompt path's loan.
+inline int stage_ahead() {
+    static const int v = [] {
+        const char* e = std::getenv("STRATA_PREFILL_STAGE_AHEAD");
+        const int n = e ? std::atoi(e) : 64;
+        return std::max(0, std::min(n, RING_MAX - STAGE - strata::prefill::xmx::kMaxGroup));
+    }();
+    return v;
+}
 inline int stage_slots() {
     const char* e = i8_env();
     const bool i8 = e != nullptr ? strata::prefill::i8::choose_mode(e, false, false) != 0 : strata::prefill::i8::any_battlemage();
-    return (strata::prefill::xmx::mode() == 2 || i8) ? STAGE + strata::prefill::xmx::kMaxGroup : STAGE;
+    return (strata::prefill::xmx::mode() == 2 || i8) ? STAGE + strata::prefill::xmx::kMaxGroup + stage_ahead() : STAGE;
 }
 // The staging buffers a layout holds: the ring, at least what the port's grouped paths hold (above), and - where the MMQ
 // group gather exists - STAGE_GRP for the staged walk's grouped gather.  Counted and taken through this one place, so the
