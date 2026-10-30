@@ -28,15 +28,18 @@ import re
 from dataclasses import dataclass, field
 
 from strata_control import signing, transfer
-from strata_control.targets import BACKEND_MATRIX
+from strata_control.targets import BACKEND_MATRIX, host_platform
 
 SCHEMA_VERSION = 1
 FEED_NAME = "strata-feed.json"
+#: The Linux ARM64 (DGX Spark) Terminal reads this file instead. A Control older than 0.1.53 refuses a feed that names a platform it does not know, so
+#: the linux-aarch64 entries cannot sit in strata-feed.json: that file stays as every released client can read it. Same format, same key.
+AARCH64_FEED_NAME = "strata-feed-linux-aarch64.json"
 SIGNATURE_SUFFIX = ".sig"
 FORMATS = ("tar.gz", "tar.xz", "zip")
-PLATFORMS = ("windows-x86_64", "linux-x86_64", "macos-arm64", "macos-x86_64")
-#: Tauri's names for the same platforms.
-TAURI_TARGETS = {"windows-x86_64": "windows-x86_64", "linux-x86_64": "linux-x86_64",
+PLATFORMS = ("windows-x86_64", "linux-x86_64", "linux-aarch64", "macos-arm64", "macos-x86_64")
+#: Tauri's names for the same platforms (no desktop app is built for linux-aarch64: the entry only keeps the name parsable).
+TAURI_TARGETS = {"windows-x86_64": "windows-x86_64", "linux-x86_64": "linux-x86_64", "linux-aarch64": "linux-aarch64",
                  "macos-arm64": "darwin-aarch64", "macos-x86_64": "darwin-x86_64"}
 _VERSION = re.compile(r"\d+\.\d+\.\d+(?:\.\d+)?")
 _HEX64 = re.compile(r"[0-9a-f]{64}")
@@ -157,6 +160,9 @@ class Feed:
     #: the DeepSeek-V4.1 engine packages (feed member ``dsv41``, same entry shape as ``engine``): a separate download that setup fetches when
     #: DeepSeek is chosen. Kept out of ``engine`` so that `strata update` and select_engine never pick one as THE engine. Older Controls ignore the member.
     dsv41: tuple[EnginePackage, ...] = ()
+    #: entries this Control does not know how to use (a platform, a backend or an archive format added after it was built): left out, one plain line each.
+    #: A feed with such an entry is still a feed; only an entry of a kind this Control knows and that is malformed refuses the feed.
+    skipped: tuple[str, ...] = ()
 
     def url(self, ref: str) -> str:
         return transfer.resolve_ref(transfer.base_of(self.source), ref)
@@ -189,11 +195,14 @@ def _engine_package(item: dict) -> EnginePackage:
     version = _need(item, "version", str, where)
     version_key(version)
     platform = _need(item, "platform", str, where)
-    if platform not in PLATFORMS:
-        raise FeedError(f"the feed's {where} names an unknown platform {platform!r}")
     backend = _need(item, "backend", str, where)
+    label = f"{version} {platform}-{backend}" + (f"-{item['variant']}" if item.get("variant") else "")
+    if platform not in PLATFORMS:
+        _skipping(skipped, f"engine {label}", f"for a platform this Strata does not know ({platform})")
+        return None
     if backend not in BACKEND_MATRIX:
-        raise FeedError(f"the feed's {where} names an unknown backend {backend!r}")
+        _skipping(skipped, f"engine {label}", f"for a backend this Strata does not know ({backend})")
+        return None
     archs = item.get("archs")
     if not isinstance(archs, list) or not all(isinstance(a, str) and a for a in archs) or (backend != "cpu" and not archs):
         raise FeedError(f"the feed's {where} needs a list of archs")
@@ -202,7 +211,8 @@ def _engine_package(item: dict) -> EnginePackage:
         raise FeedError(f"the feed's {where} has an invalid min_driver")
     fmt = _need(item, "format", str, where)
     if fmt not in FORMATS:
-        raise FeedError(f"the feed's {where} uses an unsupported archive format {fmt!r}")
+        _skipping(skipped, f"engine {label}", f"in an archive format this Strata does not know ({fmt})")
+        return None
     size = _need(item, "size", int, where)
     installed = _need(item, "installed_bytes", int, where)
     if size <= 0 or installed <= 0:
@@ -218,14 +228,16 @@ def _engine_package(item: dict) -> EnginePackage:
                          notes=str(item.get("notes") or ""))
 
 
-def _control_package(item: dict, version: str) -> ControlPackage:
+def _control_package(item: dict, version: str, skipped: list | None = None) -> ControlPackage | None:
     where = "control entry"
     platform = _need(item, "platform", str, where)
     if platform not in PLATFORMS:
-        raise FeedError(f"the feed's control entry names an unknown platform {platform!r}")
+        _skipping(skipped, f"Control {version} {platform}", "for a platform this Strata does not know")
+        return None
     fmt = _need(item, "format", str, where)
     if fmt not in FORMATS:
-        raise FeedError(f"the feed's control entry uses an unsupported archive format {fmt!r}")
+        _skipping(skipped, f"Control {version} {platform}", f"in an archive format this Strata does not know ({fmt})")
+        return None
     size, installed = _need(item, "size", int, where), _need(item, "installed_bytes", int, where)
     if size <= 0 or installed <= 0:
         raise FeedError("the feed's control entry declares a size that cannot be a real file")
@@ -251,6 +263,7 @@ def parse(payload: bytes, *, source: str, key_id: str) -> Feed:
     expires = data.get("expires_at")
     if expires is not None:
         _time(expires, "expires_at")
+    skipped: list = []
     app = None
     raw_app = data.get("app")
     if raw_app is not None:
@@ -264,8 +277,11 @@ def parse(payload: bytes, *, source: str, key_id: str) -> Feed:
         by_tauri = {v: k for k, v in TAURI_TARGETS.items()}
         for target, entry in platforms.items():
             plat = by_tauri.get(str(target).split("-nsis")[0].split("-msi")[0])
-            if plat is None or not isinstance(entry, dict):
-                raise FeedError(f"the feed's app entry names an unknown platform {target!r}")
+            if plat is None:
+                _skipping(skipped, f"the app for {target}", "a platform this Strata does not know")
+                continue
+            if not isinstance(entry, dict):
+                raise FeedError(f"the feed's app entry for {target!r} is not an object")
             parsed_platforms[plat] = {"url": _need(entry, "url", str, "app entry"),
                                       "signature": _need(entry, "signature", str, "app entry"),
                                       "sha256": _hex(entry.get("sha256"), "app entry"),
@@ -279,7 +295,7 @@ def parse(payload: bytes, *, source: str, key_id: str) -> Feed:
             raise FeedError("the feed's control member is not an object")
         cver = _need(raw_control, "version", str, "control entry")
         version_key(cver)
-        control = [_control_package(item, cver) for item in (raw_control.get("packages") or [])]
+        control = [c for c in (_control_package(item, cver, skipped) for item in (raw_control.get("packages") or [])) if c is not None]
     engine = []
     raw_engine = data.get("engine")
     if raw_engine is not None:
@@ -305,7 +321,8 @@ def parse(payload: bytes, *, source: str, key_id: str) -> Feed:
                 raise FeedError(f"the feed lists DeepSeek engine {pkg.label} twice")
             seen.add(ident)
     return Feed(sequence=sequence, channel=channel, generated_at=generated, expires_at=expires, app=app,
-                control=tuple(control), engine=tuple(engine), source=source, key_id=key_id, raw=payload, dsv41=tuple(dsv41))
+                control=tuple(control), engine=tuple(engine), source=source, key_id=key_id, raw=payload, dsv41=tuple(dsv41),
+                skipped=tuple(skipped))
 
 
 def _expired_words(expires_at: str, now: dt.datetime, server_now: dt.datetime | None) -> str:
@@ -350,6 +367,17 @@ def verify_and_parse(payload: bytes, signature_bytes: bytes, *, source: str, tru
     return feed
 
 
+def feed_name(platform: str | None = None) -> str:
+    """The feed file this machine reads from a folder or a release address: ``strata-feed-linux-aarch64.json`` on a Linux ARM64 machine, else
+    ``strata-feed.json``. A source that names its file (``.../x.json``) is used as given, whatever the machine."""
+    if platform is None:
+        try:
+            platform = host_platform()
+        except Exception:                                             # noqa: BLE001 - an unknown OS reads the common feed
+            platform = None
+    return AARCH64_FEED_NAME if platform == "linux-aarch64" else FEED_NAME
+
+
 def fetch(source: str, trusted: dict[str, bytes], **guards) -> Feed:
     """Read the feed and its signature from `source` (an https URL, a loopback http URL, a file URL or a folder/file path)."""
     if not trusted:
@@ -359,9 +387,11 @@ def fetch(source: str, trusted: dict[str, bytes], **guards) -> Feed:
     if transfer.kind_of(source) == "path":
         path = transfer._local_path(source)
         if path.is_dir():
-            location = str(path / FEED_NAME)
+            location = str(path / feed_name())
+            if not (path / feed_name()).is_file() and (path / FEED_NAME).is_file():
+                location = str(path / FEED_NAME)                 # a local folder made for the common feed (a test feed, an offline copy)
     elif transfer.kind_of(source) in ("http", "https") and not source.rsplit("/", 1)[-1].endswith(".json"):
-        location = source.rstrip("/") + "/" + FEED_NAME
+        location = source.rstrip("/") + "/" + feed_name()
     try:
         payload = transfer.read_small(location)
         signature = transfer.read_small(location + SIGNATURE_SUFFIX)

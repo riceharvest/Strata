@@ -65,6 +65,7 @@ if git rev-parse --git-dir >/dev/null 2>&1; then
   # shellcheck disable=SC2086
   { git ls-files -z -- $paths ':(glob)tools/*.py' ':(glob)tools/dsv41/*.py'; } | tar --null -T - -cf - | tar -xf - -C "$ctx/terminal-src"
 else
+  tools_py=$(find tools -name '*.py')          # nested too: the bundle's dsv41 scripts live in tools/dsv41/
   # shellcheck disable=SC2086
   tar -cf - --exclude='__pycache__' $paths tools/*.py tools/dsv41/*.py | tar -xf - -C "$ctx/terminal-src"
 fi

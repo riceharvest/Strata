@@ -16,6 +16,7 @@ bit-exact run to run). Only ``exact`` is picked on its own; the others need the 
 
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass, field
 from typing import Any, Callable, Sequence
 
@@ -221,7 +222,17 @@ def _prefill_below_auto(value: Any) -> bool:
 def check_setting(args: dict[str, Any], env: dict[str, str | None], ctx: Context) -> list[str]:
     """Reasons (plain words) a setting must not be applied; an empty list means it is inside the rules.
 
-    ``args`` maps flag -> value (True for a present boolean flag); ``env`` maps name -> value."""
+    ``args`` maps flag -> value (True for a present boolean flag); ``env`` maps name -> value. The tuner uses this whole
+    list for what it tries; a saved or imported preset uses `check_setting_parts` (see there)."""
+    never, bounds = check_setting_parts(args, env, ctx)
+    return never + bounds
+
+
+def check_setting_parts(args: dict[str, Any], env: dict[str, str | None], ctx: Context) -> tuple[list[str], list[str]]:
+    """(never, bounds): `never` are the settings measured to be harmful (the never list: slower, unsafe, or changing the
+    numbers); `bounds` are values outside the range the tuner tried (``--spec 5``, ``--pcie-frac 0.6``), which nobody
+    measured as bad. A preset keeps a user's setting that is only outside the tested range, with a warning (#3844); the
+    tuner itself never tries one."""
     problems: list[str] = []
     ctx_tokens = ctx.context_tokens
     default_workers = ctx.facts.get("workers")
@@ -275,6 +286,7 @@ def check_setting(args: dict[str, Any], env: dict[str, str | None], ctx: Context
             hit = n is not None and (n == 0 or n >= 4)
         if hit:
             problems.append(f"{flag} {value}: {rule['reason']}")
+    bound_problems: list[str] = []
     for flag, value in args.items():
         bound = BOUNDS.get(flag)
         if not bound or value is None or value is True:
@@ -282,13 +294,18 @@ def check_setting(args: dict[str, Any], env: dict[str, str | None], ctx: Context
         if bound.get("numeric_only") and _as_number(value) is None:
             continue
         if "choices" in bound and value not in bound["choices"] and str(value) not in [str(c) for c in bound["choices"]]:
-            problems.append(f"{flag} {value}: outside the safe values {list(bound['choices'])}")
+            bound_problems.append(f"{flag} {value}: outside the safe values {list(bound['choices'])}")
         n = _as_number(value)
         if n is not None and "min" in bound and n < bound["min"]:
-            problems.append(f"{flag} {value}: below the safe minimum {bound['min']}")
+            bound_problems.append(f"{flag} {value}: below the safe minimum {bound['min']}")
         if n is not None and "max" in bound and n > bound["max"]:
-            problems.append(f"{flag} {value}: above the safe maximum {bound['max']}")
-    return problems
+            bound_problems.append(f"{flag} {value}: above the safe maximum {bound['max']}")
+    return problems, bound_problems
+
+
+def keep_warnings(bound_problems: Sequence[str]) -> list[str]:
+    """The short warning for each setting that is outside the tested range and is kept (#3844): said, never dropped."""
+    return [f"{p.split(': ', 1)[0]}: not tried by the tuner, kept because it is your setting" for p in bound_problems]
 
 
 def _flags_of(argv: Sequence[str]) -> set[str]:

@@ -24,17 +24,40 @@ from strata_cli.launch import access as acc
 from strata_cli.launch import params as P
 from strata_cli.launch import settings as S
 from strata_cli.launch import store
+from strata_control import dsv41_context
 from strata_cli.launch.widgets import (ACCENT, BAD, DARK, FG, LIGHT, MUTE, WARN, Cell, Item, Menu, bar)
 
 STEPS = (("model", "Model"), ("cards", "Cards"), ("folder", "Folder"), ("context", "Context"), ("pictures", "Pictures"),
          ("parallel", "Parallel"), ("tuning", "Tuning"), ("advanced", "Advanced"), ("access", "Access"), ("save", "Save"))
 
 
+STEP_LABELS = {**dict(STEPS), "speed": "Speed"}
+
+
+def speed_choice_available(ctx) -> bool:
+    """The Speed step is an active choice only when the DeepSeek engine launch will run takes --experts (0.1.50 or newer); otherwise it is not
+    there, with no error. Asked once per run of the screens (the engine files are looked up once)."""
+    cached = getattr(ctx, "_speed_ok", None)
+    if cached is None:
+        try:
+            from strata_cli.launch.runner import Runner
+            cached = bool(Runner(ctx.settings, catalog=ctx.catalog, emit=lambda e: None).speed_engine_ok())
+        except Exception:                                    # noqa: BLE001
+            cached = False
+        try:
+            ctx._speed_ok = cached
+        except AttributeError:
+            pass
+    return cached
+
+
 def flow_for(ctx) -> list[str]:
-    """The steps of this computer: the Cards step exists only when two or more graphics cards can be used."""
+    """The steps of this computer: the Cards step exists only when two or more graphics cards can be used; the Speed step only for DeepSeek."""
     ids = [sid for sid, _ in STEPS]
     if len(ctx.computer.usable_gpus) < 2:
         ids.remove("cards")
+    if getattr(getattr(ctx, "settings", None), "family", None) == "deepseek41" and speed_choice_available(ctx):
+        ids.insert(ids.index("context") + 1, "speed")
     return ids
 
 
@@ -111,7 +134,7 @@ class Base(Screen):
         out.append("STRATA  ", style=f"bold {ACCENT}")
         out.append(f"{self.title_line}", style=f"bold {ACCENT}")
         if self.step_id in flow:
-            labels = dict(STEPS)
+            labels = STEP_LABELS
             n = flow.index(self.step_id)
             if self.width() >= 118:
                 out.append("   ")
@@ -387,7 +410,7 @@ class ModelScreen(Base):
         w = self.width()
         if w >= 100:
             return [("Model", 42), ("Download", 10), ("Needs (RAM + VRAM)", 20), ("On this computer", 0)]
-        return [("Model", 41), ("Download", 9), ("Needs (RAM+VRAM)", 17), ("On this computer", 0)]
+        return [("Model", 41), ("Size", 8), ("Needs", 7), ("Fits?", 0)]      # 80 columns: the verdict column keeps room (the long words are below the list)
 
     def build_menu(self, initial: bool = False) -> None:
         s = self.ctx.settings
@@ -402,7 +425,11 @@ class ModelScreen(Base):
             tag = (" (recommended)" if r.recommended else "") + (" (installed)" if r.installed else "") + (" [experimental]" if r.experimental else "")
             need = f"{r.memory_gb:.0f} GB" if r.memory_gb else "-"
             ssd = f" · SSD {r.spill_gb:.0f} GB" if r.spill_gb >= 1 else ""
-            items.append(Item([r.title, f"{r.download_gb:.0f} GB", need, Cell((r.words.split(",")[0].split(":")[0] if ssd and "SSD" in r.words else r.words) + ssd + tag, col)], key=(r.family, r.model)))
+            verdict = (r.words.split(",")[0].split(":")[0] if ssd and "SSD" in r.words else r.words) + ssd + tag
+            if self.width() < 100:                           # a short verdict that fits the column; the full sentence is shown under the list
+                extra = " (recommended)" if r.recommended else " (installed)" if r.installed else " [experimental]" if r.experimental else ""
+                verdict = {"fits": "fits", "tight": "tight", "no": "too big"}[r.verdict] + extra
+            items.append(Item([r.title, f"{r.download_gb:.0f} GB", need, Cell(verdict, col)], key=(r.family, r.model)))
             if (s.family, s.model) == (r.family, r.model):
                 sel = i
         m = self.query_one(Menu)
@@ -872,20 +899,25 @@ class ContextScreen(Base):
         s, cat = self.ctx.settings, self.ctx.catalog
         items = []
         sel = 0
-        for i, c in enumerate(cat.contexts()):
+        deepseek = bool(s.family and cat.strata.multi_family(s.family))     # DeepSeek-V4.1-Flash: 8K to 1M, not Qwen's list or its rope scaling
+        sizes = cat.contexts_for(s.family, s.model)
+        for i, c in enumerate(sizes):
             kvgb = cat.kv_gb(c, self.kv())
             note, style = "", ""
             if c == self.rec:
                 note = "recommended"
+            elif deepseek:
+                if dsv41_context.note(c):
+                    note, style = "not tested yet: takes memory from the model", WARN
             elif c > max(self.rec * 2, 131072) and c <= 262144:
                 note, style = "tight on this computer", WARN
             elif c > 262144:
                 note, style = "experimental: rope scaling", WARN
-            items.append(Item([S.context_label(c), S.words_for(c), f"+{kvgb:.1f} GB", Cell(note, style)], key=c))
+            items.append(Item([S.context_label(c), S.words_for(c), "" if deepseek else f"+{kvgb:.1f} GB", Cell(note, style)], key=c))
             if c == s.context:
                 sel = i
-        if s.context and s.context not in cat.contexts():
-            items.append(Item([S.context_label(s.context), S.words_for(s.context), f"+{cat.kv_gb(s.context, self.kv()):.1f} GB",
+        if s.context and s.context not in sizes:
+            items.append(Item([S.context_label(s.context), S.words_for(s.context), "" if deepseek else f"+{cat.kv_gb(s.context, self.kv()):.1f} GB",
                                Cell("your own size", "")], key=s.context))
             sel = len(items) - 1
         items.append(Item(["Custom…"], key="custom"))
@@ -906,8 +938,13 @@ class ContextScreen(Base):
         cur = self.menu().current if self.menu() else None
         out = Text("More context lets agents read bigger projects. It uses more memory and the first reply of a long chat is slower. "
                    "The memory shown is only the extra for the conversation itself.", style=MUTE)
+        s = self.ctx.settings
+        deepseek = bool(s.family and self.ctx.catalog.strata.multi_family(s.family))
         if cur is not None and isinstance(cur.key, int) and cur.key > 262144:
-            out.append("\nThis is past what the model was trained on; setup adds rope scaling and answers may get less reliable.", style=WARN)
+            if deepseek:
+                out.append("\n" + dsv41_context.NOTE, style=WARN)
+            else:
+                out.append("\nThis is past what the model was trained on; setup adds rope scaling and answers may get less reliable.", style=WARN)
         return out
 
     def action_memory(self) -> None:
@@ -930,6 +967,12 @@ class ContextScreen(Base):
         except ValueError as e:
             self.say(str(e), True)
             return
+        s = self.ctx.settings
+        if s.family and self.ctx.catalog.strata.multi_family(s.family):       # DeepSeek: a size the pack cannot read is the one refusal
+            why = dsv41_context.problem(n, self.ctx.catalog.pack_limit(s.family, s.model))
+            if why:
+                self.say(why, True)
+                return
         self.ctx.settings.context = n
         self.close_field("custom")
         self.build()
@@ -974,10 +1017,15 @@ class PicturesScreen(Base):
         s = self.ctx.settings
         return next((x for x in self.ctx.rows if (x.family, x.model) == (s.family, s.model)), None)
 
+    def own_tower(self) -> bool:
+        """DeepSeek reads pictures with a tower inside its own engine: no separate picture reader to look for."""
+        s = self.ctx.settings
+        return bool(s.family) and bool(self.ctx.catalog.strata.multi_family(s.family))
+
     def reader(self) -> str:
         """"present" when the installed engine carries the picture reader (strata-vision), "missing" when an engine is installed without it,
         "unknown" before any engine is installed (the first launch fetches it)."""
-        return self.ctx.catalog.reader_state()
+        return "present" if self.own_tower() else self.ctx.catalog.reader_state()
 
     def on_mount(self) -> None:
         s = self.ctx.settings
@@ -1013,6 +1061,44 @@ class PicturesScreen(Base):
             device = self.ctx.catalog.picture_default(True)
             key = device if device != "off" else "on"
         self.ctx.settings.vision = key
+
+
+# ------------------------------------------------------------------------------------------------ DeepSeek: speed
+
+class SpeedScreen(Base):
+    step_id = "speed"
+    help_text = ("DeepSeek picks 6 experts for every word it writes. Faster uses 5 of them: answers come sooner, with a small quality change that is "
+                 "usually not noticeable. Full quality uses all 6. Faster is the default on a PC whose graphics cards total 16 GB or less, and on an integrated GPU such as Strix Halo (the engine decides the same way).")
+
+    def body(self) -> ComposeResult:
+        yield Static(Text("Speed or full quality?", style=f"bold {ACCENT}"), markup=False)
+        yield Menu(id="menu")
+
+    def default_faster(self) -> bool:
+        from strata_cli.launch.runner import faster_by_default
+        return faster_by_default(self.ctx.computer, self.ctx.settings)
+
+    def on_mount(self) -> None:
+        s = self.ctx.settings
+        faster_default = self.default_faster()
+        here = Cell("default on this PC", "")
+        items = [Item(["Faster", here if faster_default else Cell("", "")], key="faster"),
+                 Item(["Full quality", here if not faster_default else Cell("", "")], key="full")]
+        sel = 0 if (s.speed or ("faster" if faster_default else "full")) == "faster" else 1
+        self.query_one(Menu).columns = [("", 24), ("", 0)]
+        self.query_one(Menu).set_items(items, sel)
+        self.paint()
+
+    def explain(self) -> Text:
+        key = self.menu().current.key if self.menu() and self.menu().current else "faster"
+        if key == "faster":
+            return Text(S.FASTER_NOTE + " It is the default on a PC with 16 GB of graphics memory or less.", style=MUTE)
+        return Text("Full quality uses all 6 experts per word. Answers are a little slower; pick it when the last bit of quality matters more.", style=MUTE)
+
+    def commit(self) -> None:
+        key = self.menu().current.key
+        default = "faster" if self.default_faster() else "full"
+        self.ctx.settings.speed = None if key == default else key        # the default stays "the default for this PC" in a saved preset
 
 
 # ------------------------------------------------------------------------------------------------ 6 parallel
@@ -1324,7 +1410,8 @@ class AccessScreen(Base):
     step_id = "access"
     hints = "↑↓ choose   Enter next   p port   k new key   t key on/off   Esc back   ? help"
     help_text = ("Who can use the model. 'This computer only' is the safe default and never needs a key. Beyond it Strata makes an API key "
-                 "for you (recommended); press t if you would rather have no key: it still starts, but anyone who can reach it can use it.")
+                 "for you (recommended); press t if you would rather have no key: it still starts, but anyone who can reach it can use it. "
+                 "To see the key later: strata launch --show-key. To use a key of your own: strata launch --api-key YOUR-KEY (or --api-key-env NAME).")
 
     BINDINGS = Base.BINDINGS + [Binding("p", "port", show=False), Binding("k", "newkey", show=False), Binding("t", "keytoggle", show=False)]
 
@@ -1480,9 +1567,12 @@ class SaveScreen(Base):
     def summary_lines(self) -> list[tuple[str, str]]:
         s = self.ctx.settings
         r = next((x for x in self.ctx.rows if (x.family, x.model) == (s.family, s.model)), None)
+        from strata_cli.launch.runner import faster_by_default
         lines = [("Model", (r.title if r else (s.model or "?")) + (" (your files)" if s.model_path else "")),
                  ("Context", S.context_label(s.context) + f", memory {s.kv or 'int8'}"),
                  ("Pictures", "on" if s.vision != "off" else "off"),
+                 *([("Speed", S.speed_words(s.speed or ("faster" if faster_by_default(self.ctx.computer, s) else "full"),
+                                            s.speed is None))] if s.family == "deepseek41" and speed_choice_available(self.ctx) else []),
                  ("Parallel", f"{s.parallel} at a time" if s.parallel else f"fit to your card ({S.fit_parallel(self.ctx.computer.main_vram_gb)})"),
                  ("Tuning", ({"quick": "quick (about 5-10 min)", "thorough": "thorough (about 10-15 min)", "skip": "skipped"} if s.family == "deepseek41"
                               else {"quick": "quick (about 20 min)", "thorough": "thorough (up to 2 h)", "skip": "skipped"})[s.tune]),

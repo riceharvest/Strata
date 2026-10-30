@@ -95,6 +95,10 @@ the manifest file (which holds every file's hash), used as the package's digest 
 
 ## What each target's package holds
 
+Variants in the release: Windows `cuda13`, `cuda12`, `rx9070`, `rdna3`, `rdna2`; Linux `cuda13`, `cuda12`, `rx9070`, `rx7900`, `halo`, `rx6000`, plus
+the SYCL and Metal packages, and (0.2.7.1) Linux ARM64 `cuda13` for the NVIDIA DGX Spark. The packages that also carry `strata-dsv41` (DeepSeek V4.1-Flash, engine 0.1.50) are Windows `cuda13`, Linux `cuda13`
+and Linux `rx9070`. Build `strata-dsv41` with `packaging/build_dsv41_cuda.sh` or `packaging/build_dsv41_windows.bat` and copy it beside `strata` before packaging.
+
 | Package | Built on | Contents | Notes |
 |---|---|---|---|
 | `linux-x86_64` sycl, `archs` `intel-arc` | a Linux box with oneAPI DPC++ 2026.1 and `patchelf`, `packaging/build_sycl_linux.sh` (JIT from SPIR-V; ocloc cannot build the Alchemist FP64 kernels ahead of time, so one JIT package serves A-series and B-series) | `strata`, libsycl, the Unified Runtime adapters, the oneMKL SYCL libraries, libimf / libsvml / libirng / libintlc (about 650 MiB); every ELF file has RUNPATH `$ORIGIN` (Intel's libraries ship without it), so `env -i ./strata --version` runs | the Level Zero loader and compute runtime are the PC's driver; the user must be in the `render` group (`strata doctor` warns). No Windows package: `BACKEND_MATRIX` allows sycl on `linux-x86_64` only |

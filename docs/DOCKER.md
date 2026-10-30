@@ -37,8 +37,8 @@ downloaded for the model itself ([Files you already have](#files-you-already-hav
 ```sh
 docker run -d --name strata --device /dev/dri --group-add $(getent group render | cut -d: -f3) \
   -p 127.0.0.1:8080:8080 --ulimit memlock=-1:-1 --shm-size 2g --stop-timeout 120 \
-  -v strata-data:/data -e MODEL=IQ3_S -e MODEL_PATH=/models -v /srv/gguf/IQ3_S:/models:ro \
-  -e API_KEY=$(openssl rand -hex 24) ghcr.io/niko1221/strata:0.2.3-sycl
+  -v strata-data:/data -e FAMILY=qwen -e MODEL=IQ3_S -e MODEL_PATH=/models -v /srv/gguf/IQ3_S:/models:ro \
+  -e API_KEY=$(openssl rand -hex 24) ghcr.io/niko1221/strata:0.2.7-sycl
 ```
 
 What the options are for: `--ulimit memlock=-1:-1` lets the engine pin the RAM it uses for the model, `--shm-size 2g` gives
@@ -81,16 +81,18 @@ screens; leave out what you do not care about.
 | Variable | What it does | Default |
 | --- | --- | --- |
 | `MODEL` | model size: `IQ2_XS`, `IQ3_XXS`, `IQ3_S`, `Q2_0`, `UD-Q4_K_XL`, ... ([MODELS.md](MODELS.md)) | Strata picks what suits the card, and says so in the log |
-| `FAMILY` | `qwen`, `swift`, `coder`, ... when a size exists in several families | the usual one |
+| `FAMILY` | `qwen`, `unsloth`, `gyro`, `coder`, `swift`, ...; use `qwen` for the original ISTA-DASLab packs | installer recommendation; may differ by hardware |
 | `MODEL_PATH` | GGUF files you already have: a folder or one `.gguf`, **inside the container** (mount it with `-v`, `:ro` is fine) | download |
+| `ALLOW_DOWNLOAD` | `1`: go on and download the model although model files of the older layout were left unread in `/data/models` (see [From the older image](#from-the-older-image)) | stop |
 | `CONTEXT` | how much text it remembers at once: `32k`, `64k`, `128k`, `256k` or a number | the largest that fits |
 | `PARALLEL` | requests answered at the same time, 1 to 8 | fitted to the card |
 | `VISION` | `off`, `on` (the model reads pictures), `gpu`, `cpu`; the picture-reader file (about 0.9 GB) is downloaded with the model | `off` |
 | `KV` | conversation memory format: `int8`, `q4_0` (half the memory), `k8v4`, `fp16` | `int8` |
 | `GPU` / `GPUS` | card numbers as the monitor lists them, `0` or `0,1`; empty or `all` = the engine's choice. Changing it later makes the model's run settings again (the files stay) | all that fit |
-| `GPU_ROLES` | a role for each card, `1=main,0=helper` (`main`, `helper`, `off`; cards you do not name are off; not together with `GPU` / `GPUS`). Passed to `launch --gpu-roles`; see [MULTI_GPU.md](MULTI_GPU.md) |
-| `TUNE` | `quick` (up to about 20 minutes, once), `thorough`, `skip`; done once and kept in the preset (`RETUNE=1` tunes again) | `skip` |
+| `GPU_ROLES` | a role for each card, `1=main,0=helper` (`main`, `helper`, `off`; cards you do not name are off; not together with `GPU` / `GPUS`). Passed to `launch --gpu-roles`; see [MULTI_GPU.md](MULTI_GPU.md) | none |
+| `TUNE` | `quick` (runtime depends on hardware and workload), `thorough`, `skip`; done once and kept in the preset (`RETUNE=1` tunes again) | `skip` |
 | `API_KEY` / `API_KEY_FILE` | the key clients must send ([below](#the-api-key)); the file form is for Docker secrets | made for you |
+| `TUNE_ALLOW_SMALL` | `1` passes `--tune-allow-small` to `launch` (allow tuning on a small card) | `0` |
 | `PORT` | the port inside the container | `8080` |
 | `PRESET` | the preset name in `/data` | `docker` |
 | `STRATA_SET` | advanced engine settings, space separated, like `strata launch --set` (`"prefill=65536 STRATA_PIN_BY_NEED=1"`) | none |
@@ -98,7 +100,7 @@ screens; leave out what you do not care about.
 Your choices are saved as a preset in the volume. Start again with no settings and the saved preset is used; start with
 settings and they replace the saved ones (tuning results are kept). To change one thing, recreate the container with the new
 variable; the model and tuning stay in `/data`. Anything else: `docker exec strata strata launch --help`, or
-`docker run --rm IMAGE strata launch --plan --model q2_0` to see what a choice would do without starting anything.
+`docker run --rm IMAGE strata launch --plan --family qwen --model q2_0` to see what a choice would do without starting anything.
 
 What is in the volume `/data`: `Strata-data/` (model files, the prepared pack), `state/` (presets, tuning, the key), `install/`
 (run settings and logs), `home/`. The engine and the Terminal are in the image, so updating the image never touches your files.
@@ -109,14 +111,14 @@ container's user). Nothing large is written anywhere else in the container.
 ### Files you already have
 
 Mount the folder with the model's GGUF files read-only and name it: `-v /srv/gguf/IQ3_XXS:/models:ro -e MODEL_PATH=/models
--e MODEL=IQ3_XXS`. Nothing is downloaded for the model itself; the prepared pack is made in the volume.
+-e FAMILY=qwen -e MODEL=IQ3_XXS`. Nothing is downloaded for the model itself; the prepared pack is made in the volume.
 
 - The folder holds the shards of one model directly (`...-00001-of-00002.gguf`, `...-00002-of-00002.gguf`), not a folder of folders.
   If you mount a parent folder, the container says which sub-folder to name in `MODEL_PATH`.
 - The folder has to be mounted: a `MODEL_PATH` that is not in the container, or a folder with no `.gguf` files, stops the start at
   once with a message, and nothing is downloaded.
 - Read-only (`:ro`) is fine. The pack (about 40 GB for IQ3_XXS) and the draft layer (about 6 GB, fetched once) are written to the
-  volume, so it needs that room. With pictures on (the default) the picture reader (0.9 GB) is fetched too; `VISION=off` skips it.
+  volume, so it needs that room. With `VISION=on` the picture reader (0.9 GB) is fetched too; `VISION=off` skips it.
 - Links to the files work when the links' targets are mounted too, and `MODEL` is set (without `MODEL`, Strata identifies the files itself
   and does not follow links).
 - Without `MODEL_PATH`, files you put into the volume by hand (`/data/Strata-data/models/<model folder>/`) are found as well, if they have the
@@ -225,7 +227,10 @@ package and start through `strata launch`. Mapping:
 A volume from the older image is picked up: the first start moves `/data/models`, `/data/packs` and `/data/mtp` into
 `/data/Strata-data` (a rename inside the volume: nothing is copied or downloaded again, and the prepared pack is kept). The old
 `/data/config` is not read; the run settings are made again from the files. A folder you mounted yourself at one of those places
-is left alone: point `MODEL_PATH` at it. The container name, the volume and the port can stay as they were.
+is left alone: point `MODEL_PATH` at it. If model files are still in `/data/models` when the container starts (a folder you mounted there, or
+a move that failed) and `MODEL_PATH` is not set, the start **stops at once and says where the files are**: it would otherwise download the model
+again, tens of GB, because this image does not read that place. Name the folder in `MODEL_PATH`, or set `ALLOW_DOWNLOAD=1` to download anyway.
+The container name, the volume and the port can stay as they were.
 
 ## Build it yourself
 
@@ -256,7 +261,7 @@ files the signed update feed names. Nothing publishes by itself: a maintainer st
    the default branch to show up). Inputs: the release tag (`v0.2.3`), the flavors (empty: `sycl`, when the release has a package
    for it), **push** and **latest**. Run it once with **push off**: it builds every image and publishes nothing (a dry run).
 3. Run it again with **push on**. It logs in to `ghcr.io` with the job's `GITHUB_TOKEN` (`packages: write`) and pushes
-   `ghcr.io/niko1221/strata:0.2.3-<flavor>` and `latest-<flavor>`. Turn **latest** off for a pre-release.
+   `ghcr.io/niko1221/strata:0.2.7-<flavor>` and `latest-<flavor>`. Turn **latest** off for a pre-release.
 4. The first push creates each package as private. In the repository's Packages, open every package, **Package settings, Change
    visibility, Public**, and check it is linked to the repository (the image carries the `org.opencontainers.image.source` label).
 5. Check one pull from a computer that is not logged in: `docker pull ghcr.io/niko1221/strata:0.2.3-sycl`.
@@ -272,7 +277,7 @@ the job starts the image once to see that the Terminal inside it runs.
 | `sycl` | `linux-x86_64`, sycl; **only when the feed lists one** (the 0.2.0-beta feed has none, so no Intel image is built from it) |
 
 A flavor the feed has no package for is left out, with a line in the log. The same steps run from a Linux computer with Docker:
-`docker/publish.sh --release-tag v0.2.3` builds everything and pushes nothing; add `--push` (after `docker login ghcr.io`) to publish.
+`docker/publish.sh --release-tag v0.2.7` builds everything and pushes nothing; add `--push` (after `docker login ghcr.io`) to publish.
 The images run on the runner without a graphics card, so the card checks (`docker/smoke-test.sh`) stay a manual step on a computer with the card.
 
 ## Tested

@@ -15,7 +15,7 @@
 #   4. with --push: docker push of <image>:<version>-<flavor> and, unless --no-latest, <image>:latest-<flavor>. You must be logged in
 #      to the registry already (`docker login ghcr.io`; the workflow logs in with GITHUB_TOKEN).
 #
-#   --release-tag TAG    the release, for example v0.2.3; the image version is the tag without the leading v
+#   --release-tag TAG    the release, for example v0.2.7; the image version is the tag without the leading v
 #   --source DIR|URL     use this folder or URL (with strata-feed.json, its .sig and the archives) instead of the GitHub release
 #   --version V          image version (default: the tag without v)
 #   --flavors LIST       comma separated (default: sycl, the only flavor)

@@ -68,14 +68,14 @@ BURST_MAX_TOKENS = 128
 def redactor(extra: list[str] = (), key: str = ""):
     """-> f(text) -> text with this machine's home folders, user and host names, the Strata folder, IP addresses and the
     API key replaced.  Applied to everything that is written or printed from the server's or the machine's own text."""
-    subs: list[tuple[re.Pattern, str]] = []
+    subs: list[tuple[re.Pattern, str, int]] = []
 
     def add(value, label, word=False):
         if value and len(str(value)) >= 4:
             v = str(value)
             for form in sorted({v, v.replace("\\", "/"), v.replace("/", "\\")}, key=len, reverse=True):
                 pat = re.escape(form)
-                subs.append((re.compile(r"(?<![\w-])" + pat + r"(?![\w-])" if word else pat, re.I), label))
+                subs.append((re.compile(r"(?<![\w-])" + pat + r"(?![\w-])" if word else pat, re.I), label, len(form)))
 
     add(ROOT, "<strata>")
     add(Path.home(), "<home>")
@@ -89,7 +89,7 @@ def redactor(extra: list[str] = (), key: str = ""):
     for x in extra:
         add(x, "<private>", True)
     add(key, "<key>")
-    subs.sort(key=lambda p: -len(p[0].pattern))
+    subs.sort(key=lambda s: -s[2])      # by the text that is replaced: the word wrappers would make a short user name outrank the folder holding it
     path_user = re.compile(r"(?i)([A-Za-z]:)?([\\/])(Users|home)([\\/])(?!<)[^\\/\s\"':;,]+")
     ip4 = re.compile(r"\b(?:192\.168|10\.\d{1,3}|172\.(?:1[6-9]|2\d|3[01])|100\.(?:6[4-9]|[7-9]\d|1[01]\d|12[0-7])|169\.254)\.\d{1,3}\.\d{1,3}\b")
     bearer = re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._~+/=-]{8,}")
@@ -97,7 +97,7 @@ def redactor(extra: list[str] = (), key: str = ""):
     def f(text):
         if not isinstance(text, str):
             return text
-        for pat, label in subs:
+        for pat, label, _ in subs:
             text = pat.sub(label, text)
         text = path_user.sub(lambda m: f"{m.group(1) or ''}{m.group(2)}{m.group(3)}{m.group(4)}<user>", text)
         text = bearer.sub(r"\1<key>", text)
@@ -529,7 +529,8 @@ def detect_quant(view: dict) -> str | None:
 
 def project_version() -> str | None:
     try:
-        m = re.search(r"project\(strata VERSION ([\d.]+)", (ROOT / "CMakeLists.txt").read_text())
+        # UTF-8 as setup.py reads it, whatever the locale's code page (#2792)
+        m = re.search(r"project\(strata VERSION ([\d.]+)", (ROOT / "CMakeLists.txt").read_text(encoding="utf-8"))
         return m.group(1) if m else None
     except OSError:
         return None
@@ -562,7 +563,7 @@ def collect_machine(base: str, key: str, cfg: dict | None, gpu_arg: str | None =
         "gpu": gpu_names, "gpu_vram_mib": vram_mib, "gpu_driver": None,
         "cpu": static.get("cpu_name") or cpu_name(), "cpu_cores": static.get("cores"),
         "cpu_threads": static.get("threads") or os.cpu_count(), "ram_gib": total_ram_gib(),
-        "os": f"{platform.system()} {platform.release()} ({platform.version()})" if os.name == "nt" else f"{platform.system()} {platform.release()}",
+        "os": f"{platform.system()} {'11' if int(platform.version().split('.')[-1] or 0) >= 22000 else platform.release()} ({platform.version()})" if os.name == "nt" else f"{platform.system()} {platform.release()}",
         "python": platform.python_version(),
         "strata_version": project_version(), "strata_commit": git_commit(),
         "engine_version": (eng.get("version") or status.get("engine") or str(props.get("build_info", "")).replace("Strata ", "") or None),
@@ -747,8 +748,11 @@ def render_readme(res: dict) -> str:
          f"installed RAM: {mc.get('ram_gib') or '?'} GiB; storage: not measured",
          f"- OS: {mc.get('os')}; GPU driver: {mc.get('gpu_driver') or 'not read'}",
          f"- Strata: project {mc.get('strata_version') or '?'}, commit {mc.get('strata_commit') or 'not a git checkout'}; "
-         f"engine {mc.get('engine_version') or 'not read'}",
-         "- Background workloads and power limits: not recorded", "",
+         f"engine {mc.get('engine_version') or 'not read'}"]
+    for g in (mc.get("gpu_detail") or []):
+        if g:
+            L.append("- GPU detail (after the run, near idle): " + ", ".join(f"{k}={v}" for k, v in g.items() if v is not None))
+    L += ["- Background workloads: not recorded (GPU power limit/draw read above)", "",
          "## Model and configuration", "",
          f"- Model and quantization: {model}",
          f"- Context: {mc.get('context') or 'not read'} tokens; parallel slots: {mc.get('parallel_slots') or 1}",

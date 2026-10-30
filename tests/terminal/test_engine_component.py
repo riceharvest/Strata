@@ -19,6 +19,7 @@ from strata_control import acquisition, components, engine_component as ec
 
 WINDOWS = os.name == "nt"
 HERE = components.host_platform()
+NO_HIP = HERE == "linux-aarch64"      # the DGX Spark: CUDA only
 EXE = "strata.exe" if WINDOWS else "strata"
 
 
@@ -115,6 +116,7 @@ class Resolution(unittest.TestCase):
             ec.resolve(self.root, backend="sycl")
         self.assertIn(f"is for {other}", str(caught.exception))
 
+    @unittest.skipIf(NO_HIP, "there is no HIP engine for arm64 Linux (BACKEND_MATRIX): this test builds one for the host platform")
     def test_another_backend_is_refused_with_the_reason(self):
         make_package(self.root, backend="cpu")
         with self.assertRaises(ec.EngineMissing) as caught:

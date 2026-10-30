@@ -46,7 +46,8 @@ Qwen3.8-Flash-Next IQ2_XS on one Arc Pro B70, Ryzen 9 5950X, 64 GB RAM. Settings
 That's +12% (4K) and +17% (16K) prompt speed over upstream Strata on the same card, with identical greedy answers.
 [docs/B70.md](docs/B70.md) has the comparison, every change against upstream and who wrote it.
 
-## What you need
+<details>
+<summary><img src="docs/media/models/qwen.svg" width="22" alt="" align="middle"> &nbsp;<b>Qwen3.8-Flash-Next</b></summary>
 
 - An Intel Arc Pro B70, Linux with the `xe` kernel driver and the Intel compute runtime (`ls /dev/dri` shows
   `renderD128`)
@@ -111,7 +112,10 @@ The server speaks the OpenAI, Anthropic and OpenAI Responses APIs on the port se
 - **B70 defaults are on.** `STRATA_VERIFY_DEVICE_PLAN=1`, `STRATA_VERIFY_NO_HOST=1` and `STRATA_STAGER_THREADS` are set
   unless you set them yourself. `0` turns one off; `STRATA_B70_DEFAULTS=0` turns all three off.
 
-## Credits and license
+<a id="guides"></a>
+<a id="how-fast-is-it"></a>
+<a id="how-does-it-work"></a>
+<a id="something-went-wrong"></a>
 
 - The engine and server are [Strata](https://github.com/Niko1221/Strata) by Niko1221 and its contributors. Several B70
   changes here are community pull requests to upstream, credited in [docs/B70.md](docs/B70.md).

@@ -63,6 +63,12 @@ main() {
   fi
   say "Strata Terminal installer"
   say "  This computer: $os $arch ($platform)${gpu:+, graphics: $gpu}"
+  if [ "$platform" = linux-aarch64 ]; then      # recommend, never force: the Terminal installs on any ARM Linux, its engine is for one machine
+    case "$gpu" in
+      *GB10*) ;;
+      *) say "  Note: Strata's engine for ARM Linux is built and tested on the NVIDIA DGX Spark (GB10) only. This computer reports ${gpu:-no NVIDIA graphics}: the Terminal installs, but 'strata launch' may find no engine for it." ;;
+    esac
+  fi
   say "  Release folder: $FEED"
 
   # ---- 2. download and check

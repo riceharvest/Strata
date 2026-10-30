@@ -33,6 +33,8 @@ def host_platform() -> str:
     machine = platform.machine().lower()
     arch = {"arm64": "arm64", "aarch64": "arm64",
             "x86_64": "x86_64", "amd64": "x86_64"}.get(machine, machine)
+    if system == "linux" and arch == "arm64":
+        return "linux-aarch64"         # Linux names its ARM64 machines as uname does (the Tauri target and the Python build too); a Mac stays macos-arm64
     return f"{system}-{arch}"
 
 

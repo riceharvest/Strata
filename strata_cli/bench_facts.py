@@ -7,6 +7,7 @@ server's answers. A fact that cannot be read becomes `None` with a reason in `Wh
 from __future__ import annotations
 
 import getpass
+import glob
 import hashlib
 import json
 import os

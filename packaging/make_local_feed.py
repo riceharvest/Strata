@@ -57,6 +57,7 @@ def main(argv=None) -> int:
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--terminal", type=Path, action="append", default=[], help="a terminal archive (.tar.gz or .zip); repeat per platform")
     ap.add_argument("--engine", type=Path, action="append", default=[], help="an engine package folder (with engine-component.json)")
+    ap.add_argument("--dsv41", type=Path, action="append", default=[], help="a DeepSeek engine package folder (the feed's dsv41 member)")
     ap.add_argument("--keys", type=Path, default=None, help="folder for the test key (default: <out>/../feed-test-keys)")
     ap.add_argument("--url", default="http://127.0.0.1:8099", help="the address this feed will be served at (baked into install.sh)")
     ap.add_argument("--sequence", type=int, default=1)
@@ -72,6 +73,8 @@ def main(argv=None) -> int:
     shutil.rmtree(out, ignore_errors=True)
     (out / "engine").mkdir(parents=True)
     (out / "control").mkdir(parents=True)
+    if a.dsv41:
+        (out / "dsv41").mkdir(parents=True)
     version = a.version
     with tempfile.TemporaryDirectory(prefix="strata-feed-") as tmp:
         tmpdir = Path(tmp)
@@ -91,8 +94,18 @@ def main(argv=None) -> int:
             entry = ft.pack_engine(copy, out / "engine")
             print(f"engine {entry['platform']}-{entry['backend']} {entry['version']}: {entry['size'] // 1048576} MB")
             shutil.rmtree(copy.parent, ignore_errors=True)
+        for n, pkg in enumerate(a.dsv41):
+            copy = tmpdir / f"d{n}" / pkg.name
+            shutil.copytree(pkg, copy, symlinks=True)
+            ft.sign_package(copy, key)
+            entry = ft.pack_engine(copy, out / "dsv41", url_prefix="dsv41/", prefix="strata-dsv41")
+            print(f"deepseek engine {entry['platform']}-{entry['backend']} {entry['version']}: {entry['size'] // 1048576} MB")
+            shutil.rmtree(copy.parent, ignore_errors=True)
     ft.build_feed(out, key=key, sequence=a.sequence, channel=a.channel, engine_dir=out / "engine" if a.engine else None,
-                  control_dir=out / "control" if a.terminal else None)
+                  control_dir=out / "control" if a.terminal else None, dsv41_dir=out / "dsv41" if a.dsv41 else None)
+    if any("linux-aarch64" in p.name for p in (out / "control").glob("*.entry.json")):       # the Linux ARM64 Terminal reads its own feed file (same bytes here)
+        for suffix in ("", ".sig"):
+            shutil.copy2(out / ("strata-feed.json" + suffix), out / ("strata-feed-linux-aarch64.json" + suffix))
     base = a.url.rstrip("/")
     text = (ROOT / "packaging" / "install.sh").read_text(encoding="utf-8").replace(RELEASE_FEED, base)
     (out / "install.sh").write_text(text, encoding="utf-8", newline="\n")

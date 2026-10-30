@@ -1,13 +1,14 @@
 # Strata's MCP server: let your AI assistant install and run Strata
 
-`tools/strata_mcp.py` is an [MCP](https://modelcontextprotocol.io) server for the AI assistant you already use
-(Claude Code, Claude Desktop, Cursor, VS Code, Codex ...). Add it once, then ask in plain words:
+This page is for people who use an AI assistant and want it to install, start, stop and check Strata. `tools/strata_mcp.py`
+is an [MCP](https://modelcontextprotocol.io) server for the assistant you already use (Claude Code, Claude Desktop,
+Cursor, VS Code, Codex ...). Add it once ([Quick start](#add-it)), then ask in plain words:
 
 - "Install Strata for this PC."
 - "Start Strata." / "Stop Strata."
 - "Is Strata running? How much VRAM does it use?"
 - "Which Strata model fits my PC?"
-- "Strata didn't start - what does the log say?"
+- "Strata didn't start. What does the log say?"
 - "How fast is Strata on this PC?" (a short speed test)
 - "How do I connect Open WebUI / the OpenAI SDK / Claude Code to Strata?"
 
@@ -20,6 +21,9 @@ It is not the same thing as [Tools from MCP servers](DETAILS.md#tools-from-mcp-s
 direction: *your assistant* manages Strata.
 
 ## Add it
+
+This is an optional **source-checkout tool**. It is not required to install the released app or Terminal.
+For normal agent-assisted installation, use [AI_SETUP.md](AI_SETUP.md).
 
 You need a copy of Strata: the zip from GitHub, or `git clone https://github.com/Niko1221/Strata`. Below,
 `C:\Users\you\Strata` (Windows) and `/home/you/Strata` (Linux) stand for that folder. Use `python3` on Linux. On
@@ -130,7 +134,7 @@ Every result is JSON with a one-line `summary`. It is sent both as text and as M
 - the context for the Intel Arc card's VRAM (8K under 10 GB, 16K under 20 GB, else 32K: the same rule as `strata launch`);
 - pictures on where the model can read them (on an Intel Arc the picture reader runs on the CPU).
 
-The first call returns the plan: the download size (58-111 GB), the free disk space, the RAM check, and the exact
+The first call returns the plan: the download size, the free disk space, the RAM check, and the exact
 setup command. The assistant should show you the plan and call again with `confirm: true` once you agree.
 
 It then runs the same steps `START-HERE.bat` / `setup.sh` run:
@@ -164,7 +168,7 @@ VRAM and pinned RAM itself, as when you close the window. Then the server ends:
 
 While a request is running, the tool refuses unless you pass `force: true`.
 
-**Status.** The tool reads `GET /health`, `/v1/status`, `/status` and, on older servers, `/metrics` on 127.0.0.1.
+**Status.** The tool reads `GET /health`, `/v1/status`, `/status` and `/metrics` on 127.0.0.1.
 If a config of the folder sets an `api_key`, the tool sends that key with its own requests. It never shows the key.
 
 ## Safety
