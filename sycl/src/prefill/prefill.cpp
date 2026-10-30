@@ -451,6 +451,16 @@ inline int i8_mode(void* cs) {
     if (e != nullptr) return strata::prefill::i8::choose_mode(e, false, false);
     return strata::prefill::i8::choose_mode(nullptr, strata::prefill::i8::battlemage(cs), strata::prefill::i8::available(cs));
 }
+// The groups the auto choice gives the FP16 chain take the FP16 expert products (i8::gate_up_f16 / down_f16): the chain's weights and
+// arithmetic up to the summation order, one launch per product for the group instead of a dequantize and two oneMKL GEMMs per expert.
+// On where they handle the layer's formats (IQ2_S / IQ2_XXS gate/up, Q2_0 down, on the devices the int8 kernels run on);
+// STRATA_PREFILL_F16X=0: the dequantize + oneMKL chain.
+std::atomic<bool> g_f16x_failed{false};   // a launch threw: the dequantize + oneMKL chain for the rest of the process
+inline bool f16x_on(void* cs, int gu_type, int d_type, int64_t n_ff, int64_t n_embd) {
+    static const bool off = [] { const char* v = std::getenv("STRATA_PREFILL_F16X"); return v != nullptr && v[0] == '0'; }();
+    return !off && !g_f16x_failed.load(std::memory_order_relaxed) &&
+           strata::prefill::i8::f16_handles(gu_type, d_type, (int) n_ff, (int) n_embd, cs);
+}
 // ring sizing happens before any queue is at hand: room for the int8 groups whenever the choice could be on
 inline int stage_slots() {
     const char* e = i8_env();
@@ -1538,9 +1548,12 @@ I8Cross i8_calibrate(M& m, const strata::kernels::cpu::NativeFmt& f) {
     sycl::queue& q = *m.cs;
     const std::string dev = q.get_device().template get_info<sycl::info::device::name>() + "|" +
                             q.get_device().template get_info<sycl::info::device::driver_version>();
+    // (the groups above the crossover take the FP16 products where they handle the formats: those are what int8 is timed against, and
+    //  the key says so - "|h1")
+    const bool fx = f16x_on(m.cs, f.gu_type, f.d_type, f.n_ff, f.n_embd);
     char keyb[600];
-    std::snprintf(keyb, sizeof keyb, "%s|%d|%d|%lldx%lld|k%d", dev.c_str(), f.gu_type, f.d_type, (long long) f.n_ff, (long long) f.n_embd,
-                  strata::prefill::i8::kKernelRev);
+    std::snprintf(keyb, sizeof keyb, "%s|%d|%d|%lldx%lld|k%d%s", dev.c_str(), f.gu_type, f.d_type, (long long) f.n_ff, (long long) f.n_embd,
+                  strata::prefill::i8::kKernelRev, fx ? "|h1" : "");
     const std::string key = keyb;
     I8Cross res;
     if (i8_cache_read(key, res)) {
@@ -1616,6 +1629,12 @@ I8Cross i8_calibrate(M& m, const strata::kernels::cpu::NativeFmt& f) {
             }) / E;
             if (refused) throw std::runtime_error("the int8 kernels refused this format");
             t16[ri] = timeit([&] {
+                if (fx) {
+                    if (!i8::gate_up_f16(f.gu_type, pb.data(), f.up_off, NF, lo, N, X, Hh, &q) ||
+                        !i8::down_f16(f.d_type, pb.data(), f.down_off, N, lo, NF, Hh, Dm, &q))
+                        refused = true;
+                    return;
+                }
                 int64_t o = 0;
                 for (int i = 0; i < E; ++i) {
                     const int qd = i % DQ;
@@ -1627,6 +1646,7 @@ I8Cross i8_calibrate(M& m, const strata::kernels::cpu::NativeFmt& f) {
                     o += cnt[i];
                 }
             }) / E;
+            if (refused) throw std::runtime_error("the FP16 products refused this format");
         }
     } catch (const std::exception& e) {
         std::fprintf(stderr, "strata: int8 experts: the crossover measurement failed (%s): the int8 path is used below 64 rows per expert\n", e.what());
@@ -6946,7 +6966,31 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                                     if (!g_i8_failed.exchange(true))
                                         std::fprintf(stderr, "strata: the int8 expert kernels failed to launch (%s): the FP16 expert chain is used from here\n", ex.what());
                                 }
-                                if (!done8) {   // the FP16 chain: dequantize, two oneMKL GEMMs, SwiGLU, per expert
+                                bool doneh = false;
+                                if (!done8 && f16x_on(m.cs, f.gu_type, f.d_type, f.n_ff, f.n_embd)) {
+                                    // the FP16 products: the FP16 chain's values up to the summation order, one launch per product
+                                    namespace i8 = strata::prefill::i8;
+                                    try {
+                                        if (static bool said = false; !said) {
+                                            said = true;
+                                            std::fprintf(stderr, "strata: prompt experts above the int8 crossover on the FP16 products (STRATA_PREFILL_F16X=0: dequantize + oneMKL)\n");
+                                        }
+                                        i8::Layout loh;
+                                        i8::make_layout(loh, xg_c, xg_n);
+                                        pt.mark(kPfGemmGU, cs);
+                                        if (i8::gate_up_f16(f.gu_type, xg_g, f.up_off, f.n_ff, loh, (int) N, m.Xs + xg_r0 * N, m.Hh + xg_r0 * 640, m.cs)) {
+                                            had_h(xg_r0, nr);
+                                            pt.mark(kPfGemmD, cs);
+                                            doneh = i8::down_f16(f.d_type, xg_g, f.down_off, (int) N, loh, f.n_ff, m.Hh + xg_r0 * 640,
+                                                                 m.Dm + xg_r0 * N, m.cs);
+                                        }
+                                    } catch (const std::exception& ex) {   // as the int8 kernels: the dequantize + oneMKL chain, for good
+                                        doneh = false;
+                                        if (!g_f16x_failed.exchange(true))
+                                            std::fprintf(stderr, "strata: the FP16 expert products failed to launch (%s): the dequantize + oneMKL chain is used from here\n", ex.what());
+                                    }
+                                }
+                                if (!done8 && !doneh) {   // the FP16 chain: dequantize, two oneMKL GEMMs, SwiGLU, per expert
                                     int64_t o = xg_r0;
                                     for (int i = 0; i < xg_n; ++i) {
                                         const int qd = i % DQ;

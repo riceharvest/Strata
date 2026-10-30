@@ -57,6 +57,9 @@ void quantize_rows(const uint16_t*, const Layout&, int, int8_t*, float*, void*) 
 bool gate_up(int, const uint8_t* const*, size_t, int, const Layout&, int, const int8_t*, const float*, float*, void*) { return false; }
 void swiglu_quantize(const float*, const Layout&, int, int8_t*, float*, void*) {}
 bool down(int, const uint8_t* const*, size_t, int, const Layout&, int, const int8_t*, const float*, float*, void*) { return false; }
+bool f16_handles(int, int, int, int, void*) { return false; }
+bool gate_up_f16(int, const uint8_t* const*, size_t, int, const Layout&, int, const uint16_t*, uint16_t*, void*) { return false; }
+bool down_f16(int, const uint8_t* const*, size_t, int, const Layout&, int, const uint16_t*, float*, void*) { return false; }
 }  // namespace strata::prefill::i8
 #else
 namespace strata::prefill::i8 {
@@ -1236,6 +1239,432 @@ bool down(int d_type, const uint8_t* const* blob, size_t down_off, int n_embd, c
             else launch_dn<T_Q2_0, MT, 256>(q, a, rb);
         }
     });
+}
+
+// ------------------------------------------------------------------------------------------------ FP16 products (larger groups)
+// The FP16 chain (dequantize the expert to FP16, oneMKL FP16 GEMM, SwiGLU, oneMKL GEMM) without the FP16 copy of the expert and
+// with one launch per product for the group:
+//  * Tile.  A hardware thread owns 64 rows (MT = 8 row tiles) of one expert and 32 output columns (gate/up: 16 gate rows and the
+//    same 16 up rows, SwiGLU in the epilogue; down: 2 tiles of 16).  It walks K in steps of 16: decode the step's B operand (lane =
+//    output column, VNNI: a dword holds two consecutive K values) in registers, read the activations with 2-D block loads (rows past
+//    the expert's end read as zero, stores past it are dropped), one FP16 DPAS 8x16x16 per row tile and column tile into FP32
+//    accumulators (128 of the 256 registers).  A weight is decoded once per 64 rows.  No shared memory, no barrier; the 8 threads of a
+//    work-group share their rows (L1).  Measured on gate/up (esimd_f16_parity, 16 experts x 320 rows, B70, the first version with a sign
+//    table): the DPAS loop alone 111 TFLOP/s, with the decode 72, with the activation loads 79, with both 53; with the computed signs
+//    and no per-tile branches 64; 32 rows a thread (MT 4) was half as fast, 32 output columns more (64 x 64) spilled.
+//  * Weights.  The values iq_dequant_expert_f16 writes: IQ2_S / IQ2_XXS w = d (2 s + 1) g / 8 rounded to FP16 once (its float
+//    product is exact).  Here g (2 s + 1) is an exact FP16 integer (<= 1333) and times d it rounds once to 8 w; the 1 / 8 is applied
+//    to the FP32 accumulators (exact).  So the B operand is the FP16 chain's weights times 8, bit for bit, unless a weight is an FP16
+//    subnormal (|w| < 6.1e-5; this one is then the more precise).  Q2_0 w = d (c - 1) is exact.  The codebooks are FP16 copies
+//    of the grids (4 dwords an entry, one 16-byte gather a lane) gathered from global memory (L1); the sign bits are computed.
+//  * Outputs: gate/up H = silu(g) u in FP16, saturated at +-65504 as swiglu_interleaved; down FP32.  The products differ from the
+//    FP16 chain only in the summation order.
+namespace {
+constexpr int O_HG2S = 0;       // iq2s_grid as FP16: 1024 entries x 4 dwords (values 2j, 2j + 1 in dword j)
+constexpr int O_HG2XXS = 4096;  // iq2xxs_grid as FP16: 256 x 4
+constexpr int O_HQ2 = 5120;     // Q2_0 byte -> its four (code - 1) as FP16: 256 x 2 dwords
+constexpr int N_HTABLE = 5632;
+
+uint32_t* htables(sycl::queue& q) {
+    static std::mutex mu;
+    static std::unordered_map<sycl::device, uint32_t*> per_dev;
+    std::lock_guard<std::mutex> lk(mu);
+    uint32_t*& t = per_dev[q.get_device()];
+    if (!t) {
+        auto hb = [](int v) { return (uint32_t) sycl::bit_cast<uint16_t>(sycl::half((float) v)); };
+        std::vector<uint32_t> h(N_HTABLE, 0);
+        auto grid = [&](int off, const uint64_t* g, int n) {
+            for (int i = 0; i < n; ++i)
+                for (int j = 0; j < 4; ++j)
+                    h[off + 4 * i + j] = hb((int) ((g[i] >> (16 * j)) & 0xff)) | (hb((int) ((g[i] >> (16 * j + 8)) & 0xff)) << 16);
+        };
+        grid(O_HG2S, iq2s_grid, 1024);
+        grid(O_HG2XXS, iq2xxs_grid, 256);
+        for (int b = 0; b < 256; ++b)
+            for (int j = 0; j < 2; ++j)
+                h[O_HQ2 + 2 * b + j] = hb(((b >> (4 * j)) & 3) - 1) | (hb(((b >> (4 * j + 2)) & 3) - 1) << 16);
+        uint32_t* d = sycl::malloc_device<uint32_t>(N_HTABLE, q);
+        q.memcpy(d, h.data(), N_HTABLE * 4);
+        q.wait();
+        t = d;
+    }
+    return t;
+}
+
+struct HArgs {
+    const uint8_t* blob[kMaxGroup];
+    uint32_t sec_off;                 // gate/up: byte offset of the up rows; down: byte offset of the down rows
+    int n;
+    int row0[kMaxGroup + 1];
+    int rb0[kMaxGroup + 1];           // first row block of expert i
+    const half* X;                    // A rows [row][K]
+    void* Y;                          // gate/up: H (FP16) [row][n_out]; down: Dm (FP32) [row][n_out]
+    const uint32_t* tab;
+    int K;
+    int n_out;                        // gate/up: n_ff; down: n_embd
+    int rowb;                         // bytes per weight row
+    uint32_t lim;                     // down: byte offset of the last dword of the matrix (ld32c)
+    int dbg;                          // STRATA_F16X_DBG: 4 skip the stores, 8 no L1 prefetch of the weight rows
+};
+struct HPick { int row0, cnt, rb0; const uint8_t* blob; };
+SYCL_ESIMD_FUNCTION inline HPick pick_h(const HArgs& a, int rbg) {
+    HPick p{a.row0[0], a.row0[1] - a.row0[0], a.rb0[0], a.blob[0]};
+#pragma unroll
+    for (int i = 1; i < kMaxGroup; ++i)
+        if (i < a.n && rbg >= a.rb0[i]) p = HPick{a.row0[i], a.row0[i + 1] - a.row0[i], a.rb0[i], a.blob[i]};
+    return p;
+}
+int fill_hargs(HArgs& a, const Layout& lo, int BM) {
+    int rb = 0;
+    for (int i = 0; i < lo.n; ++i) {
+        a.row0[i] = lo.row0[i];
+        a.rb0[i] = rb;
+        rb += (lo.cnt[i] + BM - 1) / BM;
+    }
+    a.row0[lo.n] = lo.row0[lo.n];
+    a.rb0[lo.n] = rb;
+    a.n = lo.n;
+    return rb;
+}
+
+SYCL_ESIMD_FUNCTION inline simd<float, 128> dpas_h(simd<float, 128> c, simd<uint32_t, 128> b, simd<half, 128> a) {
+    simd<int, 128> bi = b.template bit_cast_view<int>();
+    simd<int, 64> ai = a.template bit_cast_view<int>();
+    return xmx::dpas<8, 8, float, float, int, int, xmx::dpas_argument_type::fp16, xmx::dpas_argument_type::fp16>(c, bi, ai);
+}
+// FP16 per-lane scale -> the 32 halves of one VNNI row (lane l: halves 2 l, 2 l + 1)
+SYCL_ESIMD_FUNCTION inline simd<half, 32> pair_of(simd<half, 16> s) {
+    simd<half, 32> r;
+    r.template select<16, 2>(0) = s;
+    r.template select<16, 2>(1) = s;
+    return r;
+}
+// One B operand (16 K values x 16 lanes) of IQ2_S / IQ2_XXS: the two 8-value grid entries idx0, idx1 with their sign bytes, times
+// c1 = 2 s + 1 (exact), times d (one rounding): 8 w.  The sign bits are computed: dword j of an entry takes bits 2 j, 2 j + 1 of the
+// sign byte to bits 15, 31 as (s >> 2 j) * 0x40008000 & 0x80008000 (a sign table gathered like the grid: gate/up 622 against 524 us,
+// 601 against 569 with per-tile branches, esimd_f16_parity 320 16 on the B70).
+template <int OG>
+SYCL_ESIMD_FUNCTION inline simd<uint32_t, 128> dec_iq2_h(const uint32_t* T, simd<uint32_t, 16> idx0, simd<uint32_t, 16> idx1,
+                                                         simd<uint32_t, 16> s0, simd<uint32_t, 16> s1, simd<half, 32> c2,
+                                                         simd<half, 32> d2) {
+    simd<uint32_t, 128> b;
+    b.template select<64, 1>(0) = gather<uint32_t, 64, 4>(T + OG, idx0 << 4);
+    b.template select<64, 1>(64) = gather<uint32_t, 64, 4>(T + OG, idx1 << 4);
+    simd<uint32_t, 128> sv;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        sv.template select<16, 1>(16 * j) = s0 >> (2 * j);
+        sv.template select<16, 1>(64 + 16 * j) = s1 >> (2 * j);
+    }
+    b ^= (sv * 0x40008000u) & 0x80008000u;
+    auto bh = b.template bit_cast_view<half>();
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        simd<half, 32> v = bh.template select<32, 1>(32 * j);
+        v = v * c2;
+        bh.template select<32, 1>(32 * j) = v * d2;
+    }
+    return b;
+}
+constexpr auto kPfL1h = sycl::ext::oneapi::experimental::properties{cache_hint_L1<cache_hint::cached>, cache_hint_L2<cache_hint::cached>};
+SYCL_ESIMD_FUNCTION inline simd<half, 16> half16(simd<uint32_t, 16> h16) {
+    simd<uint16_t, 16> lo = h16.template bit_cast_view<uint16_t>().template select<16, 2>(0);
+    return lo.template bit_cast_view<half>();
+}
+
+template <int F, int MT, int NG> struct TagGuH;
+template <int F, int MT, int NT> struct TagDnH;
+
+// gate/up: rows (rbg's MT x 8) x (NG gate tiles of 16 rows from 16 NG cb, the same up rows), H out
+template <int F, int MT, int NG>
+void launch_gu_h(sycl::queue& q, const HArgs a, int nrb, int ncb, int wgn) {
+    constexpr int NT = 2 * NG;
+    constexpr int BB = blk_bytes<F>();
+    constexpr int OG = F == T_IQ2S ? O_HG2S : O_HG2XXS;
+    static_assert(MT == 4 || MT == 8, "row tiles: one or two 32-row block loads");
+    auto props = sycl::ext::oneapi::experimental::properties{sycl::ext::intel::experimental::grf_size<256>};
+    q.submit([&](sycl::handler& h) {
+        h.parallel_for<TagGuH<F, MT, NG>>(sycl::nd_range<2>(sycl::range<2>((size_t) nrb, (size_t) ncb), sycl::range<2>(1, (size_t) wgn)), props,
+                                          [=](sycl::nd_item<2> it) SYCL_ESIMD_KERNEL {
+            const int rbg = (int) it.get_group(0), cb = (int) it.get_global_id(1);
+            const HPick pk = pick_h(a, rbg);
+            const int r0 = (rbg - pk.rb0) * (8 * MT);
+            const int left = pk.cnt - r0;
+            const int nvalid = left >= 8 * MT ? MT : (left + 7) >> 3;
+            const half* Xe = a.X + (size_t) pk.row0 * a.K;
+            const uint32_t sw = (uint32_t) a.K * 2u - 1u, sh = (uint32_t) pk.cnt - 1u;
+            const uint8_t* We = pk.blob;
+            const uint32_t* T = a.tab;
+            simd<uint32_t, 16> lane(0, 1);
+            simd<uint32_t, 16> ro[NT];
+#pragma unroll
+            for (int g = 0; g < NG; ++g) {
+                ro[g] = (lane + (uint32_t) (16 * (NG * cb + g))) * (uint32_t) a.rowb;
+                ro[NG + g] = ro[g] + a.sec_off;
+            }
+            simd<float, 128> acc[MT][NT];
+#pragma unroll
+            for (int i = 0; i < MT; ++i)
+#pragma unroll
+                for (int t = 0; t < NT; ++t) acc[i][t] = 0.f;
+            const int nsb = a.K / 256;
+            for (int sb = 0; sb < nsb; ++sb) {
+                const uint32_t P = (uint32_t) sb * BB;
+                if (sb + 1 < nsb && !(a.dbg & 8)) {   // the next superblock's bytes of each lane's row into L1 (its loads then hit it)
+#pragma unroll
+                    for (int t = 0; t < NT; ++t) {
+                        simd<uint32_t, 16> l0 = (ro[t] + (P + BB)) & ~63u;
+#pragma unroll
+                        for (int c = 0; c < (BB + 63) / 64 + 1; ++c)
+                            prefetch<uint32_t, 16>(reinterpret_cast<const uint32_t*>(We), l0 + 64u * c, kPfL1h);
+                    }
+                }
+                simd<half, 32> d2[NT];
+                simd<uint32_t, 16> w0[NT], w1[NT], w2[NT], w3[NT];
+#pragma unroll
+                for (int t = 0; t < NT; ++t) {
+                    d2[t] = pair_of(half16(ld16(We, ro[t] + P)));
+                    if constexpr (F == T_IQ2S) {
+                        w0[t] = ld32(We, ro[t] + (P + 74));   // scales 0..3
+                        w1[t] = ld32(We, ro[t] + (P + 78));   // scales 4..7
+                        w2[t] = ld32(We, ro[t] + (P + 66));   // qh 0..3
+                        w3[t] = ld32(We, ro[t] + (P + 70));   // qh 4..7
+                    }
+                }
+                // a 32-block's index and sign dwords, loaded one 32-block ahead (a macro, not a lambda: see LOAD_CHUNK)
+#define LDQ_H(IB, XA, XB)                                                                                    \
+    _Pragma("unroll") for (int t = 0; t < NT; ++t) {                                                         \
+        if constexpr (F == T_IQ2S) {                                                                         \
+            XA[t] = ld32(We, ro[t] + (P + 2 + 4 * (IB)));    /* grid index low bytes */                      \
+            XB[t] = ld32(We, ro[t] + (P + 34 + 4 * (IB)));   /* signs */                                     \
+        } else {                                                                                             \
+            XA[t] = ld32(We, ro[t] + (P + 2 + 8 * (IB)));    /* grid indices */                              \
+            XB[t] = ld32(We, ro[t] + (P + 6 + 8 * (IB)));    /* signs (4 x 7 bits) + scale */                \
+        }                                                                                                    \
+    }
+                simd<uint32_t, 16> qa[NT], qb[NT];
+                LDQ_H(0, qa, qb)
+#pragma unroll 1
+                for (int ib = 0; ib < 8; ++ib) {
+                    simd<uint32_t, 16> na[NT], nb[NT];
+                    if (ib < 7) { LDQ_H(ib + 1, na, nb) }
+#pragma unroll
+                    for (int hf = 0; hf < 2; ++hf) {
+                        const int k0 = 256 * sb + 32 * ib + 16 * hf;
+                        simd<half, 512> av[MT / 4];
+#pragma unroll
+                        for (int p = 0; p < MT / 4; ++p) av[p] = load_2d<half, 16, 32, 1>(Xe, sw, sh, sw, k0, r0 + 32 * p);   // (past the expert: zeros)
+                        simd<uint32_t, 128> bt[NT];
+#pragma unroll
+                        for (int t = 0; t < NT; ++t) {
+                            simd<uint32_t, 16> i0, i1, s0, s1, c1;
+                            if constexpr (F == T_IQ2S) {
+                                const int il = 2 * hf;
+                                simd<uint32_t, 16> qhb = (((ib < 4) ? w2[t] : w3[t]) >> (8 * (ib & 3))) & 0xffu;
+                                simd<uint32_t, 16> scb = (((ib < 4) ? w0[t] : w1[t]) >> (8 * (ib & 3))) & 0xffu;
+                                i0 = ((qa[t] >> (8 * il)) & 0xffu) | ((qhb << (8 - 2 * il)) & 0x300u);
+                                i1 = ((qa[t] >> (8 * il + 8)) & 0xffu) | ((qhb << (6 - 2 * il)) & 0x300u);
+                                s0 = (qb[t] >> (8 * il)) & 0xffu;
+                                s1 = (qb[t] >> (8 * il + 8)) & 0xffu;
+                                c1 = ((scb >> (4 * hf)) & 0xfu) * 2u + 1u;
+                            } else {
+                                const int il = 2 * hf;
+                                i0 = (qa[t] >> (8 * il)) & 0xffu;
+                                i1 = (qa[t] >> (8 * il + 8)) & 0xffu;
+                                s0 = ksigns((qb[t] >> (7 * il)) & 127u);
+                                s1 = ksigns((qb[t] >> (7 * il + 7)) & 127u);
+                                c1 = (qb[t] >> 28) * 2u + 1u;
+                            }
+                            simd<half, 16> c1h = simd<half, 16>(simd<float, 16>(simd<int, 16>(c1)));
+                            bt[t] = dec_iq2_h<OG>(T, i0, i1, s0, s1, pair_of(c1h), d2[t]);
+                        }
+                        // every row tile, also the ones past the expert's rows (zeros, not stored): a branch per tile was slower (569
+                        // against 524 us)
+#pragma unroll
+                        for (int i = 0; i < MT; ++i) {
+                            simd<half, 128> ai = av[i / 4].template select<128, 1>(128 * (i % 4));
+#pragma unroll
+                            for (int t = 0; t < NT; ++t) acc[i][t] = dpas_h(acc[i][t], bt[t], ai);
+                        }
+                    }
+#pragma unroll
+                    for (int t = 0; t < NT; ++t) { qa[t] = na[t]; qb[t] = nb[t]; }
+                }
+#undef LDQ_H
+            }
+            if (a.dbg & 4) return;
+            half* He = reinterpret_cast<half*>(a.Y) + (size_t) pk.row0 * a.n_out;
+            const uint32_t hw = (uint32_t) a.n_out * 2u - 1u;
+#pragma unroll
+            for (int i = 0; i < MT; ++i) {
+                if (i < nvalid) {
+#pragma unroll
+                    for (int g = 0; g < NG; ++g) {
+                        simd<float, 128> gg = acc[i][g] * 0.125f, uu = acc[i][NG + g] * 0.125f;
+                        simd<float, 128> hv = gg / (1.f + exp(-gg)) * uu;
+                        hv = max(min(hv, 65504.f), -65504.f);
+                        simd<half, 128> hh = hv;
+                        store_2d<half, 16, 8>(He, hw, sh, hw, 16 * (NG * cb + g), r0 + 8 * i, hh);
+                    }
+                }
+            }
+        });
+    });
+}
+
+// down (Q2_0): rows (rbg's MT x 8) x NT tiles of 16 output columns from 16 NT cb, FP32 out
+template <int F, int MT, int NT>
+void launch_dn_h(sycl::queue& q, const HArgs a, int nrb, int ncb, int wgn) {
+    static_assert(F == T_Q2_0, "down: Q2_0");
+    static_assert(MT == 4 || MT == 8, "row tiles: one or two 32-row block loads");
+    auto props = sycl::ext::oneapi::experimental::properties{sycl::ext::intel::experimental::grf_size<256>};
+    q.submit([&](sycl::handler& h) {
+        h.parallel_for<TagDnH<F, MT, NT>>(sycl::nd_range<2>(sycl::range<2>((size_t) nrb, (size_t) ncb), sycl::range<2>(1, (size_t) wgn)), props,
+                                          [=](sycl::nd_item<2> it) SYCL_ESIMD_KERNEL {
+            const int rbg = (int) it.get_group(0), cb = (int) it.get_global_id(1);
+            const HPick pk = pick_h(a, rbg);
+            const int r0 = (rbg - pk.rb0) * (8 * MT);
+            const int left = pk.cnt - r0;
+            const int nvalid = left >= 8 * MT ? MT : (left + 7) >> 3;
+            const half* Xe = a.X + (size_t) pk.row0 * a.K;
+            const uint32_t sw = (uint32_t) a.K * 2u - 1u, sh = (uint32_t) pk.cnt - 1u;
+            const uint8_t* We = pk.blob;
+            const uint32_t* T = a.tab;
+            simd<uint32_t, 16> lane(0, 1);
+            simd<uint32_t, 16> ro[NT];
+#pragma unroll
+            for (int t = 0; t < NT; ++t) ro[t] = (lane + (uint32_t) (16 * (NT * cb + t))) * (uint32_t) a.rowb + a.sec_off;
+            if (!(a.dbg & 8)) {   // each lane's whole row (Q2_0: 180 bytes) into L1, kept inside the matrix
+#pragma unroll
+                for (int t = 0; t < NT; ++t) {
+                    simd<uint32_t, 16> l0 = ro[t] & ~63u;
+#pragma unroll
+                    for (int c = 0; c < 4; ++c)
+                        prefetch<uint32_t, 16>(reinterpret_cast<const uint32_t*>(We), min(l0 + 64u * c, simd<uint32_t, 16>(a.lim & ~63u)), kPfL1h);
+                }
+            }
+            simd<float, 128> acc[MT][NT];
+#pragma unroll
+            for (int i = 0; i < MT; ++i)
+#pragma unroll
+                for (int t = 0; t < NT; ++t) acc[i][t] = 0.f;
+            const int nblk = a.K / 64;
+#pragma unroll 1
+            for (int kb = 0; kb < nblk; ++kb) {
+                const uint32_t P = (uint32_t) kb * 18;
+                simd<half, 32> d2[NT];
+                simd<uint32_t, 16> qw[NT][4];
+#pragma unroll
+                for (int t = 0; t < NT; ++t) {
+                    d2[t] = pair_of(half16(ld16(We, ro[t] + P)));
+#pragma unroll
+                    for (int j = 0; j < 4; ++j) qw[t][j] = ld32c(We, ro[t] + (P + 2 + 4 * j), a.lim);
+                }
+#pragma unroll
+                for (int ks = 0; ks < 4; ++ks) {
+                    const int k0 = 64 * kb + 16 * ks;
+                    simd<half, 512> av[MT / 4];
+#pragma unroll
+                    for (int p = 0; p < MT / 4; ++p) av[p] = load_2d<half, 16, 32, 1>(Xe, sw, sh, sw, k0, r0 + 32 * p);   // (past the expert: zeros)
+                    simd<uint32_t, 128> bt[NT];
+#pragma unroll
+                    for (int t = 0; t < NT; ++t) {
+#pragma unroll
+                        for (int j = 0; j < 4; ++j)
+                            bt[t].template select<32, 1>(32 * j) = gather<uint32_t, 32, 2>(T + O_HQ2, ((qw[t][ks] >> (8 * j)) & 0xffu) << 3);
+                        auto bh = bt[t].template bit_cast_view<half>();
+#pragma unroll
+                        for (int j = 0; j < 8; ++j) bh.template select<32, 1>(32 * j) = bh.template select<32, 1>(32 * j) * d2[t];
+                    }
+#pragma unroll
+                    for (int i = 0; i < MT; ++i) {
+                        simd<half, 128> ai = av[i / 4].template select<128, 1>(128 * (i % 4));
+#pragma unroll
+                        for (int t = 0; t < NT; ++t) acc[i][t] = dpas_h(acc[i][t], bt[t], ai);
+                    }
+                }
+            }
+            if (a.dbg & 4) return;
+            float* De = reinterpret_cast<float*>(a.Y) + (size_t) pk.row0 * a.n_out;
+            const uint32_t dw = (uint32_t) a.n_out * 4u - 1u;
+#pragma unroll
+            for (int i = 0; i < MT; ++i) {
+                if (i < nvalid) {
+#pragma unroll
+                    for (int t = 0; t < NT; ++t) store_2d<float, 16, 8>(De, dw, sh, dw, 16 * (NT * cb + t), r0 + 8 * i, acc[i][t]);
+                }
+            }
+        });
+    });
+}
+
+int hdbg_flags() {
+    static const int v = [] { const char* s = std::getenv("STRATA_F16X_DBG"); return s ? std::atoi(s) : 0; }();
+    return v;
+}
+// tuning: STRATA_F16X_WG, the threads of a work-group (8: 5 % faster than 4 or 10 at 16 experts x 320 rows, 1 was 40 % slower)
+int henv(const char* name, int def) {
+    const char* s = std::getenv(name);
+    return s ? std::atoi(s) : def;
+}
+bool al64(const void* p) { return ((uintptr_t) p & 63) == 0; }
+}  // namespace
+
+bool f16_handles(int gu_type, int d_type, int n_ff, int n_embd, void* stream) {
+    return (gu_type == T_IQ2S || gu_type == T_IQ2XXS) && d_type == T_Q2_0 && n_embd % 256 == 0 && n_ff % 64 == 0 && n_ff % 32 == 0 &&
+           n_embd % 64 == 0 && available(stream);
+}
+
+bool gate_up_f16(int gu_type, const uint8_t* const* blob, size_t up_off, int n_ff, const Layout& lo, int K, const uint16_t* X,
+                 uint16_t* H, void* stream) {
+    if (lo.n == 0 || lo.row0[lo.n] == 0) return true;
+    if ((gu_type != T_IQ2S && gu_type != T_IQ2XXS) || K % 256 != 0 || n_ff % 32 != 0 || (up_off & 3) != 0 || lo.n > kMaxGroup ||
+        !al64(X) || !al64(H))
+        return false;
+    sycl::queue& q = *strata::q_of(stream);
+    HArgs a{};
+    for (int i = 0; i < lo.n; ++i) a.blob[i] = blob[i];
+    a.sec_off = (uint32_t) up_off;
+    a.X = reinterpret_cast<const half*>(X);
+    a.Y = H;
+    a.tab = htables(q);
+    a.K = K;
+    a.n_out = n_ff;
+    a.rowb = (K / 256) * block_bytes_of(gu_type);
+    a.dbg = hdbg_flags();
+    static const int wg = henv("STRATA_F16X_WG", 8);
+    const int nrb = fill_hargs(a, lo, 64);
+    const int ncb = n_ff / 16;
+    const int wgn = ncb % wg == 0 ? wg : 1;
+#define STRATA_GU_H(F_) launch_gu_h<F_, 8, 1>(q, a, nrb, ncb, wgn);
+    if (gu_type == T_IQ2S) { STRATA_GU_H(T_IQ2S) } else { STRATA_GU_H(T_IQ2XXS) }
+#undef STRATA_GU_H
+    return true;
+}
+
+bool down_f16(int d_type, const uint8_t* const* blob, size_t down_off, int n_embd, const Layout& lo, int n_ff, const uint16_t* H,
+              float* Dm, void* stream) {
+    if (lo.n == 0 || lo.row0[lo.n] == 0) return true;
+    if (d_type != T_Q2_0 || n_ff % 64 != 0 || n_embd % 64 != 0 || (down_off & 3) != 0 || lo.n > kMaxGroup || !al64(H) || !al64(Dm))
+        return false;
+    sycl::queue& q = *strata::q_of(stream);
+    HArgs a{};
+    for (int i = 0; i < lo.n; ++i) a.blob[i] = blob[i];
+    a.sec_off = (uint32_t) down_off;
+    a.X = reinterpret_cast<const half*>(H);
+    a.Y = Dm;
+    a.tab = htables(q);
+    a.K = n_ff;
+    a.n_out = n_embd;
+    a.rowb = (n_ff / 64) * 18;
+    a.lim = (uint32_t) (down_off + (size_t) n_embd * (size_t) a.rowb) - 4u;
+    a.dbg = hdbg_flags();
+    static const int wg = henv("STRATA_F16X_WG", 8);
+    const int nrb = fill_hargs(a, lo, 64);
+    const int ncb = n_embd / 16 / 2;
+    const int wgn = ncb % wg == 0 ? wg : 1;
+    launch_dn_h<T_Q2_0, 8, 2>(q, a, nrb, ncb, wgn);
+    return true;
 }
 
 }  // namespace strata::prefill::i8

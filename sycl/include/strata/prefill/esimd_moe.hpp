@@ -83,4 +83,16 @@ void swiglu_quantize(const float* GU, const Layout& lo, int n_ff, int8_t* Hq, fl
 bool down(int d_type, const uint8_t* const* blob, size_t down_off, int n_embd, const Layout& lo, int n_ff, const int8_t* Hq,
           const float* dh, float* Dm, void* stream);
 
+/// The FP16 products for the groups above the int8 crossover: the FP16 chain's arithmetic (the weights decoded in registers to the
+/// FP16 values iq_dequant_expert_f16 writes, FP16 activations, FP32 accumulation; only the summation order differs) without its FP16
+/// copy of each expert, one launch per product for the whole group.  True when this build and device have them and the formats /
+/// shape are handled: gate/up IQ2_S or IQ2_XXS, down Q2_0, K a multiple of 256, n_ff a multiple of 64.
+bool f16_handles(int gu_type, int d_type, int n_ff, int n_embd, void* stream);
+/// H[row][n_ff] (FP16) = silu(gate) * up of X[row][K] (FP16), saturated at +-65504 as swiglu_interleaved; X and H 64-byte aligned.
+bool gate_up_f16(int gu_type, const uint8_t* const* blob, size_t up_off, int n_ff, const Layout& lo, int K, const uint16_t* X,
+                 uint16_t* H, void* stream);
+/// Dm[row][n_embd] (FP32) = H . down^T, H[row][n_ff] FP16; H and Dm 64-byte aligned.
+bool down_f16(int d_type, const uint8_t* const* blob, size_t down_off, int n_embd, const Layout& lo, int n_ff, const uint16_t* H,
+              float* Dm, void* stream);
+
 }  // namespace strata::prefill::i8
