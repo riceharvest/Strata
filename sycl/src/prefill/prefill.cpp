@@ -3654,8 +3654,21 @@ const char* const kPfNames[kPfCount] = {"embed+steps", "hc read", "gdn", "qsa pr
                                         "qsa attn", "router+shared", "host grouping", "gather", "wait copy", "dequant",
                                         "gemm gate/up", "gemm down", "combine", "ple", "kv stage", "gdn conv+gates",
                                         "gdn recurrence", "gdn out proj", "hc write"};
+// SYCL port (Arc Pro B70, Level Zero v2 adapter): the timing's marks, folds and drains run on every prompt, quietly. A
+// prompt that continued a conversation (an agent's or a chat's next turn: the chunk after the cached prefix) stopped for
+// good at an early layer of its first chunk - the host in queue::wait() at the layer's routing, both engines busy - every
+// time, on this branch and before it, while the same runs with STRATA_PREFILL_TIMING=1 (or STRATA_PREFILL_SYNC=1)
+// finished: a two-turn chat at 15K, and a 52-request coding-agent session from 64K to 118K tokens (2026-10-31). Which of
+// the timing's effects keeps the queues moving is not known yet (not the barrier before the routing download, not one
+// before each cross-queue wait, not a drain of either queue at the chunk's start, not polled drains). ~5% of a
+// 118K prompt. STRATA_PREFILL_ORDER=0: off (the old behaviour).
+inline bool prefill_order_on() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_PREFILL_ORDER"); return !(v && v[0] == '0'); }();
+    return on;
+}
 struct PfTimer {
-    bool on = std::getenv("STRATA_PREFILL_TIMING") != nullptr;
+    bool quiet = std::getenv("STRATA_PREFILL_TIMING") == nullptr;   // the timing's work without its report
+    bool on = !quiet || prefill_order_on();
     std::vector<dpct::event_ptr> ev;
     std::vector<int> ph;
     size_t used = 0;
@@ -4148,7 +4161,7 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
         const auto tsetup = Clock::now();
         auto tlap = tsetup;   // STRATA_PREFILL_TIMING=1: where the host's chunk setup goes
         auto lap = [&](const char* what) {
-            if (pt.on) { std::fprintf(stderr, "strata prefill timing: setup %s %.1f ms\n", what, ms_since(tlap)); tlap = Clock::now(); }
+            if (pt.on && !pt.quiet) { std::fprintf(stderr, "strata prefill timing: setup %s %.1f ms\n", what, ms_since(tlap)); tlap = Clock::now(); }
         };
         if (pt.on) { m.cs->wait(); lap("work queued before the chunk"); }
         // ---- embeddings, broadcast to the four streams - or, in a later stage of a layer split, the rows the
@@ -7847,7 +7860,7 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
             stats_.ms_experts_host += iss_ms;
             stats_.experts_streamed += iss_streamed;
             stats_.experts_dma += iss_dma;
-            if (copy_wait_dedupe && pt.on)
+            if (copy_wait_dedupe && pt.on && !pt.quiet)
                 std::fprintf(stderr, "strata prefill copies: %lld slot waits, %lld skipped as the same release event\n",
                              (long long) iss_waits, (long long) iss_dedup);
         }
@@ -8129,7 +8142,7 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                                  "BF16 weights max |w| %.3f (%llu), FP16 GEMM outputs max |y| %.1f (%llu not finite)\n",
                          (long long) n, xm, xo, wy[0], wyo[0], wy[1], wyo[1]);
     }
-    if (pt.on) {
+    if (pt.on && !pt.quiet) {
         pt.fold();
         double total = 0.0;
         for (double v : pt.ms) total += v;
@@ -9617,7 +9630,7 @@ bool Prefill::run_layer_major(const int64_t *tokens, int64_t n, int64_t pos0,
                  lb.r_dev ? "VRAM" : "pinned RAM", (long long) lb.free_mib,
                  (long long) lm_streamed, (double) lm_bytes / 1e6, (long long) lm_resident, (long long) lm_groups,
                  (long long) lm_groups_f16, ms_since(t_start), ms_attn, ms_experts, ms_wait_a, ms_host_tables);
-    if (pt.on) {
+    if (pt.on && !pt.quiet) {
         pt.fold();
         double total = 0.0;
         for (double x : pt.ms) total += x;
