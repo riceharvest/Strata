@@ -13,8 +13,8 @@ Not affiliated with Intel or with upstream Strata.
 
 | Model | Status on one B70 |
 | --- | --- |
-| [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next), [ISTA-DASLab GSQ-RCO GGUFs](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF) | Works. Numbers below |
-| DeepSeek V4.1-Flash, [ISTA-DASLab sets](https://huggingface.co/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF), **pruned** (`--prune-experts`) | In progress. Pruning changes the answers; quality and speed not measured yet |
+| [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next), [ISTA-DASLab GSQ-RCO GGUFs](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF) | Usable at 118K context (256K not measured yet). Numbers below |
+| DeepSeek V4.1-Flash, [ISTA-DASLab sets](https://huggingface.co/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF), **pruned** (`--prune-experts`) | Runs, not recommended, no further work planned: the 2-bit set plus pruning loses too much of what the model knows (in our tests it got simple facts wrong) |
 | DeepSeek V4.1-Flash, unpruned | Not recommended. On one card with 64 GB of RAM most experts come off the disk on every token: about 1 tok/s from a SATA SSD, about 5 tok/s from NVMe |
 
 ## What counts as usable here
@@ -29,22 +29,23 @@ Anything that misses one of these is labelled "works, not usable".
 
 ## Speed
 
-Qwen3.8-Flash-Next IQ2_XS on one Arc Pro B70, Ryzen 9 5950X, 64 GB RAM. Settings:
+Qwen3.8-Flash-Next IQ2_XS on one Arc Pro B70, Ryzen 9 5950X, 64 GB RAM, measured 2026-10-31. Settings:
 
-- MTP draft, `--spec 4`, int8 KV
+- MTP draft, `--spec 4`, int8 KV, 32K of the KV in VRAM, `--prefill 16384`
 - 7 GB of VRAM kept free, because the card also drives a desktop
 - page cache dropped before every start
-- Strata's `standard-v1` benchmark, two runs each
+- one 118,196-token prompt (this repo's docs with a fact hidden in the middle; every answer found it), a ~730-token
+  answer, temperature 0, two runs each
 
 | Context | Prompt (tok/s) | Answer (tok/s) |
 | --- | ---: | ---: |
-| short | | 57.4 / 57.7 |
-| 4K | 1,542 / 1,612 | 51.2 / 51.5 |
-| 16K | 1,689 / 1,701 | 51.9 / 51.9 |
-| 128K, 256K | not measured yet | not measured yet |
+| 118K | 2,911 / 2,935 | 64.9 / 64.6 |
+| 256K | not measured yet | not measured yet |
 
-That's +12% (4K) and +17% (16K) prompt speed over upstream Strata on the same card, with identical greedy answers.
-[docs/B70.md](docs/B70.md) has the comparison, every change against upstream and who wrote it.
+The same test on this branch before the latest prompt work read 1,786 / 1,817 tok/s, so the prompt is read 62% faster.
+The answer speed did not change. [docs/B70.md](docs/B70.md) has what changed, every change against upstream and who
+wrote it, and the earlier comparisons with upstream Strata on this card (+12% to +17% prompt speed at 4K and 16K on
+2026-10-24, before this work).
 
 <details>
 <summary><img src="docs/media/models/qwen.svg" width="22" alt="" align="middle"> &nbsp;<b>Qwen3.8-Flash-Next</b></summary>
@@ -109,8 +110,10 @@ The server speaks the OpenAI, Anthropic and OpenAI Responses APIs on the port se
   back. Leave a few GB free (`--vram-reserve-mib`).
 - **Keep RAM headroom on a desktop.** On a 64 GB machine leave `--ple-io` at its default (`direct`); `ram` locks a
   28.8 GB table into memory. Size `STRATA_MIRROR_MIB` so a few GB stay free.
-- **B70 defaults are on.** `STRATA_VERIFY_DEVICE_PLAN=1`, `STRATA_VERIFY_NO_HOST=1` and `STRATA_STAGER_THREADS` are set
-  unless you set them yourself. `0` turns one off; `STRATA_B70_DEFAULTS=0` turns all three off.
+- **B70 defaults are on.** The engine sets its B70 settings (`STRATA_VERIFY_DEVICE_PLAN`, `STRATA_SELECT_LONG`,
+  `STRATA_HC_Q8` and the others listed in [docs/B70.md](docs/B70.md)) unless you set them yourself; `0` turns one off,
+  `STRATA_B70_DEFAULTS=0` turns all of them off. The B70 prompt kernels (attention, selection, GDN, hyper-connections,
+  experts) are on by default on this card, each with its own switch to turn it off, also in [docs/B70.md](docs/B70.md).
 
 <a id="guides"></a>
 <a id="how-fast-is-it"></a>
