@@ -3621,12 +3621,17 @@ catch (sycl::exception const &exc) {
 // the previous half's)
 bool hc_downinj_proj(Gemm& gm, const core::WeightRef* wd, const core::WeightRef* wi, const uint16_t* X, float* Y,
                      int64_t T, void* stream, std::string& err) {
-    static uint16_t* w = nullptr;
-    if (w == nullptr) {
-        w = (uint16_t*) sycl::malloc_device((size_t) (LR + HC) * D * 2, dpct::get_in_order_queue());
-        if (w == nullptr) { err = "prefill: the STRATA_HC_DOWNINJ weight scratch (6.6 MB)"; return false; }
-    }
     sycl::queue& q = *strata::q_of(stream);
+    static std::mutex mu;   // one scratch per device: a layer split runs a stage per card
+    static std::unordered_map<sycl::device, uint16_t*> scratch;
+    uint16_t* w = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(mu);
+        uint16_t*& s = scratch[q.get_device()];
+        if (s == nullptr) s = (uint16_t*) sycl::malloc_device((size_t) (LR + HC) * D * 2, q);
+        w = s;
+    }
+    if (w == nullptr) { err = "prefill: the STRATA_HC_DOWNINJ weight scratch (6.6 MB)"; return false; }
     q.memcpy(w, wd->data, (size_t) LR * D * 2);
     q.memcpy(w + (size_t) LR * D, wi->data, (size_t) HC * D * 2);
     const bool ct = g_cold.begin();
