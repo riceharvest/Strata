@@ -39,13 +39,13 @@ Qwen3.8-Flash-Next IQ2_XS on one Arc Pro B70, Ryzen 9 5950X, 64 GB RAM, measured
 
 | Context | Prompt (tok/s) | Answer (tok/s) |
 | --- | ---: | ---: |
-| 118K | 2,911 / 2,935 | 64.9 / 64.6 |
+| 118K | 2,861 / 2,857 | 65.4 / 66.0 |
 | 256K | not measured yet | not measured yet |
 
-The same test on this branch before the latest prompt work read 1,786 / 1,817 tok/s, so the prompt is read 62% faster.
-The answer speed did not change. [docs/B70.md](docs/B70.md) has what changed, every change against upstream and who
-wrote it, and the earlier comparisons with upstream Strata on this card (+12% to +17% prompt speed at 4K and 16K on
-2026-10-24, before this work).
+The same test on this branch before the latest prompt work read 1,786 / 1,817 tok/s, so the prompt is read 59% faster.
+The answer speed did not change. These numbers include the fix for the second-turn hang below, which costs about 2%.
+[docs/B70.md](docs/B70.md) has what changed, every change against upstream and who wrote it, and the earlier
+comparisons with upstream Strata on this card (+12% to +17% prompt speed at 4K and 16K on 2026-10-24, before this work).
 
 **A coding agent on one B70.** The [pi](https://github.com/earendil-works/pi) agent with thinking `xhigh`, a 64K-token system
 prompt, `--max-context 262144` and 3 GB of VRAM kept for the desktop ran seven coding tasks in one session: 52 requests,
@@ -53,8 +53,7 @@ the context growing from 64K to 118K tokens. Every turn reused the history it ha
 tokens (most turns under 1.5 s); answers ran at 74-111 tok/s. Turns that continue a conversation used to hang on this
 card; the engine now works around it (2% prompt speed), see [docs/B70.md](docs/B70.md#agent-use-and-the-second-turn-hang-2026-10-31).
 
-<details>
-<summary><img src="docs/media/models/qwen.svg" width="22" alt="" align="middle"> &nbsp;<b>Qwen3.8-Flash-Next</b></summary>
+## What you need
 
 - An Intel Arc Pro B70, Linux with the `xe` kernel driver and the Intel compute runtime (`ls /dev/dri` shows
   `renderD128`)
@@ -110,10 +109,38 @@ The server speaks the OpenAI, Anthropic and OpenAI Responses APIs on the port se
 | Anthropic API (Claude Code) | `http://127.0.0.1:PORT` (no `/v1`) |
 | OpenAI Responses API (Codex CLI) | `http://127.0.0.1:PORT/v1/responses` |
 
+### For a coding agent
+
+For one long agent session (a system prompt of 40K-60K tokens, the context up to the model's 262,144 tokens):
+
+    ./setup.sh --backend sycl --model IQ2_XS --context 262144 --vram-reserve-mib 3072 --vision no
+
+- **3 GB of VRAM for the desktop** was enough on the test box (KDE and a browser). Everything else goes to the expert
+  cache: about 16,000 experts in VRAM instead of 13,000 with 7 GB kept free, so less is read over PCIe.
+- **Thinking** is on at the model's highest level (`xhigh`) unless the client asks for another (`reasoning_effort`:
+  `low`, `medium`, `high` or `xhigh`, `none` turns it off).
+- **Earlier turns' thinking stays in the prompt** when the client sends it back (`reasoning_content`, as pi does). The
+  history then matches what the engine already read, and each turn reads only its new tokens.
+- **Pictures** stay off with `--vision no`. Setup's default reads them on the CPU, from RAM; the first picture sent on a
+  B70 once reset the card ([docs/INTEL.md](docs/INTEL.md#pictures-on-an-arc)), and nobody has looked at it since.
+
+For [pi](https://github.com/earendil-works/pi), add the server to `~/.pi/agent/models.json`:
+
+```json
+{"providers": {"strata": {"baseUrl": "http://127.0.0.1:8080/v1", "api": "openai-completions", "apiKey": "local",
+  "models": [{"id": "qwen38-flash-next", "contextWindow": 262144, "maxTokens": 32768, "reasoning": true,
+              "compat": {"supportsReasoningEffort": true}}]}}}
+```
+
+and start it with `pi --provider strata --model qwen38-flash-next --thinking xhigh`. What one session measured is
+under [Speed](#speed); sessions past 118K tokens are not measured yet.
+
 ## Things that matter on this card
 
 - **Keep VRAM headroom.** Near 32 GB the `xe` driver can wedge the card, and only a reboot or driver rebind brings it
   back. Leave a few GB free (`--vram-reserve-mib`).
+- **Pictures run on the CPU by default** (setup's choice for this card). See the note under
+  [For a coding agent](#for-a-coding-agent) before turning them on.
 - **Keep RAM headroom on a desktop.** On a 64 GB machine leave `--ple-io` at its default (`direct`); `ram` locks a
   28.8 GB table into memory. Size `STRATA_MIRROR_MIB` so a few GB stay free.
 - **B70 defaults are on.** The engine sets its B70 settings (`STRATA_VERIFY_DEVICE_PLAN`, `STRATA_SELECT_LONG`,
