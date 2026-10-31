@@ -13,7 +13,7 @@ Not affiliated with Intel or with upstream Strata.
 
 | Model | Status on one B70 |
 | --- | --- |
-| [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next), [ISTA-DASLab GSQ-RCO GGUFs](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF) | Usable at 118K context (256K not measured yet). Numbers below |
+| [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next), [ISTA-DASLab GSQ-RCO GGUFs](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF) | Usable at 118K context, chats and coding agents included (256K not measured yet). Numbers below |
 | DeepSeek V4.1-Flash, [ISTA-DASLab sets](https://huggingface.co/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF), **pruned** (`--prune-experts`) | Runs, not recommended, no further work planned: the 2-bit set plus pruning loses too much of what the model knows (in our tests it got simple facts wrong) |
 | DeepSeek V4.1-Flash, unpruned | Not recommended. On one card with 64 GB of RAM most experts come off the disk on every token: about 1 tok/s from a SATA SSD, about 5 tok/s from NVMe |
 
@@ -46,6 +46,12 @@ The same test on this branch before the latest prompt work read 1,786 / 1,817 to
 The answer speed did not change. [docs/B70.md](docs/B70.md) has what changed, every change against upstream and who
 wrote it, and the earlier comparisons with upstream Strata on this card (+12% to +17% prompt speed at 4K and 16K on
 2026-10-24, before this work).
+
+**A coding agent on one B70.** The [pi](https://github.com/earendil-works/pi) agent with thinking `xhigh`, a 64K-token system
+prompt, `--max-context 262144` and 3 GB of VRAM kept for the desktop ran seven coding tasks in one session: 52 requests,
+the context growing from 64K to 118K tokens. Every turn reused the history it had already read and read only the new
+tokens (most turns under 1.5 s); answers ran at 74-111 tok/s. Turns that continue a conversation used to hang on this
+card; the engine now works around it (2% prompt speed), see [docs/B70.md](docs/B70.md#agent-use-and-the-second-turn-hang-2026-10-31).
 
 <details>
 <summary><img src="docs/media/models/qwen.svg" width="22" alt="" align="middle"> &nbsp;<b>Qwen3.8-Flash-Next</b></summary>
